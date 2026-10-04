@@ -7,6 +7,8 @@ import android.app.Service
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
@@ -19,6 +21,10 @@ import com.jarvis.assistant.activation.JarvisActivationController
 import com.jarvis.assistant.core.JarvisCoreView
 import com.jarvis.assistant.speech.AndroidTtsSpeechController
 import com.jarvis.assistant.speech.JarvisSpeechController
+import com.jarvis.assistant.wakeword.AssistantFlow
+import com.jarvis.assistant.wakeword.VoskWakeWordEngine
+import com.jarvis.assistant.wakeword.WakeStatus
+import com.jarvis.assistant.wakeword.WakeWordState
 
 /**
  * Hosts the JARVIS assistant UI as a system overlay, independent of any Activity.
@@ -28,9 +34,14 @@ import com.jarvis.assistant.speech.JarvisSpeechController
  *           -> TTS "بله ارباب." (SPEAKING) -> LISTENING -> [future command listener]
  *           -> deactivate(): READY -> hideOverlay() (fade out, window removed, service stops)
  *
- * Runs as a foreground service (specialUse for now). When the wake-word engine arrives, switch the
- * manifest type to microphone (+ RECORD_AUDIO) and set [STOP_SERVICE_AFTER_HIDE] to false.
- * No microphone is used in this stage.
+ * Stage 44: while the wake word is enabled this service also owns the offline Vosk detector
+ * («هی جارویس»), so it stays alive after the overlay hides and runs as a microphone foreground service:
+ *
+ *   IDLE -> WAKE_WORD_LISTENING -> (wake word) -> OVERLAY_ACTIVATING -> "بله ارباب." -> LISTENING
+ *        -> overlay hides -> WAKE_WORD_LISTENING
+ *
+ * The microphone is released while the overlay / TTS / command stage is active and re-acquired after.
+ * Without the wake word the service behaves exactly as in Stage 43 (specialUse, stops after hide).
  */
 class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresenter {
 
@@ -39,6 +50,10 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
     private lateinit var speech: JarvisSpeechController
     private lateinit var activation: JarvisActivationController
     private var lastStartId = 0
+
+    private lateinit var wake: VoskWakeWordEngine
+    private var wakeEnabled = false
+    private val resumeWakeRunnable = Runnable { resumeWake() }
 
     private val autoDismiss = Runnable { activation.deactivate() }
     private var pendingActivate: Runnable? = null
@@ -49,8 +64,13 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
         window = JarvisOverlayWindow(this)
         speech = AndroidTtsSpeechController(this)
         activation = JarvisActivationController(speech, presenter = this)
+        wake = VoskWakeWordEngine(this, object : VoskWakeWordEngine.Callback {
+            override fun onWakeWord() = onWakeWordDetected()
+            override fun onStatus(status: WakeStatus) = onWakeStatus(status)
+        })
         activation.listener = object : JarvisActivationController.Listener {
             override fun onReadyForCommand() {
+                if (wakeEnabled) WakeWordState.update(flow = AssistantFlow.LISTENING)
                 // Placeholder until the command listener exists: it should take over here and call
                 // endInteraction() when finished. Without it the overlay would never leave.
                 main.removeCallbacks(autoDismiss)
@@ -61,9 +81,36 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         lastStartId = startId
-        if (!enterForeground()) { stopSelf(startId); return START_NOT_STICKY }
+        when (intent?.action) {
+            ACTION_WAKE_START -> wakeEnabled = true
+            ACTION_WAKE_STOP -> wakeEnabled = false
+        }
+        if (wakeEnabled && !hasMicPermission()) {
+            wakeEnabled = false
+            WakeWordState.update(status = WakeStatus.NO_PERMISSION, flow = AssistantFlow.IDLE)
+        }
+        if (!enterForeground()) {
+            wakeEnabled = false
+            wake.stop()
+            WakeWordState.update(status = WakeStatus.ERROR, flow = AssistantFlow.IDLE)
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
 
         when (intent?.action) {
+            ACTION_WAKE_START -> {
+                if (wakeEnabled) {
+                    WakeWordState.update(status = WakeStatus.LOADING_MODEL, flow = AssistantFlow.WAKE_WORD_LISTENING)
+                    resumeWake()
+                } else {
+                    finishIfIdle()
+                }
+            }
+            ACTION_WAKE_STOP -> {
+                suspendWake()
+                if (!window.isAttached) WakeWordState.update(status = WakeStatus.OFF, flow = AssistantFlow.IDLE)
+                finishIfIdle()
+            }
             ACTION_ACTIVATE -> {
                 if (!hasOverlayPermission(this)) {
                     Log.w(TAG, "Overlay permission missing; ignoring activation")
@@ -102,7 +149,10 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
         main.removeCallbacks(autoDismiss)
         window.hide {
             isOverlayVisible = false
+            if (wakeEnabled) WakeWordState.update(flow = AssistantFlow.WAKE_WORD_LISTENING)
+            else if (WakeWordState.isActive()) WakeWordState.update(status = WakeStatus.OFF, flow = AssistantFlow.IDLE)
             finishIfIdle()
+            scheduleWakeResume()    // interaction is over: listen for the wake word again
         }
     }
 
@@ -115,8 +165,67 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
     }
 
     private fun runActivation(source: JarvisActivationController.Source) {
+        suspendWake()                            // free the mic while the overlay / TTS / commands run
+        if (wakeEnabled) WakeWordState.update(flow = AssistantFlow.OVERLAY_ACTIVATING)
         activation.activate(source)
-        if (!window.isAttached) finishIfIdle()   // window could not be created: don't linger
+        if (!window.isAttached) {                // window could not be created: don't linger
+            if (wakeEnabled) WakeWordState.update(flow = AssistantFlow.WAKE_WORD_LISTENING)
+            finishIfIdle()
+            scheduleWakeResume()
+        }
+    }
+
+    // ---- wake word ------------------------------------------------------------------------------
+
+    private fun hasMicPermission(): Boolean =
+        checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+    /** Engine already stopped itself (mic released) before this is called. Main thread. */
+    private fun onWakeWordDetected() {
+        if (!wakeEnabled) return
+        val busy = activation.phase != JarvisActivationController.Phase.IDLE ||
+            window.isAttached || pendingActivate != null
+        if (busy || !hasOverlayPermission(this)) {
+            if (!busy) Log.w(TAG, "Wake word heard but overlay permission is missing")
+            scheduleWakeResume()
+            return
+        }
+        Log.i(TAG, "Wake word detected")
+        runActivation(JarvisActivationController.Source.WAKE_WORD)
+    }
+
+    private fun onWakeStatus(status: WakeStatus) {
+        when (status) {
+            WakeStatus.LOADING_MODEL, WakeStatus.LISTENING ->
+                if (wakeEnabled) WakeWordState.update(status = status)
+            WakeStatus.NO_PERMISSION, WakeStatus.MODEL_MISSING, WakeStatus.ERROR -> {
+                // The detector cannot run: leave wake word mode instead of holding a useless mic service.
+                wakeEnabled = false
+                wake.stop()
+                WakeWordState.update(status = status, flow = AssistantFlow.IDLE)
+                finishIfIdle()
+            }
+            else -> Unit
+        }
+    }
+
+    private fun suspendWake() {
+        main.removeCallbacks(resumeWakeRunnable)
+        wake.stop()
+        if (wakeEnabled) WakeWordState.update(status = WakeStatus.SUSPENDED)
+    }
+
+    private fun scheduleWakeResume() {
+        main.removeCallbacks(resumeWakeRunnable)
+        if (wakeEnabled) main.postDelayed(resumeWakeRunnable, RESUME_WAKE_DELAY_MS)
+    }
+
+    private fun resumeWake() {
+        if (!wakeEnabled || window.isAttached || pendingActivate != null) return
+        if (activation.phase != JarvisActivationController.Phase.IDLE) return
+        if (!hasMicPermission()) { onWakeStatus(WakeStatus.NO_PERMISSION); return }
+        WakeWordState.update(flow = AssistantFlow.WAKE_WORD_LISTENING)
+        wake.start()                              // idempotent: never a second listener
     }
 
     private fun cancelPendingActivate() {
@@ -125,7 +234,7 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
     }
 
     private fun finishIfIdle() {
-        if (STOP_SERVICE_AFTER_HIDE && !window.isAttached && pendingActivate == null) {
+        if (!wakeEnabled && !window.isAttached && pendingActivate == null) {
             stopSelf(lastStartId)    // ignored if a newer start command arrived meanwhile
         }
     }
@@ -138,6 +247,10 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
     override fun onDestroy() {
         main.removeCallbacksAndMessages(null)
         cancelPendingActivate()
+        wakeEnabled = false
+        wake.release()               // releases the microphone and the Vosk model
+        if (WakeWordState.isActive()) WakeWordState.update(status = WakeStatus.OFF)
+        WakeWordState.update(flow = AssistantFlow.IDLE)
         activation.unbind()          // cancels speech callbacks/timeouts
         window.remove()              // never leak the WindowManager view
         speech.shutdown()
@@ -150,12 +263,36 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
 
     // ---- foreground notification ----------------------------------------------------------------
 
+    /**
+     * Android 14+ requires the type passed here to match what the service really does, and a
+     * microphone type needs RECORD_AUDIO. So: microphone while the wake word is on, specialUse otherwise.
+     * If the microphone type is refused we fall back to specialUse and leave wake word mode.
+     */
     private fun enterForeground(): Boolean {
+        if (tryForeground(microphone = wakeEnabled)) return true
+        if (!wakeEnabled) return false
+        Log.w(TAG, "Microphone foreground type refused; wake word disabled")
+        wakeEnabled = false
+        WakeWordState.update(status = WakeStatus.ERROR, flow = AssistantFlow.IDLE)
+        return tryForeground(microphone = false)
+    }
+
+    private fun tryForeground(microphone: Boolean): Boolean {
         return try {
-            startForeground(NOTIFICATION_ID, buildNotification())
+            val notification = buildNotification()
+            when {
+                Build.VERSION.SDK_INT >= 34 -> {
+                    val type = if (microphone) ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                    else ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                    startForeground(NOTIFICATION_ID, notification, type)
+                }
+                Build.VERSION.SDK_INT >= 29 ->
+                    startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MANIFEST)
+                else -> startForeground(NOTIFICATION_ID, notification)
+            }
             true
         } catch (e: RuntimeException) {   // e.g. foreground start not allowed from background (API 31+)
-            Log.e(TAG, "startForeground failed", e)
+            Log.e(TAG, "startForeground failed (microphone=$microphone)", e)
             false
         }
     }
@@ -175,7 +312,7 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
         return builder
             .setSmallIcon(icon)
             .setContentTitle("JARVIS")
-            .setContentText("دستیار فعال است")
+            .setContentText(if (wakeEnabled) "منتظر «هی جارویس»" else "دستیار فعال است")
             .setOngoing(true)
             .setCategory(Notification.CATEGORY_SERVICE)
             .build()
@@ -188,14 +325,16 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
 
         const val ACTION_ACTIVATE = "com.jarvis.assistant.overlay.ACTION_ACTIVATE"
         const val ACTION_HIDE = "com.jarvis.assistant.overlay.ACTION_HIDE"
+        const val ACTION_WAKE_START = "com.jarvis.assistant.overlay.ACTION_WAKE_START"
+        const val ACTION_WAKE_STOP = "com.jarvis.assistant.overlay.ACTION_WAKE_STOP"
         const val EXTRA_SOURCE = "source"
         const val EXTRA_DELAY_MS = "delay_ms"
 
         /** Temporary: how long the overlay stays after "بله ارباب." until a command listener exists. */
         private const val AUTO_DISMISS_MS = 8000L
 
-        /** Set to false once a wake-word engine keeps this service alive permanently. */
-        private const val STOP_SERVICE_AFTER_HIDE = true
+        /** Pause before the microphone is reopened after an interaction (avoids catching TTS tail audio). */
+        private const val RESUME_WAKE_DELAY_MS = 600L
 
         @Volatile private var instance: JarvisOverlayService? = null
 
@@ -246,6 +385,37 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
                 true
             } catch (e: RuntimeException) {
                 Log.e(TAG, "Could not start overlay service", e)
+                false
+            }
+        }
+
+        /**
+         * Starts the wake word service. Call only from a user action while the app is visible
+         * (Android 14+ does not allow starting a microphone foreground service from the background).
+         * @return false if RECORD_AUDIO / overlay permission is missing or the service could not start.
+         */
+        fun startWakeWord(context: Context): Boolean {
+            val app = context.applicationContext
+            if (app.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return false
+            if (!hasOverlayPermission(app)) return false
+            return sendAction(app, ACTION_WAKE_START)
+        }
+
+        /** Turns the wake word off and releases the microphone. Safe when the service is not running. */
+        fun stopWakeWord(context: Context) {
+            val app = context.applicationContext
+            if (instance == null) { WakeWordState.update(status = WakeStatus.OFF, flow = AssistantFlow.IDLE); return }
+            sendAction(app, ACTION_WAKE_STOP)
+        }
+
+        private fun sendAction(app: Context, action: String): Boolean {
+            val intent = Intent(app, JarvisOverlayService::class.java).setAction(action)
+            return try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) app.startForegroundService(intent)
+                else app.startService(intent)
+                true
+            } catch (e: RuntimeException) {
+                Log.e(TAG, "Could not start overlay service ($action)", e)
                 false
             }
         }

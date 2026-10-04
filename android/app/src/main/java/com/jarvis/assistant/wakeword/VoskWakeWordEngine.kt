@@ -1,0 +1,263 @@
+package com.jarvis.assistant.wakeword
+
+import android.Manifest
+import android.content.Context
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import org.json.JSONObject
+import org.vosk.LibVosk
+import org.vosk.LogLevel
+import org.vosk.Model
+import org.vosk.Recognizer
+import java.io.File
+import java.io.FileNotFoundException
+
+/**
+ * Offline wake word detector («هی جارویس») on top of Vosk.
+ *
+ * Guarantees:
+ *  - At most one capture thread / microphone at a time. [start] is idempotent; a new session first
+ *    waits for the previous one to release the microphone.
+ *  - [stop] releases the microphone (the thread closes AudioRecord + Recognizer in `finally`).
+ *  - [release] additionally frees the Vosk model. The engine must not be used afterwards.
+ *  - Callbacks are delivered on the main thread and never after [stop]/[release] for a stale session.
+ *
+ * The Vosk model is expected in assets/[ASSET_DIR] (see INTEGRATION.md); it is copied once to
+ * internal storage because Vosk needs a real directory.
+ */
+class VoskWakeWordEngine(context: Context, private val callback: Callback) {
+
+    interface Callback {
+        /** The wake phrase was detected. The engine has already stopped (microphone released). */
+        fun onWakeWord()
+        /** LOADING_MODEL / LISTENING, or a terminal problem: NO_PERMISSION / MODEL_MISSING / ERROR. */
+        fun onStatus(status: WakeStatus)
+    }
+
+    private val app = context.applicationContext
+    private val main = Handler(Looper.getMainLooper())
+    private val debug = (app.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+
+    private val lock = Any()
+    private var lastSession: Session? = null          // guarded by lock
+    private val modelLock = Any()
+    private var model: Model? = null                  // guarded by modelLock
+    @Volatile private var released = false
+
+    /** Starts listening. No-op if a session is already running. */
+    fun start() {
+        synchronized(lock) {
+            if (released) return
+            val cur = lastSession
+            if (cur != null && !cur.stopped) return
+            val s = Session(cur)
+            lastSession = s
+            s.start()
+        }
+    }
+
+    /** Stops listening and releases the microphone (asynchronously, within ~150 ms). */
+    fun stop() {
+        synchronized(lock) { lastSession?.stopped = true }
+    }
+
+    fun release() {
+        released = true
+        val alive: Boolean
+        synchronized(lock) {
+            lastSession?.stopped = true
+            alive = lastSession?.isAlive == true
+        }
+        if (!alive) closeModel()                       // otherwise the session thread closes it
+    }
+
+    // ---------------------------------------------------------------------------------------------
+
+    private inner class Session(private var previous: Session?) : Thread("JarvisWakeWord") {
+        @Volatile var stopped = false
+
+        override fun run() {
+            try {
+                try { previous?.join() } catch (e: InterruptedException) { return }
+                previous = null
+                if (stopped || released) return
+                capture(this)
+            } catch (t: Throwable) {
+                Log.e(TAG, "Wake word session crashed", t)
+                emit(this, WakeStatus.ERROR)
+            } finally {
+                if (released) closeModel()
+            }
+        }
+    }
+
+    private fun capture(s: Session) {
+        if (app.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            emit(s, WakeStatus.NO_PERMISSION); return
+        }
+        if (model == null) emit(s, WakeStatus.LOADING_MODEL)
+        val m = obtainModel(s) ?: return
+        if (s.stopped || released) return
+
+        var recognizer: Recognizer? = null
+        var audio: AudioRecord? = null
+        try {
+            recognizer = Recognizer(m, SAMPLE_RATE.toFloat(), WakePhrase.grammarJson)
+            recognizer.setWords(true)
+            audio = createAudioRecord()
+            if (audio == null) { emit(s, WakeStatus.ERROR); return }
+            audio.startRecording()
+            if (audio.recordingState != AudioRecord.RECORDSTATE_RECORDING) { emit(s, WakeStatus.ERROR); return }
+            emit(s, WakeStatus.LISTENING)
+
+            val buf = ShortArray(CHUNK_SAMPLES)
+            while (!s.stopped && !released) {
+                val n = audio.read(buf, 0, buf.size)
+                if (n < 0) { emit(s, WakeStatus.ERROR); return }
+                if (n == 0) continue
+                if (recognizer.acceptWaveForm(buf, n) && isWakeWord(recognizer.result)) {
+                    s.stopped = true                    // we are done; mic is released in finally
+                    main.post { if (!released) callback.onWakeWord() }
+                    return
+                }
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "Capture failed", t)
+            emit(s, WakeStatus.ERROR)
+        } finally {
+            try { audio?.stop() } catch (e: IllegalStateException) { /* not started */ }
+            audio?.release()
+            try { recognizer?.close() } catch (e: Throwable) { /* ignore */ }
+        }
+    }
+
+    private fun isWakeWord(json: String): Boolean {
+        val o = try { JSONObject(json) } catch (e: Exception) { return false }
+        val text = o.optString("text")
+        if (text.isBlank()) return false
+        if (debug) WakeWordState.update(heard = text)
+        if (!WakePhrase.matches(text)) return false
+
+        // Confidence of the real (non-[unk]) words.
+        val words = o.optJSONArray("result")
+        var sum = 0.0
+        var count = 0
+        if (words != null) {
+            for (i in 0 until words.length()) {
+                val w = words.optJSONObject(i) ?: continue
+                if (w.optString("word") == "[unk]") continue
+                sum += w.optDouble("conf", 1.0)
+                count++
+            }
+        }
+        val conf = if (count > 0) sum / count else 1.0
+        if (debug) Log.d(TAG, "wake candidate \"$text\" conf=$conf")
+        return conf >= MIN_CONFIDENCE
+    }
+
+    private fun emit(s: Session, status: WakeStatus) {
+        if (s.stopped || released) return
+        main.post { if (!s.stopped && !released) callback.onStatus(status) }
+    }
+
+    private fun createAudioRecord(): AudioRecord? {
+        val min = AudioRecord.getMinBufferSize(
+            SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+        )
+        if (min <= 0) return null
+        val size = maxOf(min * 2, SAMPLE_RATE)         // bytes; >= 0.5 s
+        for (source in intArrayOf(MediaRecorder.AudioSource.VOICE_RECOGNITION, MediaRecorder.AudioSource.MIC)) {
+            try {
+                val r = AudioRecord(
+                    source, SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, size
+                )
+                if (r.state == AudioRecord.STATE_INITIALIZED) return r
+                r.release()
+            } catch (e: SecurityException) {
+                Log.w(TAG, "AudioRecord denied", e)
+            } catch (e: IllegalArgumentException) {
+                Log.w(TAG, "AudioRecord bad args", e)
+            }
+        }
+        return null
+    }
+
+    // ---- model --------------------------------------------------------------------------------
+
+    private fun obtainModel(s: Session): Model? {
+        synchronized(modelLock) { model?.let { return it } }
+        try {
+            val dir = File(app.filesDir, "vosk/$ASSET_DIR")
+            val marker = File(dir, ".ok")
+            val stamp = installStamp()
+            if (!marker.exists() || marker.readText() != stamp) {
+                if (!assetModelPresent()) { emit(s, WakeStatus.MODEL_MISSING); return null }
+                dir.deleteRecursively()
+                copyAsset(ASSET_DIR, dir)
+                marker.writeText(stamp)
+            }
+            if (s.stopped || released) return null
+            LibVosk.setLogLevel(LogLevel.WARNINGS)
+            val m = Model(dir.absolutePath)
+            synchronized(modelLock) {
+                if (released) { m.close(); return null }
+                model = m
+            }
+            return m
+        } catch (t: Throwable) {
+            Log.e(TAG, "Could not load Vosk model", t)
+            emit(s, WakeStatus.ERROR)
+            return null
+        }
+    }
+
+    private fun closeModel() {
+        synchronized(modelLock) {
+            try { model?.close() } catch (e: Throwable) { /* ignore */ }
+            model = null
+        }
+    }
+
+    /** A model counts as present when assets/model-fa/am/final.mdl exists. */
+    private fun assetModelPresent(): Boolean =
+        app.assets.list("$ASSET_DIR/am")?.contains("final.mdl") == true
+
+    /** Changes with every app update, so a replaced model is re-copied. */
+    private fun installStamp(): String = try {
+        app.packageManager.getPackageInfo(app.packageName, 0).lastUpdateTime.toString()
+    } catch (e: Exception) { "0" }
+
+    private fun copyAsset(path: String, dest: File) {
+        val children = app.assets.list(path) ?: emptyArray()
+        if (children.isNotEmpty()) {
+            dest.mkdirs()
+            for (name in children) copyAsset("$path/$name", File(dest, name))
+            return
+        }
+        try {
+            dest.parentFile?.mkdirs()
+            app.assets.open(path).use { input -> dest.outputStream().use { input.copyTo(it) } }
+        } catch (e: FileNotFoundException) {
+            dest.mkdirs()                              // empty directory
+        }
+    }
+
+    companion object {
+        private const val TAG = "VoskWakeWord"
+
+        /** Folder inside app/src/main/assets that holds the unpacked Vosk Persian model. */
+        const val ASSET_DIR = "model-fa"
+
+        private const val SAMPLE_RATE = 16000
+        private const val CHUNK_SAMPLES = 2048          // ~128 ms
+
+        /** Conservative: raise to reduce false positives, lower if the phrase is missed. */
+        private const val MIN_CONFIDENCE = 0.6
+    }
+}

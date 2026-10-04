@@ -24,3 +24,9 @@ android {
         jvmTarget = "21"
     }
 }
+
+dependencies {
+    // Stage 44: offline wake word (Apache-2.0, no API key, no cloud).
+    implementation "net.java.dev.jna:jna:5.13.0@aar"
+    implementation "com.alphacephei:vosk-android:0.3.47"
+}
