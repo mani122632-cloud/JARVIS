@@ -18,6 +18,10 @@ import android.os.Looper
 import android.provider.Settings
 import android.util.Log
 import com.jarvis.assistant.activation.JarvisActivationController
+import com.jarvis.assistant.command.JarvisActionExecutor
+import com.jarvis.assistant.command.JarvisCommandProcessor
+import com.jarvis.assistant.conversation.JarvisConversationController
+import com.jarvis.assistant.speech.JarvisCommandSpeechController
 import com.jarvis.assistant.core.JarvisCoreView
 import com.jarvis.assistant.speech.AndroidTtsSpeechController
 import com.jarvis.assistant.speech.JarvisSpeechController
@@ -49,13 +53,14 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
     private lateinit var window: JarvisOverlayWindow
     private lateinit var speech: JarvisSpeechController
     private lateinit var activation: JarvisActivationController
+    private lateinit var conversation: JarvisConversationController
     private var lastStartId = 0
 
     private lateinit var wake: VoskWakeWordEngine
     private var wakeEnabled = false
     private val resumeWakeRunnable = Runnable { resumeWake() }
 
-    private val autoDismiss = Runnable { activation.deactivate() }
+    private val autoDismiss = Runnable { activation.deactivate() }   // Stage 43 dev-only fallback, no longer scheduled
     private var pendingActivate: Runnable? = null
 
     override fun onCreate() {
@@ -68,13 +73,31 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
             override fun onWakeWord() = onWakeWordDetected()
             override fun onStatus(status: WakeStatus) = onWakeStatus(status)
         })
+        conversation = JarvisConversationController(
+            tts = speech,
+            commandSpeech = JarvisCommandSpeechController(this),
+            processor = JarvisCommandProcessor(),
+            executor = JarvisActionExecutor(this),
+            core = { window.currentCore },
+            callback = object : JarvisConversationController.Callback {
+                override fun onStateChanged(state: JarvisConversationController.State) {
+                    if (!wakeEnabled) return
+                    WakeWordState.update(flow = when (state) {
+                        JarvisConversationController.State.COMMAND_LISTENING -> AssistantFlow.COMMAND_LISTENING
+                        JarvisConversationController.State.COMMAND_PROCESSING -> AssistantFlow.COMMAND_PROCESSING
+                        JarvisConversationController.State.RESPONDING -> AssistantFlow.RESPONDING
+                        JarvisConversationController.State.IDLE -> return
+                    })
+                }
+                override fun onConversationFinished() = endInteraction()   // hides overlay, then Vosk resumes
+            }
+        )
         activation.listener = object : JarvisActivationController.Listener {
             override fun onReadyForCommand() {
-                if (wakeEnabled) WakeWordState.update(flow = AssistantFlow.LISTENING)
-                // Placeholder until the command listener exists: it should take over here and call
-                // endInteraction() when finished. Without it the overlay would never leave.
+                // "بله ارباب." is done. Vosk is suspended (runActivation), so the command recognizer
+                // is the only microphone user from here until the overlay hides.
                 main.removeCallbacks(autoDismiss)
-                main.postDelayed(autoDismiss, AUTO_DISMISS_MS)
+                conversation.begin()
             }
         }
     }
@@ -161,6 +184,7 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
     /** End the current interaction (READY, then fade out). For the future command listener. */
     fun endInteraction() {
         cancelPendingActivate()
+        conversation.cancel()
         activation.deactivate()
     }
 
@@ -251,6 +275,7 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
         wake.release()               // releases the microphone and the Vosk model
         if (WakeWordState.isActive()) WakeWordState.update(status = WakeStatus.OFF)
         WakeWordState.update(flow = AssistantFlow.IDLE)
+        conversation.release()       // stops the command recognizer, frees the microphone
         activation.unbind()          // cancels speech callbacks/timeouts
         window.remove()              // never leak the WindowManager view
         speech.shutdown()

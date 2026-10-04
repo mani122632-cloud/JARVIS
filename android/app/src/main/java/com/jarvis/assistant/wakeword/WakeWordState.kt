@@ -6,7 +6,7 @@ import android.os.Looper
 enum class WakeStatus { OFF, NO_PERMISSION, LOADING_MODEL, MODEL_MISSING, LISTENING, SUSPENDED, ERROR }
 
 /** High-level assistant flow: IDLE -> WAKE_WORD_LISTENING -> OVERLAY_ACTIVATING -> LISTENING. */
-enum class AssistantFlow { IDLE, WAKE_WORD_LISTENING, OVERLAY_ACTIVATING, LISTENING }
+enum class AssistantFlow { IDLE, WAKE_WORD_LISTENING, OVERLAY_ACTIVATING, LISTENING, COMMAND_LISTENING, COMMAND_PROCESSING, RESPONDING }
 
 /**
  * Process-wide, read-only view of the wake word state for the UI (the service writes it).

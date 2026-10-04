@@ -37,6 +37,9 @@ class JarvisOverlayWindow(private val context: Context) {
     /** True from show() until the window has actually been removed (includes the exit fade). */
     val isAttached: Boolean get() = state != State.GONE
 
+    /** The on-screen core, or null when the overlay is not shown. */
+    val currentCore: JarvisCoreView? get() = core
+
     /** Adds the window (or re-enters an exiting one) and returns the core. Null if the window could not be added. */
     fun show(): JarvisCoreView? {
         val existing = root

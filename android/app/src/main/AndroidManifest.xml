@@ -6,6 +6,12 @@
 
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
+    <queries>
+        <!-- Android 11+ package visibility: Instagram launch + the speech recognition service -->
+        <package android:name="com.instagram.android" />
+        <intent><action android:name="android.speech.RecognitionService" /></intent>
+    </queries>
+
     <application
         android:theme="@style/AppTheme"
         android:label="JARVIS"
