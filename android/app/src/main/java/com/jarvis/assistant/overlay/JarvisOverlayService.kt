@@ -18,13 +18,15 @@ import android.os.Looper
 import android.provider.Settings
 import android.util.Log
 import com.jarvis.assistant.activation.JarvisActivationController
+import com.jarvis.assistant.brain.DefaultJarvisBrain
 import com.jarvis.assistant.command.JarvisActionExecutor
 import com.jarvis.assistant.command.JarvisCommandProcessor
 import com.jarvis.assistant.conversation.JarvisConversationController
+import com.jarvis.assistant.memory.SharedPreferencesJarvisMemory
 import com.jarvis.assistant.speech.JarvisCommandSpeechController
 import com.jarvis.assistant.core.JarvisCoreView
-import com.jarvis.assistant.speech.AndroidTtsSpeechController
 import com.jarvis.assistant.speech.JarvisSpeechController
+import com.jarvis.assistant.speech.tts.OfflinePersianTts
 import com.jarvis.assistant.wakeword.AssistantFlow
 import com.jarvis.assistant.wakeword.VoskWakeWordEngine
 import com.jarvis.assistant.wakeword.WakeStatus
@@ -41,7 +43,7 @@ import com.jarvis.assistant.wakeword.WakeWordState
  * Stage 44: while the wake word is enabled this service also owns the offline Vosk detector
  * («هی جارویس»), so it stays alive after the overlay hides and runs as a microphone foreground service:
  *
- *   IDLE -> WAKE_WORD_LISTENING -> (wake word) -> OVERLAY_ACTIVATING -> "بله ارباب." -> LISTENING
+ *   IDLE -> WAKE_WORD_LISTENING -> (wake word) -> ACTIVATING -> "بله ارباب." -> LISTENING
  *        -> overlay hides -> WAKE_WORD_LISTENING
  *
  * The microphone is released while the overlay / TTS / command stage is active and re-acquired after.
@@ -54,6 +56,7 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
     private lateinit var speech: JarvisSpeechController
     private lateinit var activation: JarvisActivationController
     private lateinit var conversation: JarvisConversationController
+    private lateinit var executor: JarvisActionExecutor
     private var lastStartId = 0
 
     private lateinit var wake: VoskWakeWordEngine
@@ -62,21 +65,29 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
 
     private var pendingActivate: Runnable? = null
 
+    /**
+     * True from the moment a wake word is accepted until the interaction has fully ended (overlay hidden).
+     * While set, no wake word is accepted and Vosk is never started, so there can be neither a second
+     * activation nor a second microphone session.
+     */
+    private var interactionActive = false
+
     override fun onCreate() {
         super.onCreate()
         instance = this
         window = JarvisOverlayWindow(this)
-        speech = AndroidTtsSpeechController(this)
+        speech = OfflinePersianTts(this).also { it.initialize() }   // offline Persian voice, loaded once
         activation = JarvisActivationController(speech, presenter = this)
         wake = VoskWakeWordEngine(this, object : VoskWakeWordEngine.Callback {
             override fun onWakeWord() = onWakeWordDetected()
             override fun onStatus(status: WakeStatus) = onWakeStatus(status)
         })
+        executor = JarvisActionExecutor(this)
         conversation = JarvisConversationController(
             tts = speech,
             commandSpeech = JarvisCommandSpeechController(this),
-            processor = JarvisCommandProcessor(),
-            executor = JarvisActionExecutor(this),
+            brain = DefaultJarvisBrain(JarvisCommandProcessor(), SharedPreferencesJarvisMemory(this)),
+            executor = executor,
             core = { window.currentCore },
             callback = object : JarvisConversationController.Callback {
                 override fun onStateChanged(state: JarvisConversationController.State) {
@@ -168,6 +179,7 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
     override fun hideOverlay() {
         window.hide {
             isOverlayVisible = false
+            interactionActive = false
             if (wakeEnabled) WakeWordState.update(flow = AssistantFlow.WAKE_WORD_LISTENING)
             else if (WakeWordState.isActive()) WakeWordState.update(status = WakeStatus.OFF, flow = AssistantFlow.IDLE)
             finishIfIdle()
@@ -185,10 +197,12 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
     }
 
     private fun runActivation(source: JarvisActivationController.Source) {
+        interactionActive = true
         suspendWake()                            // free the mic while the overlay / TTS / commands run
-        if (wakeEnabled) WakeWordState.update(flow = AssistantFlow.OVERLAY_ACTIVATING)
+        if (wakeEnabled) WakeWordState.update(flow = AssistantFlow.ACTIVATING)
         activation.activate(source)
         if (!window.isAttached) {                // window could not be created: don't linger
+            interactionActive = false
             if (wakeEnabled) WakeWordState.update(flow = AssistantFlow.WAKE_WORD_LISTENING)
             finishIfIdle()
             scheduleWakeResume()
@@ -203,14 +217,19 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
     /** Engine already stopped itself (mic released) before this is called. Main thread. */
     private fun onWakeWordDetected() {
         if (!wakeEnabled) return
-        val busy = activation.phase != JarvisActivationController.Phase.IDLE ||
+        val busy = interactionActive || activation.phase != JarvisActivationController.Phase.IDLE ||
             window.isAttached || pendingActivate != null
-        if (busy || !hasOverlayPermission(this)) {
-            if (!busy) Log.w(TAG, "Wake word heard but overlay permission is missing")
+        if (busy) {
+            Log.w(TAG, "Wake word ignored: interaction already in progress")
+            return                                   // the running interaction resumes Vosk when it ends
+        }
+        if (!hasOverlayPermission(this)) {
+            Log.w(TAG, "Wake word heard but overlay permission is missing")
             scheduleWakeResume()
             return
         }
         Log.i(TAG, "Wake word detected")
+        interactionActive = true
         runActivation(JarvisActivationController.Source.WAKE_WORD)
     }
 
@@ -218,7 +237,7 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
         when (status) {
             WakeStatus.LOADING_MODEL, WakeStatus.LISTENING ->
                 if (wakeEnabled) WakeWordState.update(status = status)
-            WakeStatus.NO_PERMISSION, WakeStatus.MODEL_MISSING, WakeStatus.ERROR -> {
+            WakeStatus.NO_PERMISSION, WakeStatus.MODEL_MISSING, WakeStatus.PHRASE_UNSUPPORTED, WakeStatus.ERROR -> {
                 // The detector cannot run: leave wake word mode instead of holding a useless mic service.
                 wakeEnabled = false
                 wake.stop()
@@ -241,7 +260,7 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
     }
 
     private fun resumeWake() {
-        if (!wakeEnabled || window.isAttached || pendingActivate != null) return
+        if (!wakeEnabled || interactionActive || window.isAttached || pendingActivate != null) return
         if (activation.phase != JarvisActivationController.Phase.IDLE) return
         if (!hasMicPermission()) { onWakeStatus(WakeStatus.NO_PERMISSION); return }
         WakeWordState.update(flow = AssistantFlow.WAKE_WORD_LISTENING)
@@ -268,10 +287,12 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
         main.removeCallbacksAndMessages(null)
         cancelPendingActivate()
         wakeEnabled = false
+        interactionActive = false
         wake.release()               // releases the microphone and the Vosk model
         if (WakeWordState.isActive()) WakeWordState.update(status = WakeStatus.OFF)
         WakeWordState.update(flow = AssistantFlow.IDLE)
         conversation.release()       // stops the command recognizer, frees the microphone
+        executor.release()           // unregisters the torch-state callback
         activation.unbind()          // cancels speech callbacks/timeouts
         window.remove()              // never leak the WindowManager view
         speech.shutdown()

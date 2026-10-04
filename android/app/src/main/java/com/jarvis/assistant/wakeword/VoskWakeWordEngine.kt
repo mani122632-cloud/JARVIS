@@ -48,7 +48,11 @@ class VoskWakeWordEngine(context: Context, private val callback: Callback) {
     private var lastSession: Session? = null          // guarded by lock
     private val modelLock = Any()
     private var model: Model? = null                  // guarded by modelLock
+    private var grammar: WakePhrase.Grammar? = null   // built once per loaded model; guarded by modelLock
     @Volatile private var released = false
+
+    /** True once a wake word was delivered; reset only by the next explicit [start]. */
+    private val activationDelivered = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /** Starts listening. No-op if a session is already running. */
     fun start() {
@@ -56,6 +60,7 @@ class VoskWakeWordEngine(context: Context, private val callback: Callback) {
             if (released) return
             val cur = lastSession
             if (cur != null && !cur.stopped) return
+            activationDelivered.set(false)
             val s = Session(cur)
             lastSession = s
             s.start()
@@ -104,11 +109,13 @@ class VoskWakeWordEngine(context: Context, private val callback: Callback) {
         if (model == null) emit(s, WakeStatus.LOADING_MODEL)
         val m = obtainModel(s) ?: return
         if (s.stopped || released) return
+        val g = synchronized(modelLock) { grammar }
+        if (g == null) { emit(s, WakeStatus.PHRASE_UNSUPPORTED); return }
 
         var recognizer: Recognizer? = null
         var audio: AudioRecord? = null
         try {
-            recognizer = Recognizer(m, SAMPLE_RATE.toFloat(), WakePhrase.grammarJson)
+            recognizer = Recognizer(m, SAMPLE_RATE.toFloat(), g.json)
             recognizer.setWords(true)
             audio = createAudioRecord()
             if (audio == null) { emit(s, WakeStatus.ERROR); return }
@@ -117,14 +124,26 @@ class VoskWakeWordEngine(context: Context, private val callback: Callback) {
             emit(s, WakeStatus.LISTENING)
 
             val buf = ShortArray(CHUNK_SAMPLES)
+            var sumSq = 0.0                             // energy of the audio since the last final result
+            var count = 0L
             while (!s.stopped && !released) {
                 val n = audio.read(buf, 0, buf.size)
                 if (n < 0) { emit(s, WakeStatus.ERROR); return }
                 if (n == 0) continue
-                if (recognizer.acceptWaveForm(buf, n) && isWakeWord(recognizer.result)) {
-                    s.stopped = true                    // we are done; mic is released in finally
-                    main.post { if (!released) callback.onWakeWord() }
-                    return
+                for (i in 0 until n) { val v = buf[i].toDouble(); sumSq += v * v }
+                count += n
+                if (recognizer.acceptWaveForm(buf, n)) {
+                    // FINAL result only (partial results are never looked at).
+                    val rms = if (count > 0) Math.sqrt(sumSq / count) else 0.0
+                    sumSq = 0.0; count = 0
+                    if (isWakeWord(g, recognizer.result, rms)) {
+                        s.stopped = true                // we are done; mic is released in finally
+                        // Exactly one activation per engine run, even if something else re-enters here.
+                        if (activationDelivered.compareAndSet(false, true)) {
+                            main.post { if (!released) callback.onWakeWord() }
+                        }
+                        return
+                    }
                 }
             }
         } catch (t: Throwable) {
@@ -137,28 +156,20 @@ class VoskWakeWordEngine(context: Context, private val callback: Callback) {
         }
     }
 
-    private fun isWakeWord(json: String): Boolean {
-        val o = try { JSONObject(json) } catch (e: Exception) { return false }
-        val text = o.optString("text")
-        if (text.isBlank()) return false
-        if (debug) WakeWordState.update(heard = text)
-        if (!WakePhrase.matches(text)) return false
-
-        // Confidence of the real (non-[unk]) words.
-        val words = o.optJSONArray("result")
-        var sum = 0.0
-        var count = 0
-        if (words != null) {
-            for (i in 0 until words.length()) {
-                val w = words.optJSONObject(i) ?: continue
-                if (w.optString("word") == "[unk]") continue
-                sum += w.optDouble("conf", 1.0)
-                count++
-            }
+    /**
+     * Only called with a FINAL result (acceptWaveForm == true). Partial results are never examined, so a
+     * half-recognised syllable can never wake JARVIS. See [WakePhrase] for the rules.
+     */
+    private fun isWakeWord(g: WakePhrase.Grammar, json: String, rms: Double): Boolean {
+        val verdict = g.evaluate(json).let { v ->
+            if (v.accepted) WakePhrase.energyVerdict(rms).let { e -> if (e.accepted) v else e } else v
         }
-        val conf = if (count > 0) sum / count else 1.0
-        if (debug) Log.d(TAG, "wake candidate \"$text\" conf=$conf")
-        return conf >= MIN_CONFIDENCE
+        if (debug) {
+            val heard = try { JSONObject(json).optString("text") } catch (e: Exception) { "" }
+            if (heard.isNotBlank()) WakeWordState.update(heard = heard)
+            Log.d(TAG, "wake candidate \"$heard\" -> ${if (verdict.accepted) "ACCEPT" else "reject"} (${verdict.reason})")
+        }
+        return verdict.accepted
     }
 
     private fun emit(s: Session, status: WakeStatus) {
@@ -205,9 +216,12 @@ class VoskWakeWordEngine(context: Context, private val callback: Callback) {
             if (s.stopped || released) return null
             LibVosk.setLogLevel(LogLevel.WARNINGS)
             val m = Model(dir.absolutePath)
+            val g = WakePhrase.build(readVocabulary(dir))
+            Log.i(TAG, "Wake grammar: ${g?.json ?: "UNSUPPORTED (model does not know the phrase)"} tier=${g?.tier}")
             synchronized(modelLock) {
                 if (released) { m.close(); return null }
                 model = m
+                grammar = g
             }
             return m
         } catch (t: Throwable) {
@@ -221,6 +235,31 @@ class VoskWakeWordEngine(context: Context, private val callback: Callback) {
         synchronized(modelLock) {
             try { model?.close() } catch (e: Throwable) { /* ignore */ }
             model = null
+            grammar = null
+        }
+    }
+
+    /**
+     * The subset of [WakePhrase.candidateWords] present in the model's word list (graph/words.txt,
+     * one "word id" per line). Null if the list cannot be read; the grammar then assumes all exist.
+     */
+    private fun readVocabulary(modelDir: File): Set<String>? {
+        val f = File(modelDir, "graph/words.txt")
+        if (!f.isFile) return null
+        val wanted = WakePhrase.candidateWords()
+        val found = HashSet<String>()
+        return try {
+            f.bufferedReader(Charsets.UTF_8).useLines { lines ->
+                for (line in lines) {
+                    val sp = line.indexOf(' ')
+                    val w = WakePhrase.normalize(if (sp > 0) line.substring(0, sp) else line)
+                    if (w in wanted) found += w
+                }
+            }
+            found
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not read model vocabulary", e)
+            null
         }
     }
 
@@ -256,8 +295,5 @@ class VoskWakeWordEngine(context: Context, private val callback: Callback) {
 
         private const val SAMPLE_RATE = 16000
         private const val CHUNK_SAMPLES = 2048          // ~128 ms
-
-        /** Conservative: raise to reduce false positives, lower if the phrase is missed. */
-        private const val MIN_CONFIDENCE = 0.6
     }
 }

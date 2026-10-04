@@ -6,12 +6,19 @@
 
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
+    <!-- Stage 46.3: voice commands. Both are normal (install-time) permissions, no runtime prompt.
+         SET_ALARM: AlarmClock.ACTION_SET_ALARM / ACTION_SET_TIMER.
+         MODIFY_AUDIO_SETTINGS: AudioManager.setStreamVolume (kept for OEMs that enforce it).
+         The flashlight (CameraManager.setTorchMode) needs NO camera permission, so none is requested. -->
+    <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
     <queries>
-        <!-- Android 11+ package visibility: Instagram launch + the speech recognition service -->
+        <!-- Android 11+ package visibility: apps JARVIS may open (see command/AppRegistry.kt) + the speech recognition service -->
         <package android:name="com.instagram.android" />
+        <package android:name="com.android.chrome" />
+        <package android:name="com.google.android.youtube" />
         <intent><action android:name="android.speech.RecognitionService" /></intent>
-        <!-- Without this, Android 11+ hides every TTS engine and TextToSpeech never initializes -->
-        <intent><action android:name="android.intent.action.TTS_SERVICE" /></intent>
     </queries>
 
     <application

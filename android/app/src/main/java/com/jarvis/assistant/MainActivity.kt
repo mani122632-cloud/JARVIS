@@ -2,6 +2,7 @@ package com.jarvis.assistant
 
 import android.Manifest
 import android.app.Activity
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Color
@@ -18,6 +19,9 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import com.jarvis.assistant.overlay.JarvisOverlayService
+import com.jarvis.assistant.speech.tts.OfflinePersianTts
+import com.jarvis.assistant.speech.JarvisSpeechController
+import com.jarvis.assistant.wakeword.TtsStatus
 import com.jarvis.assistant.wakeword.WakeStatus
 import com.jarvis.assistant.wakeword.WakeWordState
 
@@ -36,6 +40,11 @@ class MainActivity : Activity() {
     private lateinit var grantButton: TextView
     private lateinit var voiceButton: TextView
     private lateinit var voiceStatus: TextView
+    private lateinit var ttsStatus: TextView
+
+    /** DEBUG builds only: a separate engine instance used by the [DEV] voice test button. */
+    private var devTts: OfflinePersianTts? = null
+    private var devPhraseIndex = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -55,6 +64,12 @@ class MainActivity : Activity() {
     override fun onStop() {
         WakeWordState.listener = null
         super.onStop()
+    }
+
+    override fun onDestroy() {
+        devTts?.release()
+        devTts = null
+        super.onDestroy()
     }
 
     override fun onResume() {
@@ -88,12 +103,39 @@ class MainActivity : Activity() {
             WakeStatus.LISTENING -> "منتظر «هی جارویس» هستم"
             WakeStatus.SUSPENDED -> "در حال پاسخ‌دهی"
             WakeStatus.MODEL_MISSING -> "مدل صوتی فارسی داخل برنامه نیست"
+            WakeStatus.PHRASE_UNSUPPORTED -> "مدل صوتی عبارت «هی جارویس» را نمی‌شناسد"
             WakeStatus.NO_PERMISSION -> "اجازه میکروفون لازم است"
             WakeStatus.ERROR -> "میکروفون یا مدل صوتی در دسترس نیست"
             WakeStatus.OFF -> ""
         }
         voiceStatus.text = msg
         voiceStatus.visibility = if (msg.isEmpty()) View.GONE else View.VISIBLE
+
+        val tmsg = when (WakeWordState.tts) {
+            TtsStatus.LOADING -> "در حال آماده‌سازی صدای فارسی…"
+            TtsStatus.MODEL_MISSING -> "Offline Persian TTS model is missing"
+            TtsStatus.ENGINE_MISSING -> "Offline Persian TTS engine is not in this build"
+            TtsStatus.ERROR -> "Offline Persian TTS failed to load"
+            TtsStatus.READY, TtsStatus.OFF -> ""
+        }
+        ttsStatus.text = tmsg
+        ttsStatus.visibility = if (tmsg.isEmpty()) View.GONE else View.VISIBLE
+    }
+
+    private fun isDebuggable(): Boolean = (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+
+    /** [DEV] Speaks the next sample sentence through the offline engine; no overlay, no microphone. */
+    private fun onDevTtsClicked() {
+        val tts = devTts ?: OfflinePersianTts(this).also { devTts = it; it.initialize() }
+        val phrases = com.jarvis.assistant.speech.JarvisPhrases.PREWARM
+        val text = phrases[devPhraseIndex % phrases.size]
+        devPhraseIndex++
+        tts.speak(text, object : JarvisSpeechController.Callback {
+            override fun onStart() = Unit
+            override fun onDone(success: Boolean) {
+                if (!success) Toast.makeText(this@MainActivity, tts.lastError ?: "TTS failed", Toast.LENGTH_LONG).show()
+            }
+        })
     }
 
     private fun onVoiceClicked() {
@@ -196,6 +238,16 @@ class MainActivity : Activity() {
         }
         column.addView(voiceButton, lp(20))
         column.addView(voiceStatus, lp(14))
+        ttsStatus = TextView(this).apply {
+            setTextColor(TEXT_SECONDARY)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            gravity = Gravity.CENTER
+            visibility = View.GONE
+        }
+        column.addView(ttsStatus, lp(10))
+        if (isDebuggable()) {
+            column.addView(outlineButton("[DEV] تست صدای فارسی") { onDevTtsClicked() }, lp(20))
+        }
 
         root.addView(column, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         return root
