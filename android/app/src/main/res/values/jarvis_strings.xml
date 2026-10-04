@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="jarvis_title" translatable="false">JARVIS</string>
+    <string name="jarvis_status_ready">آماده‌ام</string>
+</resources>

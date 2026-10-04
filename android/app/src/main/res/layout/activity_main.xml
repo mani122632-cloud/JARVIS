@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/jarvis_black">
+
+    <TextView
+        android:id="@+id/jarvis_title"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|center_horizontal"
+        android:layout_marginTop="72dp"
+        android:fontFamily="sans-serif-light"
+        android:layoutDirection="ltr"
+        android:letterSpacing="0.4"
+        android:paddingStart="7dp"
+        android:text="@string/jarvis_title"
+        android:textAlignment="center"
+        android:textColor="@color/jarvis_title"
+        android:textDirection="ltr"
+        android:textSize="18sp" />
+
+    <com.jarvis.assistant.ui.JarvisCoreView
+        android:id="@+id/jarvis_core"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:layout_marginStart="24dp"
+        android:layout_marginEnd="24dp" />
+
+    <TextView
+        android:id="@+id/jarvis_status"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|center_horizontal"
+        android:layout_marginBottom="104dp"
+        android:layoutDirection="rtl"
+        android:text="@string/jarvis_status_ready"
+        android:textAlignment="center"
+        android:textColor="@color/jarvis_status"
+        android:textDirection="rtl"
+        android:textSize="17sp" />
+
+</FrameLayout>
