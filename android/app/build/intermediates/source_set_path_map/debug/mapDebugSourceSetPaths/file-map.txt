@@ -1,0 +1,7 @@
+com.jarvis.assistant.app-pngs-0 /data/data/com.termux/files/home/JARVIS/android/app/build/generated/res/pngs/debug
+com.jarvis.assistant.app-resValues-1 /data/data/com.termux/files/home/JARVIS/android/app/build/generated/res/resValues/debug
+com.jarvis.assistant.app-packageDebugResources-2 /data/data/com.termux/files/home/JARVIS/android/app/build/intermediates/incremental/debug/packageDebugResources/merged.dir
+com.jarvis.assistant.app-packageDebugResources-3 /data/data/com.termux/files/home/JARVIS/android/app/build/intermediates/incremental/debug/packageDebugResources/stripped.dir
+com.jarvis.assistant.app-debug-4 /data/data/com.termux/files/home/JARVIS/android/app/build/intermediates/merged_res/debug/mergeDebugResources
+com.jarvis.assistant.app-debug-5 /data/data/com.termux/files/home/JARVIS/android/app/src/debug/res
+com.jarvis.assistant.app-main-6 /data/data/com.termux/files/home/JARVIS/android/app/src/main/res
