@@ -20,7 +20,7 @@
         android:textDirection="ltr"
         android:textSize="18sp" />
 
-    <com.jarvis.assistant.ui.JarvisCoreView
+    <com.jarvis.assistant.core.JarvisCoreView
         android:id="@+id/jarvis_core"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"

@@ -7,8 +7,8 @@ import android.os.Build
 import android.os.Bundle
 import android.view.View
 import android.view.WindowInsetsController
-import com.jarvis.assistant.ui.JarvisCoreView
-import com.jarvis.assistant.ui.JarvisState
+import com.jarvis.assistant.core.JarvisCoreView
+import com.jarvis.assistant.core.JarvisState
 
 class MainActivity : Activity() {
 
@@ -23,7 +23,7 @@ class MainActivity : Activity() {
         configureSystemBars()
 
         core = findViewById(R.id.jarvis_core)
-        core.state = JarvisState.READY
+        core.setState(JarvisState.READY)
     }
 
     @Suppress("DEPRECATION")
