@@ -30,6 +30,7 @@ class MainActivity : Activity() {
         speech = AndroidTtsSpeechController(this)
         activation = JarvisActivationController(speech)
         activation.bind(core)
+        activation.activate()
     }
 
     override fun onDestroy() {
