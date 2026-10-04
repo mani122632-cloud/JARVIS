@@ -37,7 +37,6 @@ class MainActivity : Activity() {
     private lateinit var grantButton: TextView
     private lateinit var voiceButton: TextView
     private lateinit var voiceStatus: TextView
-    private var devHeard: TextView? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -99,7 +98,6 @@ class MainActivity : Activity() {
         }
         voiceStatus.text = msg
         voiceStatus.visibility = if (msg.isEmpty()) View.GONE else View.VISIBLE
-        devHeard?.text = "[DEV] ${status.name} / ${WakeWordState.flow.name}\nشنیده‌شده: ${WakeWordState.lastHeard}"
     }
 
     private fun onVoiceClicked() {
@@ -201,24 +199,6 @@ class MainActivity : Activity() {
             visibility = View.GONE
         }
         column.addView(voiceButton, lp(20))
-        column.addView(voiceStatus, lp(14))
-
-        if (isDebuggable) {
-            // Developer-only test aid (debug builds): no ADB needed. Remove together with show() later.
-            val devButton = outlineButton("[DEV] نمایش آزمایشی پس از ۸ ثانیه") {
-                if (JarvisOverlayService.hasOverlayPermission(this)) {
-                    JarvisOverlayService.show(this, 8000L)
-                    Toast.makeText(this, "به برنامه دیگری بروید…", Toast.LENGTH_SHORT).show()
-                }
-            }
-            devHeard = TextView(this).apply {
-                setTextColor(TEXT_SECONDARY)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-                gravity = Gravity.CENTER
-                layoutDirection = View.LAYOUT_DIRECTION_LTR
-            }
-            column.addView(devButton, lp(40))
-            column.addView(devHeard!!, lp(10))
         }
 
         root.addView(column, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
