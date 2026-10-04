@@ -17,8 +17,10 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.setBackgroundDrawable(ColorDrawable(Color.BLACK))
-        configureSystemBars()
         setContentView(R.layout.activity_main)
+        // Must run after setContentView: window.insetsController can throw
+        // (NullPointerException on some Android 11 builds) before the decor view exists.
+        configureSystemBars()
 
         core = findViewById(R.id.jarvis_core)
         core.state = JarvisState.READY
@@ -26,19 +28,22 @@ class MainActivity : Activity() {
 
     @Suppress("DEPRECATION")
     private fun configureSystemBars() {
-        window.statusBarColor = Color.TRANSPARENT
-        window.navigationBarColor = Color.BLACK
-        if (Build.VERSION.SDK_INT >= 30) {
-            window.insetsController?.setSystemBarsAppearance(
-                0,
-                WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or
-                    WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
-            )
-        } else {
-            val decor = window.decorView
-            decor.systemUiVisibility = decor.systemUiVisibility and
-                View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR.inv() and
-                View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR.inv()
+        // Purely cosmetic (light icons on black); must never be able to crash startup.
+        runCatching {
+            window.statusBarColor = Color.TRANSPARENT
+            window.navigationBarColor = Color.BLACK
+            if (Build.VERSION.SDK_INT >= 30) {
+                window.insetsController?.setSystemBarsAppearance(
+                    0,
+                    WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS or
+                        WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
+                )
+            } else {
+                val decor = window.decorView
+                decor.systemUiVisibility = decor.systemUiVisibility and
+                    View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR.inv() and
+                    View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR.inv()
+            }
         }
     }
 }

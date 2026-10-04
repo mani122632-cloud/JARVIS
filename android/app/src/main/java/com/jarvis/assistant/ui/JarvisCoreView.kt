@@ -139,6 +139,12 @@ class JarvisCoreView @JvmOverloads constructor(
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         baseR = min(w, h) / 2f - 4f * density
+        if (baseR <= 0f) {
+            // RadialGradient throws IllegalArgumentException for radius <= 0.
+            baseR = 0f
+            haloPaint.shader = null
+            return
+        }
         setRect(rectB, baseR * R_B)
         setRect(rectD, baseR * R_D)
         setRect(rectE, baseR * R_E)
@@ -228,6 +234,7 @@ class JarvisCoreView @JvmOverloads constructor(
     }
 
     override fun onDraw(canvas: Canvas) {
+        if (baseR <= 0f) return
         if (running) {
             val now = SystemClock.uptimeMillis()
             val dt = if (lastFrameMs == 0L) 0f else min((now - lastFrameMs) / 1000f, MAX_FRAME_DT)
@@ -243,8 +250,10 @@ class JarvisCoreView @JvmOverloads constructor(
         canvas.translate(width / 2f, height / 2f)
 
         // Soft, restrained halo behind the core.
-        haloPaint.alpha = a(0.10f + 0.08f * n)
-        canvas.drawCircle(0f, 0f, baseR * R_HALO, haloPaint)
+        if (haloPaint.shader != null) {
+            haloPaint.alpha = a(0.10f + 0.08f * n)
+            canvas.drawCircle(0f, 0f, baseR * R_HALO, haloPaint)
+        }
 
         // Core disc.
         canvas.drawCircle(0f, 0f, coreR, corePaint)
