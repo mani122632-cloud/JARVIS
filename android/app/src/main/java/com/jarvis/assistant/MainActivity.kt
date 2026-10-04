@@ -24,6 +24,7 @@ class MainActivity : Activity() {
 
         core = findViewById(R.id.jarvis_core)
         core.setState(JarvisState.READY)
+        core.showCinematic()
     }
 
     @Suppress("DEPRECATION")

@@ -7,7 +7,7 @@
     <TextView
         android:id="@+id/jarvis_title"
         android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
+        android:layout_height="match_parent"
         android:layout_gravity="top|center_horizontal"
         android:layout_marginTop="72dp"
         android:fontFamily="sans-serif-light"
@@ -23,7 +23,7 @@
     <com.jarvis.assistant.core.JarvisCoreView
         android:id="@+id/jarvis_core"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
+        android:layout_height="match_parent"
         android:layout_gravity="center"
         android:layout_marginStart="24dp"
         android:layout_marginEnd="24dp" />
@@ -31,7 +31,7 @@
     <TextView
         android:id="@+id/jarvis_status"
         android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
+        android:layout_height="match_parent"
         android:layout_gravity="bottom|center_horizontal"
         android:layout_marginBottom="104dp"
         android:layoutDirection="rtl"

@@ -11,7 +11,8 @@ import kotlin.math.min
  * Public API:
  *  setState(JarvisState), showCinematic(), hideCinematic(),
  *  setVoiceAmplitude(0..1), setCoreVisible(visible, animated)
- * Default: visible (so existing UI is unchanged). Draws on a transparent background.
+ * Default: HIDDEN (off-screen, no animation work). Call showCinematic() to enter.
+ * Draws on a transparent background; the reactor enters/exits through the view's bottom edge.
  */
 class JarvisCoreView @JvmOverloads constructor(
     context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
@@ -96,7 +97,8 @@ class JarvisCoreView @JvmOverloads constructor(
     override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) {
         super.onSizeChanged(w, h, ow, oh)
         renderer.resize(w, h)
-        controller.hiddenOffsetPx = h / 2f + renderer.radius * 1.1f
+        // center sits at h/2; glow halo reaches ~1.2R (x up to ~1.1 scale). Whole reactor ends below the bottom edge.
+        controller.hiddenOffsetPx = h / 2f + renderer.radius * 1.4f
         controller.update(0f)
     }
 

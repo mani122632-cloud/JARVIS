@@ -25,12 +25,24 @@ class CoreAnimationController(private val s: CoreAnimationState) {
         private const val HIDE_SEC = 0.62f
         private const val TWO_PI = (2.0 * PI).toFloat()
 
-        /** FastOutSlowIn-like: fast start, soft settle. Symmetric use keeps reversals continuous. */
+        /**
+         * Material FastOutSlowIn = cubic-bezier(0.4, 0, 0.2, 1), solved without allocation.
+         * Applied to a linear progress value, so reversing mid-flight stays position-continuous.
+         */
         fun ease(t: Float): Float {
-            val u = 1f - t
-            val a = 1f - u * u * u
-            val b = t * t * (3f - 2f * t)
-            return 0.5f * (a + b)
+            if (t <= 0f) return 0f
+            if (t >= 1f) return 1f
+            val x1 = 0.4f; val x2 = 0.2f
+            var u = t
+            for (i in 0 until 6) {
+                val v = 1f - u
+                val x = 3f * v * v * u * x1 + 3f * v * u * u * x2 + u * u * u
+                val dx = 3f * v * v * x1 + 6f * v * u * (x2 - x1) + 3f * u * u * (1f - x2)
+                if (kotlin.math.abs(dx) < 1e-4f) break
+                u = (u - (x - t) / dx).coerceIn(0f, 1f)
+            }
+            val v = 1f - u
+            return 3f * v * u * u + u * u * u   // y1 = 0, y2 = 1
         }
 
         private fun transitionSeconds(from: JarvisState, to: JarvisState): Float = when {
@@ -48,8 +60,9 @@ class CoreAnimationController(private val s: CoreAnimationState) {
     private var transT = 1f
     private var transDur = 0.45f
 
-    private var visT = 1f
-    private var visTarget = 1f
+    // Hidden by default: the reactor only exists on screen while JARVIS is active.
+    private var visT = 0f
+    private var visTarget = 0f
 
     private var wavePhase = 0f
     private var patternPhase = 0f
@@ -73,7 +86,10 @@ class CoreAnimationController(private val s: CoreAnimationState) {
         transDur = transitionSeconds(state, ns)
         transT = 0f
         state = ns
+        if (isHidden) { target.copyInto(cur); transT = 1f }   // off-screen: no point blending
     }
+
+    init { applyVisibility() }
 
     fun show() { visTarget = 1f }
     fun hide() { visTarget = 0f }
@@ -110,7 +126,8 @@ class CoreAnimationController(private val s: CoreAnimationState) {
 
         val raw = rawVoice
         s.voiceAmplitude = raw
-        val sm = s.smoothedVoiceAmplitude * 0.82f + raw * 0.18f
+        val k = 1f - Math.pow(0.82, (dt * 60f).toDouble()).toFloat()   // frame-rate independent
+        val sm = s.smoothedVoiceAmplitude + (raw - s.smoothedVoiceAmplitude) * k
         s.smoothedVoiceAmplitude = sm
         val vw = cur[12]
 
@@ -128,6 +145,6 @@ class CoreAnimationController(private val s: CoreAnimationState) {
         s.visibilityProgress = e
         s.verticalEntryOffset = (1f - e) * hiddenOffsetPx
         s.entryScale = 0.94f + 0.06f * e
-        s.masterBrightness = 0.65f + 0.35f * e + 0.12f * kotlin.math.sin(PI.toFloat() * e)
+        s.masterBrightness = 0.70f + 0.30f * e
     }
 }
