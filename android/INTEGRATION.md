@@ -1,34 +1,38 @@
-# JARVIS Stage 41 — Cinematic activation / exit
+# Stage 42 — Activation layer (not compiled here)
 
-NOT compiled or run here — build via GitHub Actions and verify on a device.
-Renderer (Arc Reactor design) is untouched.
+## Changed / new files (all new; place under app/src/main/java/com/jarvis/assistant/)
+- activation/JarvisActivationController.kt
+- speech/JarvisSpeechController.kt
+- speech/AndroidTtsSpeechController.kt
 
-## 1. Files (replace, package com.jarvis.assistant.core)
-app/src/main/java/com/jarvis/assistant/core/CoreAnimationController.kt
-app/src/main/java/com/jarvis/assistant/core/JarvisCoreView.kt
+No existing files replaced. JarvisCoreRenderer, Gradle, manifest, layouts untouched.
+No project TTS was found in the uploaded files, so a minimal Android TTS wrapper is included;
+if you already have one, implement JarvisSpeechController around it instead and skip the 3rd file.
+The device needs a Persian TTS voice installed to pronounce "بله ارباب." correctly.
 
-## 2. MainActivity
-Core is now HIDDEN by default. Add only the calls below at the right moments
-(no other changes). If something already calls setCoreVisible(false, false) at
-startup, it can stay; it is now redundant.
+## MainActivity
+```kotlin
+private lateinit var speech: JarvisSpeechController
+private lateinit var activation: JarvisActivationController
 
-## 3. Layout
-No change. Keep the existing JarvisCoreView. The reactor enters/exits through the
-view's own bottom edge, so for a screen-bottom entrance make the view reach the
-bottom of the screen (e.g. match_parent height).
+// onCreate, after setContentView (do NOT call showCinematic here):
+speech = AndroidTtsSpeechController(this)          // keeps applicationContext only
+activation = JarvisActivationController(speech)
+activation.bind(findViewById(R.id.jarvisCore))     // your existing JarvisCoreView id
+// activation.listener = object : JarvisActivationController.Listener {
+//     override fun onReadyForCommand() { /* future: start command listening */ }
+// }
 
-## 4-7. Calls
-core.showCinematic()                 // rise from bottom, ~550 ms, FastOutSlowIn
-core.setState(JarvisState.LISTENING) // restrained cyan activity
-core.setState(JarvisState.THINKING)  // scanner + LED pattern
-core.setState(JarvisState.SPEAKING)  // follows amplitude
-core.setVoiceAmplitude(0f..1f)       // call while SPEAKING; smoothed internally
-core.setState(JarvisState.READY)     // optional, before hide
-core.hideCinematic()                 // sink fully below, ~620 ms, loop stops
-core.setCoreVisible(visible, animated) // convenience
+// onDestroy:
+activation.unbind()
+speech.shutdown()
+```
+Future triggers (wake word, overlay, headset, button) just call `activation.activate(Source.X)`.
+End an interaction with `activation.deactivate()`.
 
-## Behavior
-- Reversal (show<->hide mid-flight) continues from the current position; no jump.
-- Repeated show()/hide() are no-ops.
-- State changes while hidden are applied instantly; position is never reset by state.
-- Frame loop sleeps when fully hidden or detached; idle visible runs ~30 fps.
+## Manual dev test (temporary, don't commit)
+`activation.activate()` — e.g. one line at the end of onCreate while testing; remove afterwards.
+
+Behavior: repeated activate() while activating/active returns false (no restart). If TTS never
+responds, a 6 s one-shot timeout still moves to ready. Core is LISTENING -> SPEAKING (while the
+phrase plays) -> LISTENING. Stock TTS gives no amplitude, so setVoiceAmplitude is not driven yet.

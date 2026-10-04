@@ -7,31 +7,43 @@ import android.os.Build
 import android.os.Bundle
 import android.view.View
 import android.view.WindowInsetsController
+import com.jarvis.assistant.activation.JarvisActivationController
 import com.jarvis.assistant.core.JarvisCoreView
-import com.jarvis.assistant.core.JarvisState
+import com.jarvis.assistant.speech.AndroidTtsSpeechController
+import com.jarvis.assistant.speech.JarvisSpeechController
 
 class MainActivity : Activity() {
 
     private lateinit var core: JarvisCoreView
+    private lateinit var speech: JarvisSpeechController
+    private lateinit var activation: JarvisActivationController
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
         window.setBackgroundDrawable(ColorDrawable(Color.BLACK))
         setContentView(R.layout.activity_main)
-        // Must run after setContentView: window.insetsController can throw
-        // (NullPointerException on some Android 11 builds) before the decor view exists.
         configureSystemBars()
 
         core = findViewById(R.id.jarvis_core)
-        core.setState(JarvisState.READY)
+
+        speech = AndroidTtsSpeechController(this)
+        activation = JarvisActivationController(speech)
+        activation.bind(core)
+    }
+
+    override fun onDestroy() {
+        activation.unbind()
+        speech.shutdown()
+        super.onDestroy()
     }
 
     @Suppress("DEPRECATION")
     private fun configureSystemBars() {
-        // Purely cosmetic (light icons on black); must never be able to crash startup.
         runCatching {
             window.statusBarColor = Color.TRANSPARENT
             window.navigationBarColor = Color.BLACK
+
             if (Build.VERSION.SDK_INT >= 30) {
                 window.insetsController?.setSystemBarsAppearance(
                     0,
