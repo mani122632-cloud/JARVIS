@@ -2,6 +2,7 @@ package com.jarvis.assistant.conversation
 
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import com.jarvis.assistant.command.JarvisAction
 import com.jarvis.assistant.command.JarvisActionExecutor
 import com.jarvis.assistant.command.JarvisCommandProcessor
@@ -46,6 +47,7 @@ class JarvisConversationController(
     init {
         commandSpeech.setListener(object : JarvisCommandSpeechController.Listener {
             override fun onListeningStarted() { core()?.setState(JarvisState.LISTENING) }
+            override fun onPartialResult(text: String) = onPartial(text)
             override fun onFinalResult(text: String) = onCommand(text)
             override fun onError(error: CommandSpeechError) = onSpeechError(error)
             override fun onVoiceLevel(level: Float) { if (state == State.COMMAND_LISTENING) core()?.setVoiceAmplitude(level) }
@@ -79,8 +81,31 @@ class JarvisConversationController(
         main.postDelayed({ if (gen == generation && state == State.COMMAND_LISTENING) commandSpeech.startListening() }, LISTEN_DELAY_MS)
     }
 
+    /**
+     * Fast path: a partial that already is a complete, understood command and stays unchanged for
+     * [PARTIAL_STABLE_MS] is executed without waiting for the recognizer's (sometimes very slow) end-of-speech.
+     * Any newer partial restarts the wait, so "اینستاگرام ... رو ببند" is not cut off at "اینستاگرام".
+     */
+    private fun onPartial(text: String) {
+        if (state != State.COMMAND_LISTENING) return
+        main.removeCallbacks(partialRunnable)
+        if (!processor.process(text).handled) return
+        partialText = text
+        main.postDelayed(partialRunnable, PARTIAL_STABLE_MS)
+    }
+
+    private var partialText = ""
+    private val partialRunnable = Runnable {
+        if (state != State.COMMAND_LISTENING) return@Runnable
+        Log.i(TAG, "Executing stable partial: $partialText")
+        commandSpeech.stopListening()                    // silent abort: releases the microphone now
+        onCommand(partialText)
+    }
+
     private fun onCommand(text: String) {
         if (state != State.COMMAND_LISTENING) return
+        main.removeCallbacks(partialRunnable)
+        Log.i(TAG, "Command: $text")
         generation++
         setState(State.COMMAND_PROCESSING)
         core()?.setVoiceAmplitude(0f)
@@ -119,7 +144,7 @@ class JarvisConversationController(
         if (message != null) speak(message) { listen() } else main.postDelayed(next, RETRY_DELAY_MS)
     }
 
-    /** Speaks [text]; [then] runs once when done, failed, or after a safety timeout. */
+    /** Speaks [text]; [then] runs when done or failed, or if TTS never starts / hangs. Never blocks long. */
     private fun speak(text: String, then: () -> Unit) {
         val gen = ++generation
         setState(State.RESPONDING)
@@ -130,9 +155,19 @@ class JarvisConversationController(
             main.removeCallbacksAndMessages(SPEAK_TOKEN)
             then()
         }
-        main.postAtTime(proceed, SPEAK_TOKEN, android.os.SystemClock.uptimeMillis() + SPEAK_TIMEOUT_MS)
+        val startTimeout = Runnable {
+            Log.w(TAG, "TTS did not start; continuing without speech")
+            tts.stop()
+            proceed.run()
+        }
+        val now = android.os.SystemClock.uptimeMillis()
+        main.postAtTime(startTimeout, SPEAK_TOKEN, now + SPEAK_START_TIMEOUT_MS)
+        main.postAtTime(proceed, SPEAK_TOKEN, now + SPEAK_TIMEOUT_MS)
         tts.speak(text, object : JarvisSpeechController.Callback {
-            override fun onStart() { if (gen == generation) core()?.setState(JarvisState.SPEAKING) }
+            override fun onStart() {
+                main.removeCallbacks(startTimeout)
+                if (gen == generation) core()?.setState(JarvisState.SPEAKING)
+            }
             override fun onDone(success: Boolean) { main.post(proceed) }
         })
     }
@@ -160,9 +195,12 @@ class JarvisConversationController(
     private companion object {
         val SPEAK_TOKEN = Any()
         const val MAX_FAILED_ATTEMPTS = 2
-        const val LISTEN_DELAY_MS = 350L
+        const val TAG = "JarvisConversation"
+        const val LISTEN_DELAY_MS = 100L
+        const val PARTIAL_STABLE_MS = 500L
+        const val SPEAK_START_TIMEOUT_MS = 3000L
         const val RETRY_DELAY_MS = 300L
-        const val SPEAK_TIMEOUT_MS = 6000L
+        const val SPEAK_TIMEOUT_MS = 8000L
         const val OVERALL_TIMEOUT_MS = 60_000L
     }
 }

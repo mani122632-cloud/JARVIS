@@ -75,6 +75,9 @@ class JarvisCommandSpeechController(context: Context) {
                     putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
                     putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
                     putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, app.packageName)
+                    // Hints for a quicker end-of-speech (honored by some recognizers, ignored by others).
+                    putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 900L)
+                    putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 700L)
                 }
             )
             main.postDelayed(watchdog, MAX_SESSION_MS)
@@ -154,6 +157,6 @@ class JarvisCommandSpeechController(context: Context) {
 
     private companion object {
         const val TAG = "JarvisCommandSpeech"
-        const val MAX_SESSION_MS = 15_000L
+        const val MAX_SESSION_MS = 12_000L
     }
 }

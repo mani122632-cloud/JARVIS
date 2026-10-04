@@ -2,6 +2,7 @@ package com.jarvis.assistant.activation
 
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import com.jarvis.assistant.core.JarvisCoreView
 import com.jarvis.assistant.core.JarvisState
 import com.jarvis.assistant.speech.JarvisSpeechController
@@ -48,6 +49,14 @@ class JarvisActivationController(
     private var coreRef: WeakReference<JarvisCoreView>? = null
     private var generation = 0
 
+    /** TTS never even started (engine dead / no Persian voice): don't make the user wait. */
+    private val startTimeoutRunnable = Runnable {
+        if (phase != Phase.ACTIVATING) return@Runnable
+        Log.w(TAG, "TTS did not start within ${SPEECH_START_TIMEOUT_MS} ms; continuing to command listening")
+        speech.stop()
+        completeActivation(generation)
+    }
+
     private val timeoutRunnable = Runnable {
         // TTS never answered: don't stay stuck; continue as if the phrase finished.
         speech.stop()
@@ -78,8 +87,10 @@ class JarvisActivationController(
         core.setState(JarvisState.LISTENING)
 
         main.postDelayed(timeoutRunnable, SPEECH_TIMEOUT_MS)
+        main.postDelayed(startTimeoutRunnable, SPEECH_START_TIMEOUT_MS)
         speech.speak(PHRASE, object : JarvisSpeechController.Callback {
             override fun onStart() {
+                main.removeCallbacks(startTimeoutRunnable)
                 if (gen == generation && phase == Phase.ACTIVATING) {
                     coreRef?.get()?.setState(JarvisState.SPEAKING)
                 }
@@ -104,6 +115,7 @@ class JarvisActivationController(
     private fun completeActivation(gen: Int) {
         if (gen != generation || phase != Phase.ACTIVATING) return
         main.removeCallbacks(timeoutRunnable)
+        main.removeCallbacks(startTimeoutRunnable)
         phase = Phase.READY_FOR_COMMAND
         coreRef?.get()?.let {
             it.setVoiceAmplitude(0f)
@@ -115,11 +127,14 @@ class JarvisActivationController(
     private fun cancelPending() {
         generation++                       // invalidates in-flight speech callbacks
         main.removeCallbacks(timeoutRunnable)
+        main.removeCallbacks(startTimeoutRunnable)
         speech.stop()
     }
 
     private companion object {
+        const val TAG = "JarvisActivation"
         const val PHRASE = "بله ارباب."
+        const val SPEECH_START_TIMEOUT_MS = 3000L
         const val SPEECH_TIMEOUT_MS = 6000L
     }
 }

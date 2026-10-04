@@ -60,7 +60,6 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
     private var wakeEnabled = false
     private val resumeWakeRunnable = Runnable { resumeWake() }
 
-    private val autoDismiss = Runnable { activation.deactivate() }   // Stage 43 dev-only fallback, no longer scheduled
     private var pendingActivate: Runnable? = null
 
     override fun onCreate() {
@@ -96,7 +95,6 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
             override fun onReadyForCommand() {
                 // "بله ارباب." is done. Vosk is suspended (runActivation), so the command recognizer
                 // is the only microphone user from here until the overlay hides.
-                main.removeCallbacks(autoDismiss)
                 conversation.begin()
             }
         }
@@ -161,7 +159,6 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
 
     /** Idempotent: returns the existing overlay's core if already shown. */
     override fun showOverlay(): JarvisCoreView? {
-        main.removeCallbacks(autoDismiss)
         val core = window.show()
         isOverlayVisible = window.isAttached
         return core
@@ -169,7 +166,6 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
 
     /** Idempotent and safe when nothing is shown. Fades out, removes the window, then stops the service. */
     override fun hideOverlay() {
-        main.removeCallbacks(autoDismiss)
         window.hide {
             isOverlayVisible = false
             if (wakeEnabled) WakeWordState.update(flow = AssistantFlow.WAKE_WORD_LISTENING)
@@ -355,8 +351,6 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
         const val EXTRA_SOURCE = "source"
         const val EXTRA_DELAY_MS = "delay_ms"
 
-        /** Temporary: how long the overlay stays after "بله ارباب." until a command listener exists. */
-        private const val AUTO_DISMISS_MS = 8000L
 
         /** Pause before the microphone is reopened after an interaction (avoids catching TTS tail audio). */
         private const val RESUME_WAKE_DELAY_MS = 600L

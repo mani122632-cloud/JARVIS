@@ -2,7 +2,6 @@ package com.jarvis.assistant
 
 import android.Manifest
 import android.app.Activity
-import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Color
@@ -74,9 +73,6 @@ class MainActivity : Activity() {
 
     private fun hasMic(): Boolean =
         checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-
-    private val isDebuggable: Boolean
-        get() = (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
 
     private fun refreshVoiceState() {
         if (!::voiceButton.isInitialized) return
@@ -200,7 +196,6 @@ class MainActivity : Activity() {
         }
         column.addView(voiceButton, lp(20))
         column.addView(voiceStatus, lp(14))
-
 
         root.addView(column, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         return root

@@ -10,6 +10,8 @@
         <!-- Android 11+ package visibility: Instagram launch + the speech recognition service -->
         <package android:name="com.instagram.android" />
         <intent><action android:name="android.speech.RecognitionService" /></intent>
+        <!-- Without this, Android 11+ hides every TTS engine and TextToSpeech never initializes -->
+        <intent><action android:name="android.intent.action.TTS_SERVICE" /></intent>
     </queries>
 
     <application
