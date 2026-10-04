@@ -9,18 +9,35 @@ import java.lang.ref.WeakReference
 
 /**
  * Single entry point for "JARVIS was summoned", whatever the trigger (wake word, assistant
- * role, overlay, headset, hardware button). Triggers only call [activate].
+ * role, headset, hardware button). Triggers only call [activate].
  *
- * Sequence: core.showCinematic() -> LISTENING -> speak "بله ارباب." -> ready for command.
+ * Two modes:
+ *  - Overlay (Stage 43): pass an [OverlayPresenter]. activate() asks it to show the overlay, then runs
+ *    LISTENING -> speak "بله ارباب." (SPEAKING) -> LISTENING. deactivate() sets READY and hides the overlay.
+ *  - Legacy (Stage 42): no presenter; bind() a JarvisCoreView that lives in an Activity.
+ *
  * Uses only the existing JarvisCoreView API; owns no animation. Main thread only.
  */
-class JarvisActivationController(private val speech: JarvisSpeechController) {
+class JarvisActivationController(
+    private val speech: JarvisSpeechController,
+    private val presenter: OverlayPresenter? = null,
+    /** Call the core's own showCinematic()/hideCinematic() too. Set false if it doubles the overlay's fade. */
+    private val useCinematic: Boolean = true
+) {
 
     enum class Source { MANUAL, WAKE_WORD, ASSISTANT, OVERLAY, HEADSET, HARDWARE_BUTTON }
     enum class Phase { IDLE, ACTIVATING, READY_FOR_COMMAND }
 
     /** The future command-listening stage hooks in here. */
     interface Listener { fun onReadyForCommand() }
+
+    /** Implemented by JarvisOverlayService. Both calls must be idempotent. */
+    interface OverlayPresenter {
+        /** Shows the overlay (no-op if already shown) and returns its core, or null if it could not be shown. */
+        fun showOverlay(): JarvisCoreView?
+        /** Fades the overlay out and removes it. Safe when nothing is shown. */
+        fun hideOverlay()
+    }
 
     var listener: Listener? = null
 
@@ -37,10 +54,10 @@ class JarvisActivationController(private val speech: JarvisSpeechController) {
         completeActivation(generation)
     }
 
-    /** Call from onCreate/onStart. Holds the view weakly. */
+    /** Legacy mode only (no presenter). Holds the view weakly. */
     fun bind(core: JarvisCoreView) { coreRef = WeakReference(core) }
 
-    /** Call from onDestroy (or onStop). Cancels work and drops the view reference. */
+    /** Cancels work and drops the view reference. Does not hide the overlay (its service owns that). */
     fun unbind() {
         cancelPending()
         phase = Phase.IDLE
@@ -48,15 +65,16 @@ class JarvisActivationController(private val speech: JarvisSpeechController) {
     }
 
     /**
-     * @return true if an activation started; false if ignored (already activating/active, or not bound).
+     * @return true if an activation started; false if ignored (already activating/active, or no core available).
      */
     fun activate(@Suppress("UNUSED_PARAMETER") source: Source = Source.MANUAL): Boolean {
-        val core = coreRef?.get() ?: return false
         if (phase != Phase.IDLE) return false
+        val core = (if (presenter != null) presenter.showOverlay() else coreRef?.get()) ?: return false
+        coreRef = WeakReference(core)
         phase = Phase.ACTIVATING
         val gen = ++generation
 
-        core.showCinematic()
+        if (useCinematic) core.showCinematic()
         core.setState(JarvisState.LISTENING)
 
         main.postDelayed(timeoutRunnable, SPEECH_TIMEOUT_MS)
@@ -71,15 +89,16 @@ class JarvisActivationController(private val speech: JarvisSpeechController) {
         return true
     }
 
-    /** End the interaction: core sinks and the layer returns to IDLE. Safe to call repeatedly. */
+    /** End the interaction: READY, then the overlay hides. Safe to call repeatedly. */
     fun deactivate() {
         cancelPending()
         phase = Phase.IDLE
         coreRef?.get()?.let {
             it.setVoiceAmplitude(0f)
             it.setState(JarvisState.READY)
-            it.hideCinematic()
+            if (useCinematic) it.hideCinematic()
         }
+        presenter?.hideOverlay()
     }
 
     private fun completeActivation(gen: Int) {
