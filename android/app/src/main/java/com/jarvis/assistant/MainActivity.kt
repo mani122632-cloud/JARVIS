@@ -199,7 +199,8 @@ class MainActivity : Activity() {
             visibility = View.GONE
         }
         column.addView(voiceButton, lp(20))
-        }
+        column.addView(voiceStatus, lp(14))
+
 
         root.addView(column, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         return root
