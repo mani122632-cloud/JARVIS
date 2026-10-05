@@ -222,13 +222,25 @@ class LlmToolCatalog(
         ToolOutcome(false, "memory read failed", MEMORY_ERROR)
     }
 
+    /** Best match so far while scanning the stored facts. */
+    private class MemoryMatch(val value: String, val score: Int)
+
     private fun fuzzyRecall(key: String): String? {
-        val q = PersianNormalizer.tokens(key).toSet()
-        if (q.isEmpty()) return null
-        return memory.entries().entries
-            .map { (k, v) -> Triple(k, v, PersianNormalizer.tokens(k).count { it in q }) }
-            .filter { it.third > 0 }
-            .maxByOrNull { it.third }?.second
+        val queryTokens: Set<String> = PersianNormalizer.tokens(key).toSet()
+        if (queryTokens.isEmpty()) return null
+        var best: MemoryMatch? = null
+        val stored: Map<String, String> = memory.entries()
+        for (entry in stored.entries) {
+            var score = 0
+            for (token in PersianNormalizer.tokens(entry.key)) {
+                if (token in queryTokens) score++
+            }
+            val currentBest = best
+            if (score > 0 && (currentBest == null || score > currentBest.score)) {
+                best = MemoryMatch(entry.value, score)
+            }
+        }
+        return best?.value
     }
 
     private fun forget(a: Map<String, String>): ToolOutcome = try {
