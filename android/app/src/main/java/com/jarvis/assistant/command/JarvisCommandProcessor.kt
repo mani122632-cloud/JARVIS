@@ -16,7 +16,7 @@ class JarvisCommandProcessor(private val parser: CommandIntentParser = CommandIn
     data class Result(
         val handled: Boolean,
         val action: JarvisAction?,
-        /** Said before the action runs ("حتماً.") or instead of it ("متوجه نشدم."). */
+        /** Said before the action runs ("حتماً.") or instead of it ("متوجه نشدم."). Empty: the action speaks for itself. */
         val responseText: String,
         val confidence: Float
     ) {
@@ -27,7 +27,8 @@ class JarvisCommandProcessor(private val parser: CommandIntentParser = CommandIn
     fun process(text: String): Result {
         val parsed = parser.parse(text)
         val ok = parsed.action !is JarvisAction.Unknown && parsed.confidence >= CommandConfidence.THRESHOLD
-        return if (ok) Result(true, parsed.action, JarvisPhrases.SURE, parsed.confidence)
+        // Alarm / Timer / "needs info" speak their own result or question, so no "حتماً." in front of them.
+        return if (ok) Result(true, parsed.action, if (parsed.action.speaksOwnResult) "" else JarvisPhrases.SURE, parsed.confidence)
         else Result(false, null, JarvisPhrases.NOT_UNDERSTOOD, parsed.confidence)
     }
 }

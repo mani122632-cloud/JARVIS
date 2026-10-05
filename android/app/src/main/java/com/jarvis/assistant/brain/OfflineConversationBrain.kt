@@ -35,6 +35,11 @@ class OfflineConversationBrain(
 
     fun reply(text: String): String? = classify(text)?.let { respond(it) }
 
+    /** The spoken goodbye for an END_CONVERSATION intent ([goodNight]: the user also wished a good night). */
+    fun farewell(goodNight: Boolean = false): String =
+        if (goodNight) pick("شب شما هم بخیر ارباب.", "شب بخیر ارباب. هر وقت لازم شد صدایم کنید.")
+        else respond(Topic.GOODBYE)
+
     fun classify(text: String): Topic? {
         val tokens = PersianNormalizer.tokens(text).filter { it !in FILLER }
         if (tokens.isEmpty()) return null

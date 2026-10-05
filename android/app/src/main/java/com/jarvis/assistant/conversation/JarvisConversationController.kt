@@ -10,7 +10,6 @@ import com.jarvis.assistant.command.JarvisAction
 import com.jarvis.assistant.command.JarvisActionExecutor
 import com.jarvis.assistant.core.JarvisCoreView
 import com.jarvis.assistant.core.JarvisState
-import com.jarvis.assistant.nlu.PersianNormalizer
 import com.jarvis.assistant.speech.CommandSpeechError
 import com.jarvis.assistant.speech.JarvisPhrases
 import com.jarvis.assistant.speech.JarvisSpeechController
@@ -25,8 +24,13 @@ import com.jarvis.assistant.speech.SpeechInput
  * command system first (JarvisCommandProcessor -> JarvisActionExecutor) and only then the offline conversation
  * brain. After a command or a reply the session stays open and JARVIS listens again.
  *
+ * Incomplete requests are completed across turns: "آلارم بذار" -> JARVIS asks "چه ساعتی ارباب؟" -> the next
+ * utterance ("هفت صبح") is the answer (the open question lives in [ConversationContext.pending]; the Brain
+ * decides, this controller only speaks and listens again).
+ *
  * The session ends (-> [Callback.onConversationFinished], the service then hides the overlay and resumes Vosk) when
- *  - the user says an exit phrase (خداحافظ / فعلاً / تمام / دیگه کاری ندارم / برو استراحت کن / کافیه ...),
+ *  - the Brain recognizes the END_CONVERSATION intent (خداحافظ / فعلاً / من دیگه میرم / دیگه کاری ندارم / کافیه /
+ *    بعداً صحبت می‌کنیم ... by sentence structure, not by a fixed list; see EndConversationDetector),
  *  - nothing was said for [SILENCE_TIMEOUT_MS],
  *  - [MAX_SESSION_MS] have passed,
  *  - the STT is unusable (model missing, no permission, repeated audio failure),
@@ -247,14 +251,8 @@ class JarvisConversationController(
         val best = try { brain.pickBest(candidates).ifBlank { text } } catch (e: Exception) { text }
         conversationContext.addUserUtterance(best)
 
-        if (isExitPhrase(best)) {
-            Log.i(TAG, "Exit phrase")
-            conversationContext.sessionState = SessionState.ENDING
-            speak(JarvisPhrases.GOODBYE) { finish() }
-            return
-        }
-
-        // Command system first (inside the Brain), conversation second.
+        // The Brain decides everything, including the end of the conversation (an intent, not a string compare):
+        // pending answer -> memory -> device command -> END_CONVERSATION -> clarification -> small talk.
         val result = try {
             brain.think(best, conversationContext)
         } catch (e: Exception) {
@@ -268,6 +266,16 @@ class JarvisConversationController(
                 conversationContext.addResponse(result.responseText)
                 speak(result.responseText) { listen(LISTEN_DELAY_MS, newTurn = true) }
             }
+            // A question ("چه ساعتی ارباب؟"): the Brain has stored the partial request; the next utterance answers it.
+            is BrainResult.Clarify -> {
+                conversationContext.addResponse(result.responseText)
+                speak(result.responseText) { listen(LISTEN_DELAY_MS, newTurn = true) }
+            }
+            is BrainResult.EndConversation -> {
+                Log.i(TAG, "END_CONVERSATION intent")
+                conversationContext.sessionState = SessionState.ENDING
+                speak(result.responseText) { finish() }
+            }
             is BrainResult.Unknown -> handleUnusable()
             is BrainResult.Command -> runCommand(result)
         }
@@ -276,33 +284,31 @@ class JarvisConversationController(
     private fun runCommand(result: BrainResult.Command) {
         val action = result.action
         if (action is JarvisAction.Unknown) { handleUnusable(); return }
-        speak(result.responseText) {                       // "حتماً."
-            if (action == JarvisAction.DismissAssistant) { finish(); return@speak }
-            val outcome = try {
-                executor.execute(action)
-            } catch (e: RuntimeException) {                // executor promises not to throw; stay safe
-                Log.e(TAG, "Executor threw", e)
-                JarvisActionExecutor.Outcome(false, null)
-            }
-            val message = outcome.message
-            when {
-                // Back's only real effect is closing the assistant, so the session ends with it.
-                action == JarvisAction.GoBack -> finish()
-                // The session stays open: JARVIS listens again so the user can keep talking.
-                outcome.success || message == null -> listen(AFTER_COMMAND_DELAY_MS, newTurn = true)
-                else -> speak(message) { listen(LISTEN_DELAY_MS, newTurn = true) }
-            }
-        }
+        // Alarm / timer speak their own result afterwards, so there is no "حتماً." in front of them.
+        if (result.responseText.isBlank()) executeAndContinue(action)
+        else speak(result.responseText) { executeAndContinue(action) }         // "حتماً."
     }
 
-    // ---- exit phrases ---------------------------------------------------------------------------
-
-    private fun isExitPhrase(text: String): Boolean {
-        val tokens = PersianNormalizer.tokens(text).filter { it !in EXIT_FILLER }
-        if (tokens.isEmpty()) return false
-        val phrase = tokens.joinToString(" ")
-        if (phrase in EXIT_PHRASES) return true
-        return tokens.size <= 2 && tokens.any { it in EXIT_WORDS }
+    private fun executeAndContinue(action: JarvisAction) {
+        if (action == JarvisAction.DismissAssistant) { finish(); return }
+        val outcome = try {
+            executor.execute(action)
+        } catch (e: RuntimeException) {                // executor promises not to throw; stay safe
+            Log.e(TAG, "Executor threw", e)
+            JarvisActionExecutor.Outcome(false, null)
+        }
+        val message = outcome.message
+        when {
+            // Back's only real effect is closing the assistant, so the session ends with it.
+            action == JarvisAction.GoBack -> finish()
+            // The executor's sentence: the reason for a failure, or the confirmation of a real alarm / timer.
+            message != null -> {
+                conversationContext.addResponse(message)
+                speak(message) { listen(LISTEN_DELAY_MS, newTurn = true) }
+            }
+            // The session stays open: JARVIS listens again so the user can keep talking.
+            else -> listen(AFTER_COMMAND_DELAY_MS, newTurn = true)
+        }
     }
 
     // ---- speaking -------------------------------------------------------------------------------
@@ -399,13 +405,5 @@ class JarvisConversationController(
         const val SPEAK_BASE_MS = 14_000L
         const val SPEAK_PER_CHAR_MS = 90L
         const val SPEAK_MAX_MS = 40_000L
-
-        val EXIT_FILLER = setOf("جارویس", "جارویز", "هی", "لطفا", "ارباب", "بله", "ممنون", "مرسی", "ممنونم", "خب", "باشه")
-        val EXIT_PHRASES = setOf(
-            "خداحافظ", "خدافظ", "خدانگهدار", "فعلا", "تمام", "تمام شد", "کافیه", "کافی است", "بسه", "بای",
-            "دیگه کاری ندارم", "دیگه کاری باهات ندارم", "دیگه باهات کاری ندارم", "کاری ندارم", "دیگه کاری نیست",
-            "برو استراحت کن", "استراحت کن", "تا بعد"
-        )
-        val EXIT_WORDS = setOf("خداحافظ", "خدافظ", "خدانگهدار", "فعلا", "کافیه", "بای")
     }
 }

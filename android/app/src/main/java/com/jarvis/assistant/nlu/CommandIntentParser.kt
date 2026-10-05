@@ -23,10 +23,12 @@ class CommandIntentParser(
 
     data class Parsed(val action: JarvisAction, val confidence: Float, val normalized: String)
 
+    /** Time extraction + Alarm/Timer intent detection (Stage 46.5); the old keyword rules lived here. */
+    private val time = PersianTimeParser(clock)
+    private val scheduling = SchedulingIntentParser(time)
+
     private class Input(val text: String, val tokens: List<String>, val compact: String)
     private class Candidate(val action: JarvisAction, val confidence: Float)
-    private data class ClockTime(val hour: Int, val minute: Int, val confidence: Float)
-    private enum class Period { AM, NOON, AFTERNOON, NIGHT }
 
     /** App aliases in folded, space-free form (longest first): "اینستا گرام" and "اینستاگرام" are the same key. */
     private class AppKey(val app: AppEntry, val key: String)
@@ -45,8 +47,7 @@ class CommandIntentParser(
         this::matchNavigation,
         this::matchFlashlight,
         this::matchVolume,
-        this::matchTimer,
-        this::matchAlarm,
+        this::matchScheduling,
         this::matchSettings,
         this::matchApp
     )
@@ -224,161 +225,9 @@ class CommandIntentParser(
 
     // ---- timer / alarm ------------------------------------------------------------------------------
 
-    private fun matchTimer(inp: Input): Candidate? {
-        val t = inp.tokens
-        val named = t.any { it in TIMER_WORDS } || inp.text.contains("زمان سنج") || inp.text.contains("شمارش معکوس")
-        if (!named) return null
-        val secs = parseDurationSeconds(t)
-            ?: return Candidate(JarvisAction.OpenTimerScreen, 0.8f)          // "تایمر" alone: show the timer screen
-        if (secs !in 1..MAX_TIMER_SECONDS) return null
-        return Candidate(JarvisAction.CreateTimer(secs), 0.95f)
-    }
-
-    private fun matchAlarm(inp: Input): Candidate? {
-        val t = inp.tokens
-        val named = t.any { it in ALARM_WORDS } ||
-            (t.contains("زنگ") && t.any { it == "بذار" || it == "بزار" || it == "بگذار" || it == "تنظیم" })
-        if (!named) return null
-
-        // "۵ دقیقه دیگه آلارم بذار" -> now + duration, rounded UP to the next whole minute.
-        if (t.contains("دیگه") || t.contains("دیگر")) {
-            val secs = parseDurationSeconds(t)
-            if (secs != null && secs in 1..MAX_TIMER_SECONDS) {
-                var target = clock().withSecond(0).withNano(0).plusSeconds(secs.toLong())
-                if (clock().second > 0 || clock().nano > 0) target = target.plusMinutes(1)
-                return Candidate(JarvisAction.CreateAlarm(target.hour, target.minute), 0.9f)
-            }
-        }
-        val time = parseClockTime(t) ?: return Candidate(JarvisAction.OpenAlarmScreen, 0.8f)   // "آلارم" alone
-        return Candidate(JarvisAction.CreateAlarm(time.hour, time.minute), time.confidence)
-    }
-
-    /** Sum of "<number> <unit>" groups: "5 دقیقه", "یک ساعت و نیم", "نیم ساعت", "ربع ساعت", "2 ساعت و 30 دقیقه". */
-    private fun parseDurationSeconds(t: List<String>): Int? {
-        var total = 0L
-        var found = false
-        var i = 0
-        while (i < t.size) {
-            val frac = FRACTIONS[t[i]]
-            if (frac != null && i + 1 < t.size) {
-                val unit = UNIT_SECONDS[t[i + 1]]
-                if (unit != null) {
-                    total += (frac * unit).toLong()
-                    found = true
-                    i += 2
-                    continue
-                }
-            }
-            val num = PersianNumbers.parse(t, i)
-            if (num != null && num.next < t.size) {
-                val unit = UNIT_SECONDS[t[num.next]]
-                if (unit != null) {
-                    total += num.value.toLong() * unit
-                    found = true
-                    var j = num.next + 1
-                    val extra = if (j + 1 < t.size && t[j] == "و") FRACTIONS[t[j + 1]] else null
-                    if (extra != null) {
-                        total += (extra * unit).toLong()
-                        j += 2
-                    }
-                    i = j
-                    continue
-                }
-            }
-            i++
-        }
-        return if (found) total.coerceAtMost(Int.MAX_VALUE.toLong()).toInt() else null
-    }
-
-    /**
-     * Clock time: "ساعت 8 صبح", "ساعت 8:30", "ساعت هشت و نیم شب", "8 و ربع", "ربع به 9", "10 دقیقه به 9".
-     * With صبح/ظهر/عصر/شب the result is certain (0.95); with a 24h hour (13..23) 0.9;
-     * a bare 1..12 is resolved to the NEXT occurrence from now (0.85).
-     */
-    private fun parseClockTime(t: List<String>): ClockTime? {
-        val period = findPeriod(t)
-        for (i in t.indices) {
-            val tok = t[i]
-
-            TIME_REGEX.matchEntire(tok)?.let { m ->
-                val h = m.groupValues[1].toInt()
-                val min = m.groupValues[2].toInt()
-                if (h <= 24 && min <= 59) return finishTime(h, min, 0, period)
-            }
-
-            // "ربع به 9"
-            if (tok == "ربع" && t.getOrNull(i + 1) == "به") {
-                val h = PersianNumbers.parse(t, i + 2)
-                if (h != null && h.value in 1..24) return finishTime(h.value, 0, -15, period)
-            }
-
-            val num = PersianNumbers.parse(t, i) ?: continue
-
-            // "10 دقیقه به 9"
-            if (t.getOrNull(num.next) == "دقیقه" && t.getOrNull(num.next + 1) == "به" && num.value in 1..59) {
-                val h = PersianNumbers.parse(t, num.next + 2)
-                if (h != null && h.value in 1..24) return finishTime(h.value, 0, -num.value, period)
-                continue
-            }
-
-            val next = t.getOrNull(num.next)
-            val afterSaat = t.getOrNull(i - 1) == "ساعت"
-            val beforePeriod = next != null && (next in PERIOD_WORDS || next == "بعد")
-            if (!afterSaat && !beforePeriod) continue
-            if (num.value > 24) continue
-
-            var minute = 0
-            var j = num.next
-            if (j + 1 < t.size && t[j] == "و") {
-                val x = t[j + 1]
-                if (x == "نیم") { minute = 30 } else if (x == "ربع") { minute = 15 } else {
-                    val mn = PersianNumbers.parse(t, j + 1)
-                    if (mn != null && mn.value in 0..59) minute = mn.value
-                }
-            }
-            return finishTime(num.value, minute, 0, period)
-        }
-        return null
-    }
-
-    private fun finishTime(hourRaw: Int, minute: Int, offsetMinutes: Int, period: Period?): ClockTime {
-        val h = if (hourRaw == 24) 0 else hourRaw
-        val hour24: Int
-        val confidence: Float
-        if (h > 12 || h == 0) {
-            hour24 = h
-            confidence = if (period == null && h > 12) 0.9f else 0.95f
-        } else if (period != null) {
-            hour24 = when (period) {
-                Period.AM -> if (h == 12) 0 else h
-                Period.NOON -> if (h in 1..6) h + 12 else h
-                Period.AFTERNOON -> if (h < 12) h + 12 else h
-                Period.NIGHT -> when {
-                    h == 12 -> 0
-                    h in 1..5 -> h
-                    else -> h + 12
-                }
-            }
-            confidence = 0.95f
-        } else {
-            // No period: whichever of h:mm (am) / h:mm (pm) comes next.
-            val now = clock()
-            val nowMin = now.hour * 60 + now.minute
-            val am = (h % 12) * 60 + minute
-            val pm = am + 720
-            fun delta(target: Int): Int = ((target - nowMin) % 1440 + 1440) % 1440
-            fun wait(target: Int): Int = delta(target).let { if (it == 0) 1440 else it }
-            hour24 = if (wait(am) <= wait(pm)) am / 60 else pm / 60
-            confidence = 0.85f
-        }
-        val total = (((hour24 * 60 + minute + offsetMinutes) % 1440) + 1440) % 1440
-        return ClockTime(total / 60, total % 60, confidence)
-    }
-
-    private fun findPeriod(t: List<String>): Period? {
-        for (tok in t) PERIOD_WORDS[tok]?.let { return it }
-        return null
-    }
+    /** Alarm / Timer by sentence structure (noun + verb semantics + extracted time), see [SchedulingIntentParser]. */
+    private fun matchScheduling(inp: Input): Candidate? =
+        scheduling.match(inp.tokens)?.let { Candidate(it.action, it.confidence) }
 
     // ---- settings -----------------------------------------------------------------------------------
 
@@ -503,9 +352,6 @@ class CommandIntentParser(
     }
 
     private companion object {
-        const val MAX_TIMER_SECONDS = 86_400
-        val TIME_REGEX = Regex("^(\\d{1,2}):(\\d{2})$")
-
         val FILLER = setOf("جارویس", "جارویز", "هی", "لطفا", "ممنون", "مرسی", "ارباب", "بله")
         val CLITICS = setOf("رو", "را", "ی", "به", "توی", "تو", "داخل", "در", "گوشی", "تویه", "درون", "برنامه", "اپ", "اپلیکیشن", "اون", "این")
         val GLUED_CLITICS = listOf("رو", "را")
@@ -541,18 +387,6 @@ class CommandIntentParser(
         val TIMER_WORDS = setOf("تایمر", "تایمیر", "timer", "زمانسنج")
         val ALARM_WORDS = setOf("آلارم", "الارم", "آلارام", "الارام", "alarm", "بیدارم")
 
-        val FRACTIONS = mapOf("نیم" to 0.5, "ربع" to 0.25)
-        val UNIT_SECONDS = mapOf(
-            "ثانیه" to 1, "second" to 1, "seconds" to 1, "sec" to 1,
-            "دقیقه" to 60, "minute" to 60, "minutes" to 60, "min" to 60,
-            "ساعت" to 3600, "ساعته" to 3600, "hour" to 3600, "hours" to 3600
-        )
-        val PERIOD_WORDS = mapOf(
-            "صبح" to Period.AM, "بامداد" to Period.AM, "سحر" to Period.AM,
-            "ظهر" to Period.NOON,
-            "بعدازظهر" to Period.AFTERNOON, "عصر" to Period.AFTERNOON,
-            "شب" to Period.NIGHT, "امشب" to Period.NIGHT
-        )
         val SETTINGS_WORDS = setOf("تنظیمات", "settings", "setting")
 
         /** Every keyword the rules compare against; the canonical spellings of the folded lexicon. */

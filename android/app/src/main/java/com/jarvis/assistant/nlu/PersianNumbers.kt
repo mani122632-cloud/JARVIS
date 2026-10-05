@@ -3,7 +3,8 @@ package com.jarvis.assistant.nlu
 /**
  * Numbers inside a normalized token list: ASCII digits ("5") or Persian number words
  * ("پنج", "بیست و پنج", "صد و بیست"). Additive words only (no "هزار"): enough for minutes, hours,
- * percentages and clock times.
+ * percentages and clock times. [toWords] is the reverse direction (7 -> "هفت") so JARVIS can say a time
+ * without relying on the TTS to read digits.
  */
 object PersianNumbers {
 
@@ -65,5 +66,33 @@ object PersianNumbers {
             i += 2
         }
         return Parsed(total, i)
+    }
+
+    // ---- number -> words ----------------------------------------------------------------------------
+
+    private val UNIT_WORDS = arrayOf(
+        "", "یک", "دو", "سه", "چهار", "پنج", "شش", "هفت", "هشت", "نه", "ده", "یازده", "دوازده",
+        "سیزده", "چهارده", "پانزده", "شانزده", "هفده", "هجده", "نوزده"
+    )
+    private val TENS_WORDS = arrayOf("", "", "بیست", "سی", "چهل", "پنجاه", "شصت", "هفتاد", "هشتاد", "نود")
+    private val HUNDRED_WORDS = arrayOf(
+        "", "صد", "دویست", "سیصد", "چهارصد", "پانصد", "ششصد", "هفتصد", "هشتصد", "نهصد"
+    )
+
+    /** 0..999 as Persian words ("بیست و پنج"); anything else falls back to digits. */
+    fun toWords(n: Int): String {
+        if (n < 0 || n > 999) return n.toString()
+        if (n == 0) return "صفر"
+        val parts = ArrayList<String>(3)
+        val hundreds = n / 100
+        val rest = n % 100
+        if (hundreds > 0) parts += HUNDRED_WORDS[hundreds]
+        if (rest in 1..19) {
+            parts += UNIT_WORDS[rest]
+        } else if (rest >= 20) {
+            parts += TENS_WORDS[rest / 10]
+            if (rest % 10 > 0) parts += UNIT_WORDS[rest % 10]
+        }
+        return parts.joinToString(" و ")
     }
 }

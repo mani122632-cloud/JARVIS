@@ -14,7 +14,15 @@ data class AppEntry(
     val aliases: List<String>
 )
 
+/**
+ * Today only apps. Other voice capabilities (alarm, timer, call, SMS, contacts, search ...) are NOT apps: they are
+ * [JarvisTool]s registered with the executor (see JarvisTool.kt). A future "open app" tool can take its
+ * entries from here without changing this class.
+ */
 class AppRegistry(val entries: List<AppEntry>) {
+
+    fun findById(id: String): AppEntry? = entries.firstOrNull { it.id == id }
+
     companion object {
         fun default() = AppRegistry(
             listOf(

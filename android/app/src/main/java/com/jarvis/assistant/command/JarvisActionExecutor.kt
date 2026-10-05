@@ -27,18 +27,35 @@ import kotlin.math.roundToInt
  *  - Back: no public API for another app's Back; see [goBack]
  *  - Flashlight: CameraManager.setTorchMode (no CAMERA permission needed for torch-only use)
  *  - Volume: AudioManager, STREAM_MUSIC (the stream the offline TTS also plays on)
- *  - Alarm / Timer: AlarmClock.ACTION_SET_ALARM / ACTION_SET_TIMER (permission SET_ALARM)
+ *  - Alarm / Timer: [AlarmTool] / [TimerTool] (AlarmClock.ACTION_SET_ALARM / ACTION_SET_TIMER with SKIP_UI,
+ *    permission SET_ALARM): a real alarm / a really started timer, confirmed in the [Outcome] message
+ *
+ * Tools (Stage 46.5): capabilities that need more than one Intent live in a [JarvisTool] held by a
+ * [ToolRegistry]; add one with [register]. The small built-ins below (apps, settings, torch, volume, home)
+ * stay here and can move into tools one by one without changing the public API.
  *
  * Activities are started while the JARVIS overlay window is still visible (the conversation hides it
  * afterwards): an app holding SYSTEM_ALERT_WINDOW with a visible overlay is allowed to start activities
  * from the background.
  */
-class JarvisActionExecutor(context: Context) {
+class JarvisActionExecutor(
+    context: Context,
+    tools: List<JarvisTool>? = null
+) {
 
     private val app = context.applicationContext
 
-    /** @param success false means the action did not happen; [message] is what JARVIS should say. */
+    /**
+     * @param success false means the action did not happen.
+     * @param message what JARVIS says afterwards: the reason for a failure, or (for tools such as alarm and timer)
+     * the spoken confirmation of a success. Null = nothing to say.
+     */
     data class Outcome(val success: Boolean, val message: String? = null)
+
+    private val registry = ToolRegistry(tools ?: listOf(AlarmTool(app), TimerTool(app)))
+
+    /** Adds (or replaces, by name) a tool, e.g. a future call / SMS / contacts / search tool. */
+    fun register(tool: JarvisTool) = registry.register(tool)
 
     private val cameraManager: CameraManager? = app.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
     private val torchState = ConcurrentHashMap<String, Boolean>()
@@ -79,8 +96,13 @@ class JarvisActionExecutor(context: Context) {
         JarvisAction.OpenBluetoothSettings -> startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS), "نتوانستم تنظیمات بلوتوث را باز کنم.")
         is JarvisAction.ToggleFlashlight -> flashlight(action.mode)
         is JarvisAction.SetVolume -> setVolume(action.change)
-        is JarvisAction.CreateAlarm -> createAlarm(action)
-        is JarvisAction.CreateTimer -> createTimer(action)
+        is JarvisAction.CreateAlarm, is JarvisAction.CreateTimer, is JarvisAction.ToolCall ->
+            registry.execute(action) ?: Outcome(false, "این کار هنوز پشتیبانی نمی‌شود.")
+        // Never executed: the Brain turns it into a question first. Safe fallback if it ever arrives here.
+        is JarvisAction.NeedsInfo -> Outcome(
+            false,
+            if (action.target == SlotTarget.ALARM) JarvisPhrases.ASK_ALARM_TIME else JarvisPhrases.ASK_TIMER_DURATION
+        )
         JarvisAction.OpenTimerScreen -> startActivity(Intent(AlarmClock.ACTION_SHOW_TIMERS), "برنامه ساعت برای نمایش تایمر پیدا نشد.")
         JarvisAction.OpenAlarmScreen -> startActivity(Intent(AlarmClock.ACTION_SHOW_ALARMS), "برنامه ساعت برای نمایش آلارم پیدا نشد.")
         JarvisAction.GoHome -> startActivity(
@@ -94,16 +116,8 @@ class JarvisActionExecutor(context: Context) {
 
     // ---- activities -----------------------------------------------------------------------------
 
-    private fun startActivity(intent: Intent, failureMessage: String): Outcome {
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        return try {
-            app.startActivity(intent)
-            Outcome(true)
-        } catch (e: ActivityNotFoundException) {
-            Log.w(TAG, "No activity for $intent", e)
-            Outcome(false, failureMessage)
-        }
-    }
+    private fun startActivity(intent: Intent, failureMessage: String): Outcome =
+        launchActivity(app, intent, failureMessage)
 
     private fun openApp(action: JarvisAction.OpenApp): Outcome {
         val pm = app.packageManager
@@ -189,33 +203,9 @@ class JarvisActionExecutor(context: Context) {
         return Outcome(true)
     }
 
-    // ---- alarm / timer --------------------------------------------------------------------------
-
-    private fun createAlarm(a: JarvisAction.CreateAlarm): Outcome {
-        if (a.hour !in 0..23 || a.minute !in 0..59) return Outcome(false, NOT_UNDERSTOOD_TIME)
-        val intent = Intent(AlarmClock.ACTION_SET_ALARM)
-            .putExtra(AlarmClock.EXTRA_HOUR, a.hour)
-            .putExtra(AlarmClock.EXTRA_MINUTES, a.minute)
-            .putExtra(AlarmClock.EXTRA_MESSAGE, ALARM_LABEL)
-            .putExtra(AlarmClock.EXTRA_SKIP_UI, true)
-        return startActivity(intent, "برنامه ساعت برای تنظیم آلارم پیدا نشد.")
-    }
-
-    private fun createTimer(t: JarvisAction.CreateTimer): Outcome {
-        if (t.seconds !in 1..MAX_TIMER_SECONDS) return Outcome(false, NOT_UNDERSTOOD_TIME)
-        val intent = Intent(AlarmClock.ACTION_SET_TIMER)
-            .putExtra(AlarmClock.EXTRA_LENGTH, t.seconds)
-            .putExtra(AlarmClock.EXTRA_MESSAGE, ALARM_LABEL)
-            .putExtra(AlarmClock.EXTRA_SKIP_UI, true)
-        return startActivity(intent, "برنامه ساعت برای تنظیم تایمر پیدا نشد.")
-    }
-
     private companion object {
         const val TAG = "JarvisActions"
         const val GENERIC_FAILURE = "نتوانستم این کار را انجام بدهم."
-        const val NOT_UNDERSTOOD_TIME = "زمان را درست متوجه نشدم."
-        const val ALARM_LABEL = "JARVIS"
-        const val MAX_TIMER_SECONDS = 86_400
         const val VOLUME_STEP_FRACTION = 0.2f
     }
 }

@@ -3,70 +3,147 @@ package com.jarvis.assistant.brain
 import android.util.Log
 import com.jarvis.assistant.command.JarvisAction
 import com.jarvis.assistant.command.JarvisCommandProcessor
+import com.jarvis.assistant.command.SlotTarget
 import com.jarvis.assistant.conversation.ConversationContext
+import com.jarvis.assistant.conversation.PendingIntent
 import com.jarvis.assistant.memory.JarvisMemory
 import com.jarvis.assistant.memory.MemoryException
+import com.jarvis.assistant.nlu.EndConversationDetector
 import com.jarvis.assistant.nlu.PersianNormalizer
 import com.jarvis.assistant.speech.JarvisPhrases
 
 /**
- * The Stage 46.4 Brain. It sits ON TOP of the Stage 46.3 [JarvisCommandProcessor] (which wraps
- * CommandIntentParser); it does not replace it.
+ * The JARVIS Brain: Persian text in, structured decision out. It sits ON TOP of the [JarvisCommandProcessor]
+ * (which wraps the NLU); it does not replace it, and it separates the layers:
+ *
+ *   INTENT      what the user wants          (END_CONVERSATION, alarm, timer, device command, memory, small talk)
+ *   PARAMETERS  hour, duration, day ...      (extracted by the NLU; missing ones are asked for)
+ *   CONTEXT     what is still open           (ConversationContext.pending: "آلارم بذار" -> "چه ساعتی؟" -> "هفت صبح")
+ *   TOOL        how it is done on the phone  (JarvisActionExecutor -> JarvisTool, outside the Brain)
  *
  * Order for a complete utterance:
- *  1. explicit memory command (remember / recall / forget / clear)  -> CONVERSATION
- *  2. device command known to the processor, confidence >= threshold -> COMMAND
- *  3. offline small talk (سلام / خوبی؟ / اسمت چیه؟ / تشکر ...)       -> CONVERSATION (OfflineConversationBrain)
- *     requests that need live data (weather, news, search)            -> CONVERSATION ("برای این مورد باید به اینترنت وصل باشم.")
- *  4. anything else                                                  -> UNKNOWN ("متوجه نشدم.", nothing runs)
+ *  0. an answer to a pending question ("هفت صبح") completes the pending Alarm / Timer       -> COMMAND
+ *     ("ولش کن" cancels it)
+ *  1. explicit memory command (remember / recall / forget / clear)                           -> CONVERSATION
+ *  2. device command known to the processor, confidence >= threshold                         -> COMMAND
+ *  3. END_CONVERSATION intent (structure based, see EndConversationDetector)                  -> END_CONVERSATION
+ *  4. Alarm / Timer without a time                                                           -> CLARIFY (question)
+ *  5. offline small talk / requests that need live data                                      -> CONVERSATION
+ *  6. anything else                                                                          -> UNKNOWN ("متوجه نشدم.", nothing runs)
  *
- * A local command ALWAYS wins over conversation; nothing here touches the network.
+ * A device command ALWAYS wins over an ending, so "تایمر ۵ دقیقه" is never mistaken for "تمام"; nothing here
+ * touches the network. Memory is written ONLY in step 1 for an explicit "remember" command. User text is never
+ * logged. Never throws.
  *
- * Memory is written ONLY in step 1 for an explicit "remember" command; ordinary sentences are never stored.
- * User text is never logged. Never throws.
+ * A future LLM Brain implements the same [JarvisBrain] interface and returns the same [BrainResult]s.
  */
 class DefaultJarvisBrain(
     private val processor: JarvisCommandProcessor,
     private val memory: JarvisMemory,
-    private val conversation: OfflineConversationBrain = OfflineConversationBrain()
+    private val conversation: OfflineConversationBrain = OfflineConversationBrain(),
+    private val slots: SlotFiller = SlotFiller()
 ) : JarvisBrain {
 
     /** Key of the last fact remembered or recalled, so "این رو فراموش کن" knows what "این" is. */
     private var lastKey: String? = null
 
     override fun think(text: String): BrainResult = try {
-        thinkUnsafe(text)
+        decide(text, null)
     } catch (e: Exception) {
         Log.e(TAG, "Brain failed; treating the utterance as unknown", e)
         BrainResult.Unknown()
     }
 
-    private fun thinkUnsafe(text: String): BrainResult {
-        MemoryCommandParser.parse(text)?.let { return handleMemory(it) }
-
-        val result = processor.process(text)
-        val action = result.action
-        if (result.handled && action != null && action !is JarvisAction.Unknown) {
-            // "خداحافظ" is a dismiss command; it still gets a spoken farewell (the conversation ends either way).
-            if (action is JarvisAction.DismissAssistant) {
-                conversation.reply(text)?.let { return BrainResult.Conversation(it) }
+    /** Steps 0-6 above. [ctx] is null for the single-turn [think]: then nothing can be pending or stored. */
+    private fun decide(text: String, ctx: ConversationContext?): BrainResult {
+        // 0. A question is open: the utterance is most likely its answer.
+        val pending = ctx?.pending
+        if (ctx != null && pending != null) {
+            if (isCancel(text) && EndConversationDetector.detect(text) == null) {
+                ctx.pending = null
+                return BrainResult.Conversation(JarvisPhrases.CANCELLED)
             }
-            return BrainResult.Command(action, result.responseText, result.confidence)
         }
 
+        // 1. Explicit memory commands.
+        MemoryCommandParser.parse(text)?.let { return handleMemory(it) }
+
+        if (ctx != null && pending != null) {
+            slots.fill(pending, text)?.let { action ->
+                ctx.pending = null
+                return BrainResult.Command(action, "", ANSWER_CONFIDENCE)
+            }
+            if (!isNewRequest(text)) {
+                // Not an answer and not a new request: ask once more, then give up.
+                if (pending.attempts >= MAX_RETRIES) {
+                    ctx.pending = null
+                    return BrainResult.Conversation(JarvisPhrases.NOT_UNDERSTOOD)
+                }
+                ctx.pending = pending.copy(attempts = pending.attempts + 1)
+                return BrainResult.Clarify(askAgain(pending.target))
+            }
+            ctx.pending = null          // a new request replaces the open question; handled below
+        }
+
+        // 2. Device commands.
+        val result = processor.process(text)
+        val action = result.action
+        val command: JarvisAction? =
+            if (result.handled && action != null && action !is JarvisAction.Unknown) action else null
+        if (command != null && command !is JarvisAction.DismissAssistant && command !is JarvisAction.NeedsInfo) {
+            return BrainResult.Command(command, result.responseText, result.confidence)
+        }
+
+        // 3. END_CONVERSATION intent ("خداحافظ", "من دیگه میرم", "کافیه" ...).
+        EndConversationDetector.detect(text)?.let { return BrainResult.EndConversation(conversation.farewell(it.goodNight)) }
+
+        // 4. Alarm / Timer without a time: ask, and remember what was already said.
+        if (command is JarvisAction.NeedsInfo) {
+            ctx?.pending = PendingIntent(command.target, command.dayOffset, command.period, command.preferMorning)
+            return BrainResult.Clarify(question(command.target))
+        }
+
+        // "ولش کن" / "بیخیال" / "هیچی": a dismiss command; it may still get a spoken reply.
+        if (command != null) {
+            conversation.reply(text)?.let { return BrainResult.Conversation(it) }
+            return BrainResult.Command(command, result.responseText, result.confidence)
+        }
+
+        // 5. Small talk / online-only requests.
         conversation.reply(text)?.let { return BrainResult.Conversation(it) }
+
+        // 6.
         return BrainResult.Unknown()
     }
 
+    private fun question(target: SlotTarget): String =
+        if (target == SlotTarget.ALARM) JarvisPhrases.ASK_ALARM_TIME else JarvisPhrases.ASK_TIMER_DURATION
+
+    private fun askAgain(target: SlotTarget): String =
+        if (target == SlotTarget.ALARM) JarvisPhrases.ASK_ALARM_TIME_AGAIN else JarvisPhrases.ASK_TIMER_DURATION_AGAIN
+
+    /** Cancels an open question: "ولش کن", "بیخیال", "لغو", "نمیخوام", "هیچی". */
+    private fun isCancel(text: String): Boolean {
+        val tokens = PersianNormalizer.tokens(text)
+        return tokens.size <= 4 && tokens.any { it in CANCEL_WORDS }
+    }
+
+    /** True when the utterance is a command or an ending by itself, so it must not be treated as a failed answer. */
+    private fun isNewRequest(text: String): Boolean {
+        val r = processor.process(text)
+        val a = r.action
+        return (r.handled && a != null && a !is JarvisAction.Unknown) || EndConversationDetector.detect(text) != null
+    }
+
     /**
-     * Multi-turn variant. Same order as [think] (memory -> existing command system -> small talk); only the very
-     * last step differs: instead of UNKNOWN, a short natural reply from [OfflineConversationBrain.chat].
+     * Multi-turn variant. Same order as [think] plus the open question in [context]; only the very last step
+     * differs: instead of UNKNOWN, a short natural reply from [OfflineConversationBrain.chat].
      * Input cleanup only removes leading discourse words ("راستی برو اینستاگرام"); the command parser itself is
      * not touched and no second parser exists.
      */
     override fun think(text: String, context: ConversationContext): BrainResult = try {
         val cleaned = stripLeadIns(text)
-        val result = thinkUnsafe(cleaned)
+        val result = decide(cleaned, context)
         if (result is BrainResult.Unknown && cleaned.isNotBlank()) {
             if (looksLikeCommandAttempt(cleaned)) BrainResult.Conversation(JarvisPhrases.NOT_UNDERSTOOD)
             else BrainResult.Conversation(conversation.chat(cleaned, context.recentResponses))
@@ -92,7 +169,14 @@ class DefaultJarvisBrain(
     }
 
     override fun isConfidentCommand(partialText: String): Boolean = try {
-        MemoryCommandParser.parse(partialText) == null && processor.process(partialText).isHighConfidence
+        val r = processor.process(partialText)
+        val a = r.action
+        // Alarm / timer / questions / endings are never run from a still-growing partial result: "ساعت ۷" may become
+        // "ساعت ۷ و نیم", "۲۰ دقیقه" may become "۲۰ دقیقه و نیم".
+        val partialSafe = a != null && a !is JarvisAction.CreateAlarm && a !is JarvisAction.CreateTimer &&
+            a !is JarvisAction.NeedsInfo && a !is JarvisAction.ToolCall && a !is JarvisAction.DismissAssistant
+        MemoryCommandParser.parse(partialText) == null && r.isHighConfidence && partialSafe &&
+            EndConversationDetector.detect(partialText) == null
     } catch (e: Exception) {
         false
     }
@@ -102,7 +186,8 @@ class DefaultJarvisBrain(
         if (usable.isEmpty()) return candidates.firstOrNull().orEmpty()
         for (c in usable) {
             val handled = try {
-                MemoryCommandParser.parse(c) != null || processor.process(c).handled || conversation.classify(c) != null
+                MemoryCommandParser.parse(c) != null || processor.process(c).handled ||
+                    EndConversationDetector.detect(c) != null || conversation.classify(c) != null
             } catch (e: Exception) { false }
             if (handled) return c
         }
@@ -159,5 +244,8 @@ class DefaultJarvisBrain(
             "برو", "باز", "بازکن", "ببند", "روشن", "خاموش", "بزن", "بذار", "بزار", "بگذار", "زیاد", "کم", "بیار", "اجرا"
         )
         const val MEMORY_ERROR = "نتوانستم حافظه را به‌روزرسانی کنم."
+        const val MAX_RETRIES = 1
+        const val ANSWER_CONFIDENCE = 0.95f
+        val CANCEL_WORDS = setOf("لغو", "کنسل", "ولش", "بیخیال", "نمیخوام", "هیچی", "فراموشش", "منصرف")
     }
 }

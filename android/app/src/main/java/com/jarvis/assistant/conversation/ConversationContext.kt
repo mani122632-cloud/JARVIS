@@ -1,8 +1,8 @@
 package com.jarvis.assistant.conversation
 
 /**
- * Short-term memory of ONE session: the last few things the user said and JARVIS answered, plus the session
- * state. Strictly bounded, in RAM only, cleared when a session begins and when it ends. It is NOT the
+ * Short-term memory of ONE session: the last few things the user said and JARVIS answered, the session
+ * state, and the request that is waiting for the user's answer ([pending]). Strictly bounded, in RAM only, cleared when a session begins and when it ends. It is NOT the
  * persistent [com.jarvis.assistant.memory.JarvisMemory] and never writes to it. Its text is never logged.
  * Main thread only.
  */
@@ -14,6 +14,12 @@ class ConversationContext(private val maxEntries: Int = MAX_ENTRIES) {
     /** Mirrors the controller's state, so the Brain can see where the session is. */
     var sessionState: SessionState = SessionState.IDLE
         internal set
+
+    /**
+     * The incomplete Alarm / Timer request JARVIS asked a question about (null = nothing is waiting). Set and
+     * cleared by the Brain; dropped with the rest of the session.
+     */
+    var pending: PendingIntent? = null
 
     /** Number of user utterances in this session. */
     var turnCount: Int = 0
@@ -33,6 +39,7 @@ class ConversationContext(private val maxEntries: Int = MAX_ENTRIES) {
     fun clear() {
         users.clear()
         responses.clear()
+        pending = null
         turnCount = 0
     }
 
