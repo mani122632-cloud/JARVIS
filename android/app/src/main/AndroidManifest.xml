@@ -6,6 +6,9 @@
 
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
+    <!-- LLM Brain: HTTPS calls to the configured LLM endpoint. Speech recognition, wake word and TTS stay offline. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
     <!-- Stage 46.3: voice commands. Both are normal (install-time) permissions, no runtime prompt.
          SET_ALARM: AlarmClock.ACTION_SET_ALARM / ACTION_SET_TIMER.
          MODIFY_AUDIO_SETTINGS: AudioManager.setStreamVolume (kept for OEMs that enforce it).

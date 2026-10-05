@@ -19,6 +19,24 @@ class TimerTool(context: Context) : JarvisTool {
 
     override val name: String = NAME
 
+    override val spec: ToolSpec = ToolSpec(
+        name = "set_timer",
+        description = "Start a countdown timer (تایمر / ده دقیقه دیگه یادم بنداز). Give at least one of hours, minutes, seconds. Max 24 hours.",
+        params = listOf(
+            ToolParam("hours", ParamType.INTEGER, "Hours", min = 0, max = 24),
+            ToolParam("minutes", ParamType.INTEGER, "Minutes", min = 0, max = 1440),
+            ToolParam("seconds", ParamType.INTEGER, "Seconds", min = 0, max = 86400)
+        )
+    )
+
+    override fun toAction(args: Map<String, String>): JarvisAction {
+        val total = (args["hours"]?.toIntOrNull() ?: 0) * 3600L +
+            (args["minutes"]?.toIntOrNull() ?: 0) * 60L +
+            (args["seconds"]?.toIntOrNull() ?: 0)
+        // 0 or out of range is rejected by the tool itself ("زمان را درست متوجه نشدم.").
+        return JarvisAction.CreateTimer(if (total in 1..86_400L) total.toInt() else 0)
+    }
+
     override fun canHandle(action: JarvisAction): Boolean =
         action is JarvisAction.CreateTimer || (action is JarvisAction.ToolCall && action.tool == NAME)
 

@@ -57,6 +57,9 @@ class JarvisActionExecutor(
     /** Adds (or replaces, by name) a tool, e.g. a future call / SMS / contacts / search tool. */
     fun register(tool: JarvisTool) = registry.register(tool)
 
+    /** Registered tools (the LLM brain lists those that expose a [JarvisTool.spec]). */
+    val registeredTools: List<JarvisTool> get() = registry.all
+
     private val cameraManager: CameraManager? = app.getSystemService(Context.CAMERA_SERVICE) as? CameraManager
     private val torchState = ConcurrentHashMap<String, Boolean>()
     private val torchCallback = object : CameraManager.TorchCallback() {

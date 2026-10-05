@@ -251,14 +251,31 @@ class JarvisConversationController(
         val best = try { brain.pickBest(candidates).ifBlank { text } } catch (e: Exception) { text }
         conversationContext.addUserUtterance(best)
 
-        // The Brain decides everything, including the end of the conversation (an intent, not a string compare):
-        // pending answer -> memory -> device command -> END_CONVERSATION -> clarification -> small talk.
-        val result = try {
-            brain.think(best, conversationContext)
+        // The Brain decides everything, including the end of the conversation (an intent, not a string compare).
+        // The LLM Brain answers asynchronously (network); the offline Brain answers immediately. Either way the
+        // result is delivered once, on the main thread, and dropped if this turn was cancelled meanwhile.
+        val turnGen = generation
+        main.removeCallbacks(processingTimeout)
+        processingTimeout = Runnable { deliverBrainResult(turnGen, BrainResult.Unknown()) }
+        main.postDelayed(processingTimeout, PROCESSING_TIMEOUT_MS)
+        try {
+            brain.thinkAsync(best, conversationContext) { result -> deliverBrainResult(turnGen, result) }
         } catch (e: Exception) {
             Log.e(TAG, "Brain threw", e)
-            BrainResult.Unknown()
+            deliverBrainResult(turnGen, BrainResult.Unknown())
         }
+    }
+
+    /** Safety net: a Brain that never answers must not leave the session stuck in COMMAND_PROCESSING. */
+    private var processingTimeout = Runnable { }
+
+    private fun deliverBrainResult(turnGen: Int, result: BrainResult) {
+        if (turnGen != generation || state != State.COMMAND_PROCESSING) return     // cancelled / finished / duplicate
+        main.removeCallbacks(processingTimeout)
+        guarded { handleBrainResult(result) }
+    }
+
+    private fun handleBrainResult(result: BrainResult) {
         Log.i(TAG, "Brain decided: ${result.kind}" +
             ((result as? BrainResult.Command)?.let { " ${it.action::class.simpleName} conf=${it.confidence}" } ?: ""))
         when (result) {
@@ -390,6 +407,7 @@ class JarvisConversationController(
         const val SILENCE_TIMEOUT_MS = 25_000L           // no speech for this long ends the session (quietly)
         const val WATCHDOG_SLACK_MS = 20_000L            // covers one STT window (7 s wait + 12 s speech)
         const val MAX_SESSION_MS = 10 * 60_000L
+        const val PROCESSING_TIMEOUT_MS = 45_000L        // upper bound for one Brain decision (LLM round trips included)
         const val MAX_FAILED_ATTEMPTS = 5
         const val MAX_EMPTY_STREAK = 4
         const val MAX_PREPARE_WAIT_MS = 150_000L         // a loading STT model may extend the silence watchdog this long

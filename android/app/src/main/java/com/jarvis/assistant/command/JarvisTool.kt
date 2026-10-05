@@ -19,6 +19,15 @@ interface JarvisTool {
     fun canHandle(action: JarvisAction): Boolean
 
     fun execute(action: JarvisAction): JarvisActionExecutor.Outcome
+
+    /**
+     * How an LLM brain sees this tool (LLM-facing name, Persian-friendly description, parameters).
+     * Null = the tool is not offered to the LLM. Tools that return a spec are listed automatically.
+     */
+    val spec: ToolSpec? get() = null
+
+    /** Turns VALIDATED LLM arguments (see [ToolSpec.validate]) into the action this tool handles. */
+    fun toAction(args: Map<String, String>): JarvisAction = JarvisAction.ToolCall(name, args)
 }
 
 /** Ordered set of tools; the first tool that [JarvisTool.canHandle] an action runs it. */
@@ -38,4 +47,7 @@ class ToolRegistry(tools: List<JarvisTool> = emptyList()) {
     fun execute(action: JarvisAction): JarvisActionExecutor.Outcome? = find(action)?.execute(action)
 
     val names: List<String> get() = tools.map { it.name }
+
+    /** Snapshot of all registered tools (registration order). */
+    val all: List<JarvisTool> get() = tools.toList()
 }

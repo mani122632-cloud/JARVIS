@@ -72,6 +72,15 @@ interface JarvisBrain {
     fun think(text: String, context: ConversationContext): BrainResult = think(text)
 
     /**
+     * Asynchronous variant of [think] for brains that need the network (the LLM brain). [onResult] is called
+     * EXACTLY ONCE, on the MAIN thread, possibly later; the caller must ignore it if its session ended meanwhile.
+     * Default: decide synchronously.
+     */
+    fun thinkAsync(text: String, context: ConversationContext, onResult: (BrainResult) -> Unit) {
+        onResult(think(text, context))
+    }
+
+    /**
      * Side-effect-free check for a still-growing partial result: true only for a complete device command
      * that is safe to run before the recognizer has finished.
      */

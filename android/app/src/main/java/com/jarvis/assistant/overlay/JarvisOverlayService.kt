@@ -19,6 +19,7 @@ import android.provider.Settings
 import android.util.Log
 import com.jarvis.assistant.activation.JarvisActivationController
 import com.jarvis.assistant.brain.DefaultJarvisBrain
+import com.jarvis.assistant.brain.llm.JarvisBrains
 import com.jarvis.assistant.command.JarvisActionExecutor
 import com.jarvis.assistant.command.JarvisCommandProcessor
 import com.jarvis.assistant.conversation.JarvisConversationController
@@ -83,10 +84,16 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
             override fun onStatus(status: WakeStatus) = onWakeStatus(status)
         })
         executor = JarvisActionExecutor(this)
+        val memory = SharedPreferencesJarvisMemory(this)    // shared by the offline brain and the LLM brain
         conversation = JarvisConversationController(
             tts = speech,
             commandSpeech = SpeechInputFactory.create(this),
-            brain = DefaultJarvisBrain(JarvisCommandProcessor(), SharedPreferencesJarvisMemory(this)),
+            brain = JarvisBrains.create(
+                this,
+                executor,
+                DefaultJarvisBrain(JarvisCommandProcessor(), memory),
+                memory
+            ),
             executor = executor,
             core = { window.currentCore },
             callback = object : JarvisConversationController.Callback {

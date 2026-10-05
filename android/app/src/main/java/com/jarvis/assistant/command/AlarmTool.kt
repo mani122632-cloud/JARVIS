@@ -27,6 +27,22 @@ class AlarmTool(
 
     override val name: String = NAME
 
+    override val spec: ToolSpec = ToolSpec(
+        name = "set_alarm",
+        description = "Set an alarm (آلارم / بیدارم کن). hour is 24-hour. day_offset 1 = tomorrow, 0 = the next time that clock time occurs. Only today/tomorrow are supported.",
+        params = listOf(
+            ToolParam("hour", ParamType.INTEGER, "Hour 0-23 (24-hour clock)", required = true, min = 0, max = 23),
+            ToolParam("minute", ParamType.INTEGER, "Minute 0-59, default 0", min = 0, max = 59),
+            ToolParam("day_offset", ParamType.INTEGER, "1 only when the user said tomorrow (فردا), otherwise 0", min = 0, max = 7)
+        )
+    )
+
+    override fun toAction(args: Map<String, String>): JarvisAction = JarvisAction.CreateAlarm(
+        args["hour"]?.toIntOrNull() ?: -1,
+        args["minute"]?.toIntOrNull() ?: 0,
+        args["day_offset"]?.toIntOrNull() ?: 0
+    )
+
     override fun canHandle(action: JarvisAction): Boolean =
         action is JarvisAction.CreateAlarm || (action is JarvisAction.ToolCall && action.tool == NAME)
 
