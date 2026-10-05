@@ -1,6 +1,7 @@
 package com.jarvis.assistant.speech
 
-enum class SpeechInputError { NO_PERMISSION, NOT_AVAILABLE, NO_SPEECH, NO_MATCH, NETWORK, BUSY, AUDIO, OTHER }
+/** One error vocabulary for speech input: the existing [CommandSpeechError] (incl. MODEL_MISSING). */
+typealias SpeechInputError = CommandSpeechError
 
 /**
  * Speech input contract of the conversation session (Multi-Turn phase).
@@ -12,8 +13,7 @@ enum class SpeechInputError { NO_PERMISSION, NOT_AVAILABLE, NO_SPEECH, NO_MATCH,
  *
  * The caller guarantees no other microphone user (Vosk wake word) is running while this input listens.
  *
- * Implementations: [JarvisCommandSpeechController] (existing recognizer, kept as a temporary adapter) and,
- * later, the Offline STT from JARVIS-OFFLINE-STT.zip. Switching is one line in [SpeechInputFactory].
+ * Implementation: [JarvisCommandSpeechController], the facade over the Offline STT ([stt.OfflinePersianStt]).
  */
 interface SpeechInput {
 

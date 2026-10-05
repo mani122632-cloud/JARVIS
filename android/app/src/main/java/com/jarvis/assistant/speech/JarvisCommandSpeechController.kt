@@ -14,23 +14,13 @@ enum class CommandSpeechError { NO_PERMISSION, NOT_AVAILABLE, NO_SPEECH, NO_MATC
  * never held between commands. Main thread only. The caller must make sure no other microphone consumer
  * (Vosk) is running.
  */
-class JarvisCommandSpeechController(context: Context) {
+class JarvisCommandSpeechController(context: Context) : SpeechInput {
 
-    interface Listener {
-        fun onListeningStarted() {}
-        fun onPartialResult(text: String) {}          // kept for API compatibility; the offline engine has no partials
-        fun onFinalResult(text: String) {}
-        /** All alternatives of the final result (best first). Called right before [onFinalResult] with the same best text. */
-        fun onFinalAlternatives(texts: List<String>) {}
-        fun onError(error: CommandSpeechError) {}
-        /** Always called once per session, after the final result or error. */
-        fun onListeningStopped() {}
-        /** Voice level 0..1, for the reactor. */
-        fun onVoiceLevel(level: Float) {}
-    }
+    /** Kept so existing callers compile unchanged; it is exactly [SpeechInput.Listener] (the offline engine has no partials). */
+    interface Listener : SpeechInput.Listener
 
     private val stt = OfflinePersianStt(context)      // starts loading the model in the background, once
-    private var listener: Listener? = null
+    private var listener: SpeechInput.Listener? = null
 
     init {
         stt.setListener(object : OfflinePersianStt.Listener {
@@ -46,17 +36,17 @@ class JarvisCommandSpeechController(context: Context) {
         })
     }
 
-    fun setListener(l: Listener?) { listener = l }
+    override fun setListener(l: SpeechInput.Listener?) { listener = l }
 
-    val isListening: Boolean get() = stt.isListening
+    override val isListening: Boolean get() = stt.isListening
 
-    fun startListening() = stt.startListening()
+    override fun startListening() { stt.startListening() }
 
     /** Aborts the session silently (no callbacks) and releases the microphone. */
-    fun stopListening() = stt.stopListening()
+    override fun stopListening() { stt.stopListening() }
 
     /** Stops and frees the STT model. The controller must not be used afterwards. */
-    fun destroy() {
+    override fun destroy() {
         listener = null
         stt.release()
     }
