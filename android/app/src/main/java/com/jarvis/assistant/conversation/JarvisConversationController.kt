@@ -87,15 +87,19 @@ class JarvisConversationController(
         commandSpeech.setListener(object : SpeechInput.Listener {
             override fun onListeningStarted() { core()?.setState(JarvisState.LISTENING) }
             override fun onFinalAlternatives(texts: List<String>) { alternatives = texts }
-            override fun onFinalResult(text: String) = onUtterance(text)
-            override fun onError(error: CommandSpeechError) = onSpeechError(error)
+            override fun onFinalResult(text: String) = guarded { onUtterance(text) }
+            override fun onError(error: CommandSpeechError) = guarded { onSpeechError(error) }
             override fun onVoiceLevel(level: Float) { if (state == State.COMMAND_LISTENING) core()?.setVoiceAmplitude(level) }
         })
     }
 
     /** Call when "بله ارباب." has finished. */
     fun begin() {
-        if (state != State.IDLE) return
+        if (state != State.IDLE) {
+            // A stale session must never block a new one: drop it silently and start clean.
+            Log.w(TAG, "begin() while $state: resetting the previous session")
+            cancel()
+        }
         conversationContext.clear()
         emptyStreak = 0
         failedAttempts = 0
@@ -109,12 +113,38 @@ class JarvisConversationController(
     fun cancel() {
         generation++
         main.removeCallbacksAndMessages(null)
-        commandSpeech.stopListening()
-        tts.stop()
+        try { commandSpeech.stopListening() } catch (t: Throwable) { Log.w(TAG, "stopListening failed", t) }
+        try { tts.stop() } catch (t: Throwable) { Log.w(TAG, "tts.stop failed", t) }
         core()?.setVoiceAmplitude(0f)
         conversationContext.clear()
         setState(State.IDLE)
     }
+
+    /**
+     * Runs a state-machine step. Anything thrown inside must not crash the app or leave the session dead:
+     * the session keeps going (listens again) a few times, then ends cleanly and returns to the wake word.
+     */
+    private fun guarded(block: () -> Unit) {
+        try {
+            block()
+        } catch (t: Throwable) {
+            Log.e(TAG, "Conversation step failed", t)
+            recover()
+        }
+    }
+
+    private fun recover() {
+        try {
+            if (state == State.IDLE) return
+            failedAttempts++
+            if (failedAttempts >= MAX_FAILED_ATTEMPTS) finish() else listen(retryDelay(), newTurn = false)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Recovery failed", t)
+            try { finish() } catch (t2: Throwable) { Log.e(TAG, "finish() failed", t2) }
+        }
+    }
+
+    private fun retryDelay(): Long = RETRY_DELAY_MS * (failedAttempts + 1).coerceAtMost(4)
 
     // ---- listening ------------------------------------------------------------------------------
 
@@ -129,7 +159,7 @@ class JarvisConversationController(
         }
         // Short pause so the recognizer doesn't hear the tail of our own voice.
         main.postDelayed({
-            if (gen == generation && state == State.COMMAND_LISTENING) commandSpeech.startListening()
+            if (gen == generation && state == State.COMMAND_LISTENING) guarded { commandSpeech.startListening() }
         }, delayMs)
     }
 
@@ -154,9 +184,15 @@ class JarvisConversationController(
             CommandSpeechError.NO_PERMISSION -> speak("اجازه میکروفون لازم است.") { finish() }
             CommandSpeechError.NOT_AVAILABLE -> speak("تشخیص گفتار روی این گوشی در دسترس نیست.") { finish() }
             CommandSpeechError.NETWORK -> speak("برای تشخیص گفتار به اینترنت نیاز دارم.") { finish() }
+            // Transient (microphone busy, audio glitch, unexpected error): controlled retries with growing pauses.
             CommandSpeechError.BUSY, CommandSpeechError.AUDIO, CommandSpeechError.OTHER -> {
                 failedAttempts++
-                if (failedAttempts >= MAX_FAILED_ATTEMPTS) finish() else listen(RETRY_DELAY_MS, newTurn = false)
+                Log.w(TAG, "STT error $error (attempt $failedAttempts/$MAX_FAILED_ATTEMPTS)")
+                if (failedAttempts >= MAX_FAILED_ATTEMPTS) {
+                    speak("مشکلی در شنیدن صدا پیش آمد.") { finish() }
+                } else {
+                    listen(retryDelay(), newTurn = false)
+                }
             }
         }
     }
@@ -166,7 +202,7 @@ class JarvisConversationController(
         emptyStreak++
         when {
             emptyStreak >= MAX_EMPTY_STREAK -> finish()
-            emptyStreak == NOT_UNDERSTOOD_AT -> speak(JarvisPhrases.NOT_UNDERSTOOD) { listen(LISTEN_DELAY_MS, newTurn = false) }
+            emptyStreak % 2 == 1 -> speak(JarvisPhrases.NOT_UNDERSTOOD) { listen(LISTEN_DELAY_MS, newTurn = false) }
             else -> relistenOrTimeout()
         }
     }
@@ -260,7 +296,7 @@ class JarvisConversationController(
             if (done || gen != generation) return@Runnable
             done = true
             main.removeCallbacksAndMessages(SPEAK_TOKEN)
-            then()
+            guarded { then() }
         }
         val startTimeout = Runnable {
             Log.w(TAG, "TTS did not start; continuing without speech")
@@ -271,20 +307,26 @@ class JarvisConversationController(
         val now = SystemClock.uptimeMillis()
         main.postAtTime(startTimeout, SPEAK_TOKEN, now + SPEAK_START_TIMEOUT_MS)
         main.postAtTime(proceed, SPEAK_TOKEN, now + maxSpeak)
-        tts.speak(text, object : JarvisSpeechController.Callback {
-            override fun onStart() {
-                main.removeCallbacks(startTimeout)
-                if (gen == generation) core()?.setState(JarvisState.SPEAKING)
-            }
-            override fun onDone(success: Boolean) { main.post(proceed) }
-        })
+        try {
+            tts.speak(text, object : JarvisSpeechController.Callback {
+                override fun onStart() {
+                    main.removeCallbacks(startTimeout)
+                    if (gen == generation) core()?.setState(JarvisState.SPEAKING)
+                }
+                override fun onDone(success: Boolean) { main.post(proceed) }
+            })
+        } catch (t: Throwable) {
+            Log.e(TAG, "tts.speak threw", t)
+            main.post(proceed)
+        }
     }
 
     private fun finish() {
+        if (state == State.IDLE) return                   // already finished: never report twice
         generation++
         main.removeCallbacksAndMessages(null)
-        commandSpeech.stopListening()
-        tts.stop()
+        try { commandSpeech.stopListening() } catch (t: Throwable) { Log.w(TAG, "stopListening failed", t) }
+        try { tts.stop() } catch (t: Throwable) { Log.w(TAG, "tts.stop failed", t) }
         core()?.setVoiceAmplitude(0f)
         conversationContext.sessionState = SessionState.ENDING
         conversationContext.clear()
@@ -316,18 +358,18 @@ class JarvisConversationController(
         const val SILENCE_TIMEOUT_MS = 25_000L           // no speech for this long ends the session (quietly)
         const val WATCHDOG_SLACK_MS = 20_000L            // covers one STT window (7 s wait + 12 s speech)
         const val MAX_SESSION_MS = 10 * 60_000L
-        const val MAX_FAILED_ATTEMPTS = 2
+        const val MAX_FAILED_ATTEMPTS = 5
         const val MAX_EMPTY_STREAK = 4
-        const val NOT_UNDERSTOOD_AT = 2
 
-        const val LISTEN_DELAY_MS = 250L                 // lets the tail of our own voice die out
+        const val LISTEN_DELAY_MS = 400L                 // lets the tail of our own voice die out
         const val RETRY_DELAY_MS = 400L
         const val AFTER_COMMAND_DELAY_MS = 700L          // an app may just have come to the front
 
-        const val SPEAK_START_TIMEOUT_MS = 3000L
-        const val SPEAK_BASE_MS = 4000L
+        // Synthesis of a NEW sentence happens before onStart(), so this must be generous (Piper on a phone).
+        const val SPEAK_START_TIMEOUT_MS = 12_000L
+        const val SPEAK_BASE_MS = 14_000L
         const val SPEAK_PER_CHAR_MS = 90L
-        const val SPEAK_MAX_MS = 20_000L
+        const val SPEAK_MAX_MS = 40_000L
 
         val EXIT_FILLER = setOf("جارویس", "جارویز", "هی", "لطفا", "ارباب", "بله", "ممنون", "مرسی", "ممنونم", "خب", "باشه")
         val EXIT_PHRASES = setOf(

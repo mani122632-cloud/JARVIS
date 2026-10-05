@@ -106,7 +106,12 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
             override fun onReadyForCommand() {
                 // "بله ارباب." is done. Vosk is suspended (runActivation), so the command recognizer
                 // is the only microphone user from here until the overlay hides.
-                conversation.begin()
+                try {
+                    conversation.begin()
+                } catch (t: Throwable) {
+                    Log.e(TAG, "Conversation could not start; returning to wake word", t)
+                    endInteraction()
+                }
             }
         }
     }
@@ -132,7 +137,7 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
         when (intent?.action) {
             ACTION_WAKE_START -> {
                 if (wakeEnabled) {
-                    WakeWordState.update(status = WakeStatus.LOADING_MODEL, flow = AssistantFlow.WAKE_WORD_LISTENING)
+                    if (!interactionActive) WakeWordState.update(status = WakeStatus.LOADING_MODEL, flow = AssistantFlow.WAKE_WORD_LISTENING)
                     resumeWake()
                 } else {
                     finishIfIdle()
@@ -178,6 +183,8 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
     /** Idempotent and safe when nothing is shown. Fades out, removes the window, then stops the service. */
     override fun hideOverlay() {
         window.hide {
+            // Runs once the window is really gone. (If a new show() interrupts the fade-out instead, the
+            // interaction that re-showed it owns the state and resumes Vosk when IT ends.)
             isOverlayVisible = false
             interactionActive = false
             if (wakeEnabled) WakeWordState.update(flow = AssistantFlow.WAKE_WORD_LISTENING)
@@ -197,6 +204,10 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
     }
 
     private fun runActivation(source: JarvisActivationController.Source) {
+        if (activation.phase != JarvisActivationController.Phase.IDLE || conversation.state != JarvisConversationController.State.IDLE) {
+            Log.w(TAG, "Activation ignored: an interaction is already running")   // never restart a live session
+            return
+        }
         interactionActive = true
         suspendWake()                            // free the mic while the overlay / TTS / commands run
         if (wakeEnabled) WakeWordState.update(flow = AssistantFlow.ACTIVATING)

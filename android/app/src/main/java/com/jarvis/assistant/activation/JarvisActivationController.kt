@@ -121,7 +121,11 @@ class JarvisActivationController(
             it.setVoiceAmplitude(0f)
             it.setState(JarvisState.LISTENING)
         }
-        listener?.onReadyForCommand()
+        try {
+            listener?.onReadyForCommand()
+        } catch (t: Throwable) {            // the command stage must never crash the activation
+            Log.e(TAG, "onReadyForCommand threw", t)
+        }
     }
 
     private fun cancelPending() {
@@ -134,7 +138,8 @@ class JarvisActivationController(
     private companion object {
         const val TAG = "JarvisActivation"
         val PHRASE = com.jarvis.assistant.speech.JarvisPhrases.ACK      // the configured confirmation phrase
-        const val SPEECH_START_TIMEOUT_MS = 3000L
-        const val SPEECH_TIMEOUT_MS = 6000L
+        // Synthesis of an uncached phrase (first wake right after start-up) runs before audio starts.
+        const val SPEECH_START_TIMEOUT_MS = 10_000L
+        const val SPEECH_TIMEOUT_MS = 20_000L
     }
 }

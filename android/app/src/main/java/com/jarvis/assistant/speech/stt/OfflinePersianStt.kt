@@ -57,7 +57,11 @@ class OfflinePersianStt(context: Context) {
     private val app = context.applicationContext
     private val main = Handler(Looper.getMainLooper())
     private val executor = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "JarvisStt").apply { isDaemon = true }
+        Thread(r, "JarvisStt").apply {
+            isDaemon = true
+            // Last line of defence: nothing thrown on the worker may take the whole app down.
+            setUncaughtExceptionHandler { _, e -> Log.e(TAG, "Uncaught error on the STT worker", e) }
+        }
     }
 
     @Volatile private var listener: Listener? = null
@@ -66,13 +70,21 @@ class OfflinePersianStt(context: Context) {
     private var captureDone: CountDownLatch? = null     // counted down when the AudioRecord is closed
 
     // Written once by the loader task on the worker thread, read by session tasks on the same thread.
-    private var engine: OfflineSttEngine? = null
-    private var loadError: CommandSpeechError? = null
+    @Volatile private var engine: OfflineSttEngine? = null
+    @Volatile private var loadError: CommandSpeechError? = null
+    @Volatile private var loading = true                // true until the model load task has finished (either way)
     @Volatile private var released = false
 
-    private val watchdog = Runnable {
-        Log.w(TAG, "STT session watchdog fired")
-        finishWithError(session, CommandSpeechError.NO_SPEECH)
+    private val watchdog = object : Runnable {
+        override fun run() {
+            if (!active || released) return
+            if (loading) {                                   // the model is still loading: that is not the user's silence
+                main.postDelayed(this, WATCHDOG_MS)
+                return
+            }
+            Log.w(TAG, "STT session watchdog fired")
+            finishWithError(session, CommandSpeechError.NO_SPEECH)
+        }
     }
 
     init {
@@ -87,9 +99,15 @@ class OfflinePersianStt(context: Context) {
     // ---- public API (main thread) -----------------------------------------------------------------
 
     fun startListening() {
-        if (active || released) return
+        if (released) return
+        if (active) {
+            // A previous session is still marked active (stuck or not yet reported): abort it cleanly and start a
+            // fresh one, so "listen again" can never silently do nothing.
+            Log.w(TAG, "startListening while active: restarting the session")
+            stopListening()
+        }
         if (app.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            main.post { listener?.onError(CommandSpeechError.NO_PERMISSION); listener?.onListeningStopped() }
+            main.post { safe { listener?.onError(CommandSpeechError.NO_PERMISSION); listener?.onListeningStopped() } }
             return
         }
         val id = ++session
@@ -172,13 +190,15 @@ class OfflinePersianStt(context: Context) {
                         "(model.onnx, tokens.txt). Run tools/install-persian-stt.sh and rebuild.")
                 }
                 is OfflineSttEngineFactory.Result.Failed -> {
-                    loadError = CommandSpeechError.OTHER
+                    loadError = CommandSpeechError.NOT_AVAILABLE     // permanent: retrying the turn cannot help
                     Log.e(TAG, "Persian STT model failed to load", r.error)
                 }
             }
         } catch (t: Throwable) {          // nothing may escape the worker thread: an uncaught Error would kill the app
-            loadError = CommandSpeechError.OTHER
+            loadError = CommandSpeechError.NOT_AVAILABLE
             Log.e(TAG, "Persian STT model loading crashed", t)
+        } finally {
+            loading = false
         }
     }
 
@@ -271,7 +291,7 @@ class OfflinePersianStt(context: Context) {
      * Energy based: threshold = max(floor, noise floor x [NOISE_RATIO]); the noise floor adapts while silent.
      */
     private fun capture(id: Int, rec: AudioRecord): Capture {
-        main.post { if (id == session && active) listener?.onListeningStarted() }
+        main.post { if (id == session && active) safe { listener?.onListeningStarted() } }
         val chunk = ShortArray(CHUNK)
         val buf = ShortArray(MAX_SAMPLES)
         var n = 0
@@ -309,7 +329,7 @@ class OfflinePersianStt(context: Context) {
             if (++levelTick % 2 == 0) {
                 val db = 20f * log10(rms + 1e-6f)
                 val level = ((db + 55f) / 40f).coerceIn(0f, 1f)
-                main.post { if (id == session && active) listener?.onVoiceLevel(level) }
+                main.post { if (id == session && active) safe { listener?.onVoiceLevel(level) } }
             }
 
             val thr = max(MIN_THRESHOLD, noise * NOISE_RATIO)
@@ -360,7 +380,10 @@ class OfflinePersianStt(context: Context) {
             for (i in samples.indices) samples[i] *= gain
         }
         val t0 = SystemClock.elapsedRealtime()
-        val raw = eng.transcribe(samples, SAMPLE_RATE)
+        val raw = try { eng.transcribe(samples, SAMPLE_RATE) } catch (t: Throwable) {
+            Log.e(TAG, "transcribe threw", t)
+            null
+        }
         Log.i(TAG, "Decoded ${len * 1000L / SAMPLE_RATE} ms of audio in ${SystemClock.elapsedRealtime() - t0} ms")   // text is never logged
         if (session != id) return
         val text = normalize(raw)
@@ -375,8 +398,8 @@ class OfflinePersianStt(context: Context) {
             active = false
             main.removeCallbacks(watchdog)
             val l = listener
-            l?.onResult(text)
-            l?.onListeningStopped()
+            safe { l?.onResult(text) }
+            safe { l?.onListeningStopped() }
         }
     }
 
@@ -387,9 +410,14 @@ class OfflinePersianStt(context: Context) {
             session++                                    // a still-running worker must stop
             main.removeCallbacks(watchdog)
             val l = listener
-            l?.onError(error)
-            l?.onListeningStopped()
+            safe { l?.onError(error) }
+            safe { l?.onListeningStopped() }
         }
+    }
+
+    /** A throwing listener must never crash the main thread. */
+    private inline fun safe(block: () -> Unit) {
+        try { block() } catch (t: Throwable) { Log.e(TAG, "STT listener threw", t) }
     }
 
     private fun closeQuietly(r: AudioRecord) {

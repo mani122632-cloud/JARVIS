@@ -46,7 +46,10 @@ class OfflinePersianTts(context: Context) : JarvisSpeechController {
 
     private val app = context.applicationContext
     private val main = Handler(Looper.getMainLooper())
-    private val worker = Executors.newSingleThreadExecutor { r -> Thread(r, "JarvisTts").apply { isDaemon = true } }
+    private val worker = Executors.newSingleThreadExecutor { r -> Thread(r, "JarvisTts").apply {
+        isDaemon = true
+        setUncaughtExceptionHandler { _, e -> Log.e(TAG, "Uncaught error on the TTS worker", e) }
+    } }
 
     private val generation = AtomicInteger()          // identifies the current utterance; bumped by stop()
     @Volatile private var released = false
