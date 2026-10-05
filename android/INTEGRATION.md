@@ -5,14 +5,14 @@
 ## 1. جریان نهایی
 ```
 Wake Word (Vosk، «هی جارویس») → Activation → TTS «بله ارباب.»
-→ Command Listening (SpeechRecognizer fa-IR؛ Vosk متوقف)
+→ Command Listening (Offline Persian STT = sherpa-onnx NeMo CTC، کاملاً آفلاین؛ Vosk متوقف)
 → Brain (JarvisBrain)
      ├─ COMMAND       → TTS «حتماً.» → JarvisActionExecutor
      ├─ CONVERSATION  → TTS پاسخ (سلام / حافظه / ...)
      └─ UNKNOWN       → TTS «متوجه نشدم.» (هیچ Action اجرا نمی‌شود)
 → پایان → Overlay بسته می‌شود → Vosk دوباره شروع می‌شود
 ```
-- هر لحظه فقط یک میکروفون فعال است: Vosk **یا** SpeechRecognizer. TTS با AudioTrack پخش می‌شود و میکروفون نمی‌گیرد.
+- هر لحظه فقط یک میکروفون فعال است: Vosk **یا** Offline STT (`OfflinePersianStt`). TTS با AudioTrack پخش می‌شود و میکروفون نمی‌گیرد.
 - همهٔ پاسخ‌ها از `OfflinePersianTts` (مرحله 46.2) می‌آیند. Android System TTS در پروژه نیست. موتور TTS یک بار در `onCreate` سرویس load می‌شود (`initialize()`) و برای هر جمله دوباره ساخته نمی‌شود.
 - یک فرمان فقط یک بار اجرا می‌شود (`dispatched` + ورودی واحد `onCommand`). Partial فقط با confidence ≥ 0.9، ۵۰۰ms ثبات و فقط برای فرمان دستگاه (نه حافظه) زودتر اجرا می‌شود.
 - هیچ AI / API / LLM / اینترنتی در Brain، parser و executor نیست.
@@ -83,7 +83,7 @@ app/src/sherpa/java/com/k2fsa/sherpa/onnx/Tts.kt
 
 ## 7. محدودیت‌های شناخته‌شده (صادقانه)
 - **Build نشده**: هیچ بخشی روی دستگاه یا با کامپایلر تست نشده؛ مدل Vosk و صدای Piper هنوز با گوش واقعی ارزیابی نشده‌اند (تلفظ ممکن است نیاز به `PersianTtsText.PRONUNCIATION` داشته باشد؛ «جارویس» ممکن است در lexicon Vosk نباشد، املاها در `WakePhrase.kt`).
-- **شنیدن فرمان** با `SpeechRecognizer` فارسی روی بعضی گوشی‌ها اینترنت می‌خواهد (اجرای فرمان آفلاین است، شنیدنش نه). بدون آن «برای تشخیص گفتار به اینترنت نیاز دارم.» گفته می‌شود. Vosk دوم برای فرمان عمداً اضافه نشد.
+- **شنیدن فرمان** با `OfflinePersianStt` (sherpa-onnx، مدل Shenava Rizeh v1.0) کاملاً آفلاین است؛ مدل و Kotlin API با `tools/install-persian-stt.sh` نصب می‌شوند (مسیر `app/src/main/assets/stt-fa/`). بدون مدل، JARVIS «مدل تشخیص گفتار فارسی نصب نشده است.» می‌گوید و Crash نمی‌کند. جزئیات: `CHANGES-OFFLINE-STT.md`.
 - **حافظه** فقط جفت «چیز ← مقدار» است؛ جملهٔ آزاد یا چندمقداره ندارد. «این رو فراموش کن» فقط به آخرین مورد ذخیره/پرسیده‌شده در همان اجرای سرویس اشاره می‌کند؛ بعد از kill سرویس جواب می‌دهد کدام مورد را فراموش کند.
 - **گفتگو** فقط چند عبارت ثابت است، نه Local LLM. هر چیز دیگر «متوجه نشدم.»
 - **برگرد**: Back واقعی در برنامهٔ دیگر بدون AccessibilityService ممکن نیست؛ فقط Overlay بسته می‌شود. **Wi-Fi/Bluetooth** فقط صفحهٔ تنظیمات را باز می‌کنند. تایمر ≤ ۲۴ ساعت. صدا روی دستگاه‌های fixed-volume اثر ندارد. چراغ قوه اگر دوربین مشغول باشد خطا می‌دهد.

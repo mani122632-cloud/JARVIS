@@ -10,6 +10,12 @@ def sherpaKotlinApi = file("src/sherpa/java/com/k2fsa/sherpa/onnx/Tts.kt")
 def sherpaNativeLib = file("src/main/jniLibs/arm64-v8a/libsherpa-onnx-jni.so")
 def sherpaPresent = sherpaKotlinApi.exists() && sherpaNativeLib.exists()
 
+// Offline Persian STT (sherpa-onnx ASR). src/sherpa-stt is compiled only when tools/install-persian-stt.sh has
+// installed the sherpa-onnx ASR Kotlin API next to Tts.kt; otherwise JARVIS reports "STT model missing" at runtime.
+def sherpaAsrKotlinApi = file("src/sherpa/java/com/k2fsa/sherpa/onnx/OfflineRecognizer.kt")
+def sherpaAsrStream = file("src/sherpa/java/com/k2fsa/sherpa/onnx/OfflineStream.kt")
+def sherpaAsrPresent = sherpaPresent && sherpaAsrKotlinApi.exists() && sherpaAsrStream.exists()
+
 android {
     namespace "com.jarvis.assistant"
     compileSdk 35
@@ -28,6 +34,7 @@ android {
     sourceSets {
         main {
             if (sherpaPresent) java.srcDir "src/sherpa/java"
+            if (sherpaAsrPresent) java.srcDir "src/sherpa-stt/java"
         }
     }
 
@@ -53,4 +60,7 @@ dependencies {
 
 if (!sherpaPresent) {
     logger.warn("JARVIS: sherpa-onnx files not found -> building WITHOUT offline TTS (see INTEGRATION.md, tools/install-offline-assets.sh)")
+}
+if (!sherpaAsrPresent) {
+    logger.warn("JARVIS: sherpa-onnx ASR API not found -> building WITHOUT offline Persian STT (run tools/install-persian-stt.sh)")
 }

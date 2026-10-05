@@ -13,8 +13,11 @@ import com.jarvis.assistant.memory.MemoryException
  * Order for a complete utterance:
  *  1. explicit memory command (remember / recall / forget / clear)  -> CONVERSATION
  *  2. device command known to the processor, confidence >= threshold -> COMMAND
- *  3. fixed small talk (سلام / خوبی؟ / اسمت چیه؟)                    -> CONVERSATION
+ *  3. offline small talk (سلام / خوبی؟ / اسمت چیه؟ / تشکر ...)       -> CONVERSATION (OfflineConversationBrain)
+ *     requests that need live data (weather, news, search)            -> CONVERSATION ("برای این مورد باید به اینترنت وصل باشم.")
  *  4. anything else                                                  -> UNKNOWN ("متوجه نشدم.", nothing runs)
+ *
+ * A local command ALWAYS wins over conversation; nothing here touches the network.
  *
  * Memory is written ONLY in step 1 for an explicit "remember" command; ordinary sentences are never stored.
  * User text is never logged. Never throws.
@@ -22,7 +25,7 @@ import com.jarvis.assistant.memory.MemoryException
 class DefaultJarvisBrain(
     private val processor: JarvisCommandProcessor,
     private val memory: JarvisMemory,
-    private val conversation: BasicConversation = BasicConversation()
+    private val conversation: OfflineConversationBrain = OfflineConversationBrain()
 ) : JarvisBrain {
 
     /** Key of the last fact remembered or recalled, so "این رو فراموش کن" knows what "این" is. */
@@ -41,6 +44,10 @@ class DefaultJarvisBrain(
         val result = processor.process(text)
         val action = result.action
         if (result.handled && action != null && action !is JarvisAction.Unknown) {
+            // "خداحافظ" is a dismiss command; it still gets a spoken farewell (the conversation ends either way).
+            if (action is JarvisAction.DismissAssistant) {
+                conversation.reply(text)?.let { return BrainResult.Conversation(it) }
+            }
             return BrainResult.Command(action, result.responseText, result.confidence)
         }
 
@@ -59,7 +66,7 @@ class DefaultJarvisBrain(
         if (usable.isEmpty()) return candidates.firstOrNull().orEmpty()
         for (c in usable) {
             val handled = try {
-                MemoryCommandParser.parse(c) != null || processor.process(c).handled || conversation.reply(c) != null
+                MemoryCommandParser.parse(c) != null || processor.process(c).handled || conversation.classify(c) != null
             } catch (e: Exception) { false }
             if (handled) return c
         }

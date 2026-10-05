@@ -22,7 +22,7 @@ import com.jarvis.assistant.speech.JarvisSpeechController
  * The Brain (Stage 46.4) decides between COMMAND (say "حتماً.", run the action), CONVERSATION (say the reply)
  * and UNKNOWN (say "متوجه نشدم.", run nothing). Every outcome ends the conversation; the wake word resumes.
  *
- * Owns no microphone besides the command recognizer; the caller guarantees Vosk is suspended.
+ * Owns no microphone besides the offline command STT; the caller guarantees Vosk is suspended.
  * Reports the end of the conversation via [Callback.onConversationFinished]. Main thread only.
  */
 class JarvisConversationController(
@@ -175,9 +175,13 @@ class JarvisConversationController(
         if (state != State.COMMAND_LISTENING) return
         generation++
         when (error) {
-            // Empty / weak first result: ONE short silent retry, only then "متوجه نشدم.".
-            CommandSpeechError.NO_SPEECH, CommandSpeechError.NO_MATCH ->
+            // Nothing was said after "بله ارباب.": end quietly, the wake word resumes.
+            CommandSpeechError.NO_SPEECH -> finish()
+            // Speech without usable text: ONE short silent retry, only then "متوجه نشدم.".
+            CommandSpeechError.NO_MATCH ->
                 if (!retryOnce()) speak(JarvisPhrases.NOT_UNDERSTOOD) { finish() }
+            // Offline STT model / engine not installed (see tools/install-persian-stt.sh): say it, end, no crash.
+            CommandSpeechError.MODEL_MISSING -> speak("مدل تشخیص گفتار فارسی نصب نشده است.") { finish() }
             CommandSpeechError.NO_PERMISSION -> speak("اجازه میکروفون لازم است.") { finish() }
             CommandSpeechError.NOT_AVAILABLE -> speak("تشخیص گفتار روی این گوشی در دسترس نیست.") { finish() }
             CommandSpeechError.NETWORK -> speak("برای تشخیص گفتار به اینترنت نیاز دارم.") { finish() }

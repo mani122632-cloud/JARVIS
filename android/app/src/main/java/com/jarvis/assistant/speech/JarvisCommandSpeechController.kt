@@ -1,28 +1,24 @@
 package com.jarvis.assistant.speech
 
 import android.content.Context
-import android.content.Intent
-import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
-import android.util.Log
+import com.jarvis.assistant.speech.stt.OfflinePersianStt
 
-enum class CommandSpeechError { NO_PERMISSION, NOT_AVAILABLE, NO_SPEECH, NO_MATCH, NETWORK, BUSY, AUDIO, OTHER }
+enum class CommandSpeechError { NO_PERMISSION, NOT_AVAILABLE, NO_SPEECH, NO_MATCH, NETWORK, BUSY, AUDIO, OTHER, MODEL_MISSING }
 
 /**
- * Command-phase speech recognition (Persian) on top of android.speech.SpeechRecognizer.
- * One short session per [startListening]: a fresh recognizer is created, and destroyed after the final
- * result or an error, so the microphone is never held between commands. Main thread only.
- * The caller must make sure no other microphone consumer (Vosk) is running.
+ * Command-phase speech recognition (Persian). Since the offline-STT stage this is a thin facade over
+ * [OfflinePersianStt] (sherpa-onnx, fully local): no android.speech.SpeechRecognizer, no network.
+ * The public API is unchanged, so JarvisConversationController and JarvisOverlayService need no changes.
+ *
+ * One short session per [startListening]; the microphone is closed before the text is delivered and is
+ * never held between commands. Main thread only. The caller must make sure no other microphone consumer
+ * (Vosk) is running.
  */
 class JarvisCommandSpeechController(context: Context) {
 
     interface Listener {
         fun onListeningStarted() {}
-        fun onPartialResult(text: String) {}
+        fun onPartialResult(text: String) {}          // kept for API compatibility; the offline engine has no partials
         fun onFinalResult(text: String) {}
         /** All alternatives of the final result (best first). Called right before [onFinalResult] with the same best text. */
         fun onFinalAlternatives(texts: List<String>) {}
@@ -33,143 +29,35 @@ class JarvisCommandSpeechController(context: Context) {
         fun onVoiceLevel(level: Float) {}
     }
 
-    private val app = context.applicationContext
-    private val main = Handler(Looper.getMainLooper())
-    private var recognizer: SpeechRecognizer? = null
+    private val stt = OfflinePersianStt(context)      // starts loading the model in the background, once
     private var listener: Listener? = null
-    private var session = 0
-    private var active = false
-    private var lastPartial = ""
-    private var lastAlternatives: List<String> = emptyList()
 
-    private val watchdog = Runnable {
-        val id = session
-        Log.w(TAG, "Recognizer watchdog fired")
-        finish(id, error = CommandSpeechError.NO_SPEECH)
+    init {
+        stt.setListener(object : OfflinePersianStt.Listener {
+            override fun onListeningStarted() { listener?.onListeningStarted() }
+            override fun onVoiceLevel(level: Float) { listener?.onVoiceLevel(level) }
+            override fun onResult(text: String) {
+                val l = listener
+                l?.onFinalAlternatives(listOf(text))
+                l?.onFinalResult(text)
+            }
+            override fun onError(error: CommandSpeechError) { listener?.onError(error) }
+            override fun onListeningStopped() { listener?.onListeningStopped() }
+        })
     }
 
     fun setListener(l: Listener?) { listener = l }
 
-    val isListening: Boolean get() = active
+    val isListening: Boolean get() = stt.isListening
 
-    fun startListening() {
-        if (active) return
-        if (app.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) !=
-            android.content.pm.PackageManager.PERMISSION_GRANTED) {
-            main.post { listener?.onError(CommandSpeechError.NO_PERMISSION); listener?.onListeningStopped() }
-            return
-        }
-        if (!SpeechRecognizer.isRecognitionAvailable(app)) {
-            main.post { listener?.onError(CommandSpeechError.NOT_AVAILABLE); listener?.onListeningStopped() }
-            return
-        }
-        val id = ++session
-        active = true
-        lastPartial = ""
-        lastAlternatives = emptyList()
-        try {
-            val r = SpeechRecognizer.createSpeechRecognizer(app)
-            recognizer = r
-            r.setRecognitionListener(RecListener(id))
-            r.startListening(
-                Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                    putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                    putExtra(RecognizerIntent.EXTRA_LANGUAGE, "fa-IR")
-                    putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "fa-IR")
-                    putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                    putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)      // alternatives: the parser picks the best
-                    putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, app.packageName)
-                    // Give the user time to speak naturally (honored by some recognizers, ignored by others).
-                    putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1600L)
-                    putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1300L)
-                    putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 1500L)
-                }
-            )
-            main.postDelayed(watchdog, MAX_SESSION_MS)
-        } catch (e: Throwable) {
-            Log.e(TAG, "startListening failed", e)
-            finish(id, error = CommandSpeechError.OTHER)
-        }
-    }
+    fun startListening() = stt.startListening()
 
     /** Aborts the session silently (no callbacks) and releases the microphone. */
-    fun stopListening() {
-        if (!active) return
-        session++                       // invalidates callbacks of the old recognizer
-        active = false
-        main.removeCallbacks(watchdog)
-        releaseRecognizer()
-    }
+    fun stopListening() = stt.stopListening()
 
+    /** Stops and frees the STT model. The controller must not be used afterwards. */
     fun destroy() {
-        stopListening()
         listener = null
-    }
-
-    private fun releaseRecognizer() {
-        val r = recognizer ?: return
-        recognizer = null
-        try { r.setRecognitionListener(null); r.cancel() } catch (e: Throwable) { /* ignore */ }
-        try { r.destroy() } catch (e: Throwable) { /* ignore */ }
-    }
-
-    private fun finish(id: Int, finalText: String? = null, error: CommandSpeechError? = null) {
-        if (id != session || !active) return
-        active = false
-        main.removeCallbacks(watchdog)
-        releaseRecognizer()
-        val l = listener
-        when {
-            !finalText.isNullOrBlank() -> {
-                l?.onFinalAlternatives(if (lastAlternatives.isEmpty()) listOf(finalText) else lastAlternatives)
-                l?.onFinalResult(finalText)
-            }
-            (error == CommandSpeechError.NO_MATCH || error == CommandSpeechError.NO_SPEECH) && lastPartial.isNotBlank() -> {
-                l?.onFinalAlternatives(listOf(lastPartial))
-                l?.onFinalResult(lastPartial)
-            }
-            else -> l?.onError(error ?: CommandSpeechError.NO_MATCH)
-        }
-        l?.onListeningStopped()
-    }
-
-    private inner class RecListener(private val id: Int) : RecognitionListener {
-        override fun onReadyForSpeech(params: Bundle?) {
-            if (id == session && active) listener?.onListeningStarted()
-        }
-        override fun onPartialResults(partialResults: Bundle?) {
-            if (id != session || !active) return
-            val t = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
-            if (!t.isNullOrBlank()) { lastPartial = t; listener?.onPartialResult(t) }
-        }
-        override fun onResults(results: Bundle?) {
-            val all = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                ?.filter { it.isNotBlank() }.orEmpty()
-            if (id == session && active) lastAlternatives = all
-            finish(id, finalText = all.firstOrNull(), error = CommandSpeechError.NO_MATCH)
-        }
-        override fun onError(error: Int) {
-            finish(id, error = when (error) {
-                SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> CommandSpeechError.NO_SPEECH
-                SpeechRecognizer.ERROR_NO_MATCH -> CommandSpeechError.NO_MATCH
-                SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> CommandSpeechError.NO_PERMISSION
-                SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> CommandSpeechError.NETWORK
-                SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> CommandSpeechError.BUSY
-                SpeechRecognizer.ERROR_AUDIO -> CommandSpeechError.AUDIO
-                else -> CommandSpeechError.OTHER
-            })
-        }
-        override fun onRmsChanged(rmsdB: Float) {
-            if (id == session && active) listener?.onVoiceLevel(((rmsdB + 2f) / 12f).coerceIn(0f, 1f))
-        }
-        override fun onBeginningOfSpeech() {}
-        override fun onBufferReceived(buffer: ByteArray?) {}
-        override fun onEndOfSpeech() {}
-        override fun onEvent(eventType: Int, params: Bundle?) {}
-    }
-
-    private companion object {
-        const val TAG = "JarvisCommandSpeech"
-        const val MAX_SESSION_MS = 15_000L
+        stt.release()
     }
 }
