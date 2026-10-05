@@ -70,20 +70,26 @@ object RelevantMemory {
 
     fun count(memory: JarvisMemory): Int = try { memory.entries().size } catch (e: MemoryException) { 0 }
 
+    private class ScoredFact(val key: String, val value: String, val score: Int)
+
     fun select(memory: JarvisMemory, texts: List<String>): List<Pair<String, String>> {
-        val entries = try { memory.entries() } catch (e: MemoryException) { return emptyList() }
-        if (entries.isEmpty()) return emptyList()
-        val words = texts.flatMap { PersianNormalizer.tokens(it) }.filter { it.length > 1 }.toSet()
+        val stored: Map<String, String> = try { memory.entries() } catch (e: MemoryException) { return emptyList() }
+        if (stored.isEmpty()) return emptyList()
+        val words: Set<String> = texts.flatMap { PersianNormalizer.tokens(it) }.filter { it.length > 1 }.toSet()
         if (words.isEmpty()) return emptyList()
-        return entries.entries
-            .map { (k, v) ->
-                val keyHits = PersianNormalizer.tokens(k).count { it in words }
-                val valueHits = PersianNormalizer.tokens(v).count { it in words }
-                Triple(k, v, keyHits * 2 + valueHits)
-            }
-            .filter { it.third > 0 }
-            .sortedByDescending { it.third }
-            .take(MAX_FACTS)
-            .map { it.first to it.second }
+
+        val scored = ArrayList<ScoredFact>()
+        for (entry in stored.entries) {
+            var keyHits = 0
+            for (token in PersianNormalizer.tokens(entry.key)) if (token in words) keyHits++
+            var valueHits = 0
+            for (token in PersianNormalizer.tokens(entry.value)) if (token in words) valueHits++
+            val score = keyHits * 2 + valueHits
+            if (score > 0) scored.add(ScoredFact(entry.key, entry.value, score))
+        }
+        val sorted: List<ScoredFact> = scored.sortedByDescending { fact -> fact.score }
+        val result = ArrayList<Pair<String, String>>()
+        for (fact in sorted.take(MAX_FACTS)) result.add(Pair(fact.key, fact.value))
+        return result
     }
 }

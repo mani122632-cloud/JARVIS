@@ -25,6 +25,13 @@ interface JarvisMemory {
     @Throws(MemoryException::class)
     fun forget(key: String): Boolean
 
+    /**
+     * All stored facts (normalized key -> value). Only used to pick the few facts relevant to an utterance;
+     * the whole map is never sent anywhere. Default: empty (a store that cannot enumerate).
+     */
+    @Throws(MemoryException::class)
+    fun entries(): Map<String, String> = emptyMap()
+
     /** Removes everything. */
     @Throws(MemoryException::class)
     fun clear()

@@ -58,6 +58,16 @@ class SharedPreferencesJarvisMemory(context: Context) : JarvisMemory {
         }
     }
 
+    override fun entries(): Map<String, String> = try {
+        val out = LinkedHashMap<String, String>()
+        for ((k, v) in prefs().all) {
+            if (k.startsWith(PREFIX) && v is String) out[k.removePrefix(PREFIX)] = v
+        }
+        out
+    } catch (e: RuntimeException) {
+        throw MemoryException("Read failed", e)
+    }
+
     override fun clear() {
         try {
             if (!prefs().edit().clear().commit()) throw MemoryException("Write failed")
