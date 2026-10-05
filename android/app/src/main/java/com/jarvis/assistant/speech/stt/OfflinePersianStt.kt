@@ -57,7 +57,9 @@ class OfflinePersianStt(context: Context) {
     private val app = context.applicationContext
     private val main = Handler(Looper.getMainLooper())
     private val executor = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "JarvisStt").apply {
+        // Big stack: ONNX Runtime builds/optimizes the FastConformer graph on THIS thread (model load and decode).
+        // A plain Java thread has ~1 MB, which is not enough for that and ends in a native crash that no catch can see.
+        Thread(null, r, "JarvisStt", WORKER_STACK_BYTES).apply {
             isDaemon = true
             // Last line of defence: nothing thrown on the worker may take the whole app down.
             setUncaughtExceptionHandler { _, e -> Log.e(TAG, "Uncaught error on the STT worker", e) }
@@ -483,6 +485,7 @@ class OfflinePersianStt(context: Context) {
         /** Same normalizer the command parser uses (ي/ك, half-space, punctuation, digits); meaning is unchanged. */
         fun normalize(raw: String?): String = if (raw.isNullOrBlank()) "" else PersianNormalizer.normalize(raw)
 
+        private const val WORKER_STACK_BYTES = 32L * 1024 * 1024
         private const val SAMPLE_RATE = 16_000
         private const val CHUNK = 320                               // 20 ms
 
