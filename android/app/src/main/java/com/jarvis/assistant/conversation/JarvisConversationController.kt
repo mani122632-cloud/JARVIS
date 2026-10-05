@@ -71,11 +71,20 @@ class JarvisConversationController(
     private var alternatives: List<String> = emptyList()
 
     /** Backup for a recognizer that never answers; the normal silence check happens on NO_SPEECH. */
-    private val silenceWatchdog = Runnable {
-        if (state == State.COMMAND_LISTENING) {
-            Log.i(TAG, "Silence watchdog: ending session")
-            finish()
+    private val silenceWatchdog = Runnable { onSilenceWatchdog() }
+
+    /** Uptime of begin(); bounds how long a still-loading recognizer may extend the silence watchdog. */
+    private var sessionStartedAt = 0L
+
+    private fun onSilenceWatchdog() {
+        if (state != State.COMMAND_LISTENING) return
+        // The STT model is still loading (first use after start-up): that is not the user's silence.
+        if (commandSpeech.isPreparing && SystemClock.uptimeMillis() - sessionStartedAt < MAX_PREPARE_WAIT_MS) {
+            main.postDelayed(silenceWatchdog, PREPARE_RECHECK_MS)
+            return
         }
+        Log.i(TAG, "Silence watchdog: ending session")
+        finish()
     }
 
     private val maxSession = Runnable {
@@ -106,6 +115,7 @@ class JarvisConversationController(
         alternatives = emptyList()
         main.removeCallbacks(maxSession)
         main.postDelayed(maxSession, MAX_SESSION_MS)
+        sessionStartedAt = SystemClock.uptimeMillis()
         listen(LISTEN_DELAY_MS, newTurn = true)
     }
 
@@ -182,7 +192,17 @@ class JarvisConversationController(
             CommandSpeechError.NO_MATCH -> handleUnusable()
             CommandSpeechError.MODEL_MISSING -> speak("مدل تشخیص گفتار فارسی نصب نشده است.") { finish() }
             CommandSpeechError.NO_PERMISSION -> speak("اجازه میکروفون لازم است.") { finish() }
-            CommandSpeechError.NOT_AVAILABLE -> speak("تشخیص گفتار روی این گوشی در دسترس نیست.") { finish() }
+            // The recognizer could not load (the STT reloads itself on every attempt): retry with growing pauses and
+            // only give up, with the spoken message, when several attempts in a row failed.
+            CommandSpeechError.NOT_AVAILABLE -> {
+                failedAttempts++
+                Log.w(TAG, "STT not available (attempt $failedAttempts/$MAX_FAILED_ATTEMPTS)")
+                if (failedAttempts >= MAX_FAILED_ATTEMPTS) {
+                    speak("تشخیص گفتار روی این گوشی در دسترس نیست.") { finish() }
+                } else {
+                    listen(retryDelay() + NOT_AVAILABLE_EXTRA_DELAY_MS, newTurn = false)
+                }
+            }
             CommandSpeechError.NETWORK -> speak("برای تشخیص گفتار به اینترنت نیاز دارم.") { finish() }
             // Transient (microphone busy, audio glitch, unexpected error): controlled retries with growing pauses.
             CommandSpeechError.BUSY, CommandSpeechError.AUDIO, CommandSpeechError.OTHER -> {
@@ -303,10 +323,16 @@ class JarvisConversationController(
             tts.stop()
             proceed.run()
         }
+        val maxTimeout = Runnable {
+            if (done || gen != generation) return@Runnable
+            Log.w(TAG, "TTS took too long; cutting it and continuing")
+            try { tts.stop() } catch (t: Throwable) { Log.w(TAG, "tts.stop failed", t) }
+            proceed.run()
+        }
         val maxSpeak = (SPEAK_BASE_MS + text.length * SPEAK_PER_CHAR_MS).coerceAtMost(SPEAK_MAX_MS)
         val now = SystemClock.uptimeMillis()
         main.postAtTime(startTimeout, SPEAK_TOKEN, now + SPEAK_START_TIMEOUT_MS)
-        main.postAtTime(proceed, SPEAK_TOKEN, now + maxSpeak)
+        main.postAtTime(maxTimeout, SPEAK_TOKEN, now + maxSpeak)
         try {
             tts.speak(text, object : JarvisSpeechController.Callback {
                 override fun onStart() {
@@ -360,6 +386,9 @@ class JarvisConversationController(
         const val MAX_SESSION_MS = 10 * 60_000L
         const val MAX_FAILED_ATTEMPTS = 5
         const val MAX_EMPTY_STREAK = 4
+        const val MAX_PREPARE_WAIT_MS = 150_000L         // a loading STT model may extend the silence watchdog this long
+        const val PREPARE_RECHECK_MS = 3_000L
+        const val NOT_AVAILABLE_EXTRA_DELAY_MS = 1_000L
 
         const val LISTEN_DELAY_MS = 400L                 // lets the tail of our own voice die out
         const val RETRY_DELAY_MS = 400L

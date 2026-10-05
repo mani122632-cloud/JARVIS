@@ -39,17 +39,20 @@ object OfflineSttEngineFactory {
         Log.i(TAG, "ABIs=${Build.SUPPORTED_ABIS.joinToString()} model=${files.model.length()} bytes tokens=${files.tokens.length()} bytes")
         preflight(files)?.let { return Result.Failed(IllegalStateException(it)) }
 
-        // A native abort (exit()/SIGSEGV inside sherpa-onnx or ONNX Runtime) cannot be caught in Kotlin and kills the
-        // process. The marker survives such a death; the next start (same installed build) then refuses to repeat the
-        // fatal load, so the app does not crash on every Voice toggle. A new install/update retries once.
+        // A native abort (exit()/SIGSEGV/OOM-kill inside sherpa-onnx or ONNX Runtime) cannot be caught in Kotlin and
+        // kills the process. The marker survives such a death and counts the attempts that died. It must NEVER make
+        // the voice mode unavailable for good (one low-memory kill while Vosk + Gyro + STT were loading used to do
+        // exactly that): only [MAX_NATIVE_CRASHES] dead attempts of this build within [CRASH_MEMORY_MS] block a
+        // retry, then the counter expires by itself. A new install/update starts clean.
         val marker = File(files.model.parentFile, MARKER)
         val build = buildStamp(context)
-        if (marker.isFile && readQuietly(marker) == build) {
-            Log.e(TAG, "The previous native load of the STT model killed the process (model/native library " +
-                "incompatible or out of memory). Not retrying with this build; see logcat of that run (tag JarvisSttEngine).")
-            return Result.Failed(IllegalStateException("previous native STT load crashed the process"))
+        val deadAttempts = readDeadAttempts(marker, build)
+        if (deadAttempts >= MAX_NATIVE_CRASHES) {
+            Log.e(TAG, "The native load of the STT model killed the process $deadAttempts times in a row " +
+                "(model/native library incompatible or out of memory). Pausing retries; see logcat tag JarvisSttEngine.")
+            return Result.Failed(IllegalStateException("previous native STT loads crashed the process"))
         }
-        try { marker.writeText(build) } catch (t: Throwable) { Log.w(TAG, "could not write load marker", t) }
+        try { marker.writeText("$build|${deadAttempts + 1}|${System.currentTimeMillis()}") } catch (t: Throwable) { Log.w(TAG, "could not write load marker", t) }
 
         return try {
             val ctor = cls.getConstructor(String::class.java, String::class.java, Int::class.javaPrimitiveType)
@@ -61,6 +64,17 @@ object OfflineSttEngineFactory {
         } finally {
             marker.delete()               // control came back to Kotlin: the load did not kill the process
         }
+    }
+
+    /** Number of earlier load attempts of THIS build that never came back (process died); 0 if none / stale / other build. */
+    private fun readDeadAttempts(marker: File, build: String): Int {
+        if (!marker.isFile) return 0
+        val parts = readQuietly(marker).split('|')
+        if (parts.size < 3 || parts[0] != build) return 0
+        val count = parts[1].toIntOrNull() ?: return 0
+        val at = parts[2].toLongOrNull() ?: return 0
+        val age = System.currentTimeMillis() - at
+        return if (age < 0 || age > CRASH_MEMORY_MS) 0 else count
     }
 
     /** Cheap sanity checks that turn an obviously broken install into a log line instead of a native abort. */
@@ -80,5 +94,7 @@ object OfflineSttEngineFactory {
     private fun readQuietly(f: File): String = try { f.readText().trim() } catch (t: Throwable) { "" }
 
     private const val MARKER = ".native-load"
+    private const val MAX_NATIVE_CRASHES = 3
+    private const val CRASH_MEMORY_MS = 30L * 60_000L
     private const val MIN_MODEL_BYTES = 50_000_000L
 }

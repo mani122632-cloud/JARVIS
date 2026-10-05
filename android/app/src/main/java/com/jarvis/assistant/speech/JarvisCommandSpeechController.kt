@@ -40,6 +40,8 @@ class JarvisCommandSpeechController(context: Context) : SpeechInput {
 
     override val isListening: Boolean get() = stt.isListening
 
+    override val isPreparing: Boolean get() = stt.isPreparing
+
     override fun startListening() { stt.startListening() }
 
     /** Aborts the session silently (no callbacks) and releases the microphone. */

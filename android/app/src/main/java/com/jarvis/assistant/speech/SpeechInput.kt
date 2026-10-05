@@ -32,6 +32,9 @@ interface SpeechInput {
 
     val isListening: Boolean
 
+    /** True while the recognizer is still preparing (model loading): a started utterance only answers when ready. */
+    val isPreparing: Boolean get() = false
+
     fun setListener(l: Listener?)
 
     /** Starts capturing ONE utterance. No-op if already listening. */

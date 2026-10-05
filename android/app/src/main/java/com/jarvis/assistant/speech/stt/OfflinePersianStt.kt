@@ -74,6 +74,8 @@ class OfflinePersianStt(context: Context) {
     @Volatile private var loadError: CommandSpeechError? = null
     @Volatile private var loading = true                // true until the model load task has finished (either way)
     @Volatile private var released = false
+    @Volatile private var loadAttempts = 0              // failed loads since the last success / cool-down (worker thread writes)
+    @Volatile private var lastLoadFailureAt = 0L
 
     private val watchdog = object : Runnable {
         override fun run() {
@@ -95,6 +97,9 @@ class OfflinePersianStt(context: Context) {
     fun setListener(l: Listener?) { listener = l }
 
     val isListening: Boolean get() = active
+
+    /** True while the model is (re)loading: a session started now is only queued and answers when the model is ready. */
+    val isPreparing: Boolean get() = loading && !released
 
     // ---- public API (main thread) -----------------------------------------------------------------
 
@@ -172,12 +177,32 @@ class OfflinePersianStt(context: Context) {
     private fun loadEngine() {
         try {
             awaitOtherModels()
+        } catch (t: Throwable) {
+            Log.w(TAG, "waiting for the other models failed", t)
+        }
+        attemptLoad()
+    }
+
+    /**
+     * One load attempt (worker thread only). A failure is remembered but is NOT final: a failed load is retried by the
+     * next session (see [maybeRetryLoad]) because the usual causes are transient (low memory while Vosk/Gyro were
+     * loading, a half-finished copy, a killed previous start). Only "no engine / no model in this build" is permanent.
+     */
+    private fun attemptLoad() {
+        loading = true
+        try {
             if (released) return
+            loadError = null
             val t0 = SystemClock.elapsedRealtime()
             when (val r = OfflineSttEngineFactory.create(app)) {
                 is OfflineSttEngineFactory.Result.Ready -> {
-                    engine = r.engine
-                    Log.i(TAG, "Persian STT model loaded in ${SystemClock.elapsedRealtime() - t0} ms")
+                    if (released) {
+                        try { r.engine.release() } catch (t: Throwable) { Log.w(TAG, "engine release failed", t) }
+                    } else {
+                        engine = r.engine
+                        loadAttempts = 0
+                        Log.i(TAG, "Persian STT model loaded in ${SystemClock.elapsedRealtime() - t0} ms")
+                    }
                 }
                 OfflineSttEngineFactory.Result.EngineMissing -> {
                     loadError = CommandSpeechError.MODEL_MISSING
@@ -190,16 +215,42 @@ class OfflinePersianStt(context: Context) {
                         "(model.onnx, tokens.txt). Run tools/install-persian-stt.sh and rebuild.")
                 }
                 is OfflineSttEngineFactory.Result.Failed -> {
-                    loadError = CommandSpeechError.NOT_AVAILABLE     // permanent: retrying the turn cannot help
-                    Log.e(TAG, "Persian STT model failed to load", r.error)
+                    loadError = CommandSpeechError.NOT_AVAILABLE
+                    noteLoadFailure()
+                    Log.e(TAG, "Persian STT model failed to load (attempt $loadAttempts/$MAX_LOAD_ATTEMPTS)", r.error)
                 }
             }
         } catch (t: Throwable) {          // nothing may escape the worker thread: an uncaught Error would kill the app
             loadError = CommandSpeechError.NOT_AVAILABLE
-            Log.e(TAG, "Persian STT model loading crashed", t)
+            noteLoadFailure()
+            Log.e(TAG, "Persian STT model loading crashed (attempt $loadAttempts/$MAX_LOAD_ATTEMPTS)", t)
         } finally {
             loading = false
         }
+    }
+
+    private fun noteLoadFailure() {
+        loadAttempts++
+        lastLoadFailureAt = SystemClock.elapsedRealtime()
+    }
+
+    /**
+     * Worker thread, called by a session that finds no engine. Reloads once if the earlier failure was a transient
+     * kind (never for "missing"), at most [MAX_LOAD_ATTEMPTS] times in a row, and again after [LOAD_COOLDOWN_MS].
+     * @return the engine, or null if there is still none.
+     */
+    private fun maybeRetryLoad(id: Int): OfflineSttEngine? {
+        engine?.let { return it }
+        if (released || loadError != CommandSpeechError.NOT_AVAILABLE) return null
+        if (loadAttempts >= MAX_LOAD_ATTEMPTS) {
+            if (SystemClock.elapsedRealtime() - lastLoadFailureAt < LOAD_COOLDOWN_MS) return null
+            loadAttempts = 0                                 // cool-down over: the next failures count afresh
+        }
+        Log.w(TAG, "STT engine not loaded: retrying the load for this session")
+        try { Thread.sleep(LOAD_RETRY_PAUSE_MS) } catch (e: InterruptedException) { Thread.currentThread().interrupt() }
+        if (session != id) return null
+        attemptLoad()
+        return engine
     }
 
     // ---- one session (worker thread) ----------------------------------------------------------------
@@ -208,10 +259,11 @@ class OfflinePersianStt(context: Context) {
         var rec: AudioRecord? = null
         try {
             if (session != id) return
-            val eng = engine
+            val eng = engine ?: maybeRetryLoad(id)
+            if (session != id) return
             if (eng == null) {
                 latch.countDown()
-                finishWithError(id, loadError ?: CommandSpeechError.MODEL_MISSING)
+                finishWithError(id, loadError ?: CommandSpeechError.NOT_AVAILABLE)
                 return
             }
 
@@ -443,6 +495,9 @@ class OfflinePersianStt(context: Context) {
         private const val MAX_EMPTY_READS = 50
         private const val SETTLE_DELAY_MS = 1_500L                  // let Gyro/Vosk start loading first
         private const val SETTLE_MAX_MS = 20_000L                   // never wait longer than this for them
+        private const val MAX_LOAD_ATTEMPTS = 3                     // failed model loads in a row before pausing
+        private const val LOAD_COOLDOWN_MS = 60_000L                // ... after which a session may try again
+        private const val LOAD_RETRY_PAUSE_MS = 800L                // let memory settle before reloading
 
         // Endpointing
         private const val START_CHUNKS = 3                          // 60 ms above threshold = speech started
