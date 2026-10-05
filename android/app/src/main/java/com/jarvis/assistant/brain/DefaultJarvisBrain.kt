@@ -3,8 +3,11 @@ package com.jarvis.assistant.brain
 import android.util.Log
 import com.jarvis.assistant.command.JarvisAction
 import com.jarvis.assistant.command.JarvisCommandProcessor
+import com.jarvis.assistant.conversation.ConversationContext
 import com.jarvis.assistant.memory.JarvisMemory
 import com.jarvis.assistant.memory.MemoryException
+import com.jarvis.assistant.nlu.PersianNormalizer
+import com.jarvis.assistant.speech.JarvisPhrases
 
 /**
  * The Stage 46.4 Brain. It sits ON TOP of the Stage 46.3 [JarvisCommandProcessor] (which wraps
@@ -53,6 +56,39 @@ class DefaultJarvisBrain(
 
         conversation.reply(text)?.let { return BrainResult.Conversation(it) }
         return BrainResult.Unknown()
+    }
+
+    /**
+     * Multi-turn variant. Same order as [think] (memory -> existing command system -> small talk); only the very
+     * last step differs: instead of UNKNOWN, a short natural reply from [OfflineConversationBrain.chat].
+     * Input cleanup only removes leading discourse words ("راستی برو اینستاگرام"); the command parser itself is
+     * not touched and no second parser exists.
+     */
+    override fun think(text: String, context: ConversationContext): BrainResult = try {
+        val cleaned = stripLeadIns(text)
+        val result = thinkUnsafe(cleaned)
+        if (result is BrainResult.Unknown && cleaned.isNotBlank()) {
+            if (looksLikeCommandAttempt(cleaned)) BrainResult.Conversation(JarvisPhrases.NOT_UNDERSTOOD)
+            else BrainResult.Conversation(conversation.chat(cleaned, context.recentResponses))
+        } else result
+    } catch (e: Exception) {
+        Log.e(TAG, "Brain failed; treating the utterance as unknown", e)
+        BrainResult.Unknown()
+    }
+
+    /** Drops leading "راستی / خب / حالا ..." so a command said mid-conversation reaches the parser unchanged. */
+    private fun stripLeadIns(text: String): String {
+        val tokens = PersianNormalizer.tokens(text)
+        var i = 0
+        while (i < tokens.size && tokens[i] in LEAD_INS) i++
+        if (i == 0 || i >= tokens.size) return text
+        return tokens.drop(i).joinToString(" ")
+    }
+
+    /** An unparsed sentence that starts like an order must not get a chatty answer. */
+    private fun looksLikeCommandAttempt(text: String): Boolean {
+        val tokens = PersianNormalizer.tokens(text)
+        return tokens.size <= 5 && tokens.any { it in COMMAND_VERBS }
     }
 
     override fun isConfidentCommand(partialText: String): Boolean = try {
@@ -118,6 +154,10 @@ class DefaultJarvisBrain(
 
     private companion object {
         const val TAG = "JarvisBrain"
+        val LEAD_INS = setOf("راستی", "خب", "خو", "حالا", "ببین", "راستش", "میگم", "آها", "اها", "اوه", "عه", "هی", "جارویس", "ارباب")
+        val COMMAND_VERBS = setOf(
+            "برو", "باز", "بازکن", "ببند", "روشن", "خاموش", "بزن", "بذار", "بزار", "بگذار", "زیاد", "کم", "بیار", "اجرا"
+        )
         const val MEMORY_ERROR = "نتوانستم حافظه را به‌روزرسانی کنم."
     }
 }

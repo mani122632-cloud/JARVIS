@@ -23,7 +23,7 @@ import com.jarvis.assistant.command.JarvisActionExecutor
 import com.jarvis.assistant.command.JarvisCommandProcessor
 import com.jarvis.assistant.conversation.JarvisConversationController
 import com.jarvis.assistant.memory.SharedPreferencesJarvisMemory
-import com.jarvis.assistant.speech.JarvisCommandSpeechController
+import com.jarvis.assistant.speech.SpeechInputFactory
 import com.jarvis.assistant.core.JarvisCoreView
 import com.jarvis.assistant.speech.JarvisSpeechController
 import com.jarvis.assistant.speech.tts.OfflinePersianTts
@@ -85,7 +85,7 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
         executor = JarvisActionExecutor(this)
         conversation = JarvisConversationController(
             tts = speech,
-            commandSpeech = JarvisCommandSpeechController(this),
+            commandSpeech = SpeechInputFactory.create(this),
             brain = DefaultJarvisBrain(JarvisCommandProcessor(), SharedPreferencesJarvisMemory(this)),
             executor = executor,
             core = { window.currentCore },

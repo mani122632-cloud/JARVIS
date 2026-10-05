@@ -1,6 +1,7 @@
 package com.jarvis.assistant.brain
 
 import com.jarvis.assistant.command.JarvisAction
+import com.jarvis.assistant.conversation.ConversationContext
 import com.jarvis.assistant.speech.JarvisPhrases
 
 enum class BrainKind { COMMAND, CONVERSATION, UNKNOWN }
@@ -46,6 +47,13 @@ interface JarvisBrain {
      * caller invokes it once per utterance, never for partial recognition results.
      */
     fun think(text: String): BrainResult
+
+    /**
+     * Same decision inside a multi-turn session: the command system is still asked first, but a sentence that is
+     * neither a command nor known small talk gets a short natural reply instead of [BrainResult.Unknown].
+     * [context] is the bounded history of this session.
+     */
+    fun think(text: String, context: ConversationContext): BrainResult = think(text)
 
     /**
      * Side-effect-free check for a still-growing partial result: true only for a complete device command

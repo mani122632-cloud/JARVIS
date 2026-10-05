@@ -100,6 +100,33 @@ class OfflineConversationBrain(
         return null
     }
 
+    /**
+     * Last-resort short reply inside a multi-turn session, for a sentence that is neither a command nor known
+     * small talk ("امروز حالم خیلی خوبه"). Deliberately tiny: a few mood/plan cues and neutral acknowledgements,
+     * not a canned-answer database. [recent] = JARVIS's latest replies; a variant not said recently is preferred.
+     */
+    fun chat(text: String, recent: List<String>): String {
+        val tokens = PersianNormalizer.tokens(text).filter { it !in FILLER }
+        if (tokens.isEmpty()) return JarvisPhrases.ACK
+        val set = tokens.toSet()
+        val negated = set.any { it in NEGATION_WORDS }
+        return when {
+            set.any { it in NEGATIVE_MOOD } || (negated && set.any { it in POSITIVE_MOOD }) ->
+                fresh(recent, "متأسفم ارباب. اگر کاری از دستم برمی‌آید بگویید.", "ناراحت شدم ارباب. امیدوارم زود بهتر شود.")
+            set.any { it in POSITIVE_MOOD } ->
+                fresh(recent, "خوشحالم ارباب.", "چه خوب! امیدوارم همین‌طور ادامه پیدا کند.")
+            set.any { it in PLAN_WORDS } ->
+                fresh(recent, "باشه ارباب. اگر خواستید برایتان آلارم بگذارم، بگویید.", "متوجه شدم ارباب. هر وقت لازم بود کمک می‌کنم.")
+            set.any { it in QUESTION_WORDS } ->
+                fresh(recent, "متأسفانه جواب دقیقی برای این ندارم ارباب.", "این را نمی‌دانم ارباب، ولی در کارهای گوشی کمکتان می‌کنم.")
+            else ->
+                fresh(recent, "بله ارباب، می‌شنوم.", "متوجهم ارباب.", "باشه ارباب، ادامه بدهید.")
+        }
+    }
+
+    private fun fresh(recent: List<String>, vararg options: String): String =
+        options.firstOrNull { it !in recent } ?: pick(*options)
+
     private fun respond(topic: Topic): String = when (topic) {
         Topic.GREETING -> pick(JarvisPhrases.GREETING, "سلام! در خدمتم.", "سلام ارباب، آماده‌ام.")
         Topic.GOOD_MORNING -> pick("صبح شما هم بخیر ارباب.", "صبح بخیر! امیدوارم روز خوبی داشته باشید.")
@@ -140,6 +167,16 @@ class OfflineConversationBrain(
     private companion object {
         /** Wake-word leftovers and politeness that do not change the meaning. */
         val FILLER = setOf("جارویس", "جارویز", "هی", "لطفا", "ارباب", "بله", "آقا")
+
+        // ---- multi-turn fallback cues (chat) ----
+        val NEGATION_WORDS = setOf("نیست", "نیستم", "نیستی", "ندارم", "نداره", "نبود", "نمیشه")
+        val POSITIVE_MOOD = setOf("خوبه", "خوبم", "خوب", "عالی", "عالیه", "عالیم", "خوشحال", "خوشحالم", "شادم", "باحال", "قشنگ", "خوشم")
+        val NEGATIVE_MOOD = setOf(
+            "خسته", "خستم", "ناراحت", "ناراحتم", "بد", "بدم", "بده", "حوصله", "کلافه", "کلافم",
+            "عصبی", "عصبانی", "غمگین", "ناامید", "نگران", "نگرانم", "استرس"
+        )
+        val PLAN_WORDS = setOf("فردا", "امشب", "قراره", "باید", "بیدار")
+        val QUESTION_WORDS = setOf("چرا", "چطور", "چگونه", "کجا", "کی", "چقدر", "چیه", "چیست", "کدوم")
 
         // ---- needs the internet ----
         val ONLINE_WORDS = setOf(
