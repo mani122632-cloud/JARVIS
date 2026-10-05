@@ -26,7 +26,7 @@ class AppRegistry(val entries: List<AppEntry>) {
                 AppEntry(
                     id = "chrome", label = "کروم",
                     packageNames = listOf("com.android.chrome"),
-                    aliases = listOf("گوگل کروم", "کروم", "کرووم", "گوگل", "chrome")
+                    aliases = listOf("گوگل کروم", "کروم", "کرووم", "کرم", "chrome")
                 ),
                 AppEntry(
                     id = "youtube", label = "یوتیوب",

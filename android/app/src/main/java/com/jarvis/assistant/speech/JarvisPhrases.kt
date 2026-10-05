@@ -11,6 +11,8 @@ object JarvisPhrases {
     const val FINE = "ممنون، آماده‌ام."
     const val MY_NAME = "من جارویس هستم."
 
+    const val CAPABILITIES = "می‌توانم برنامه‌ها را باز کنم، چراغ قوه و صدا را کنترل کنم، تایمر و آلارم بگذارم و به صفحه اصلی بروم."
+
     /** Sentences worth synthesizing ahead of time so the first answer is instant. */
     val PREWARM = listOf(ACK, SURE, NOT_UNDERSTOOD, GREETING, FINE, MY_NAME)
 }

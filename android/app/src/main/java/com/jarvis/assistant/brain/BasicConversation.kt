@@ -14,18 +14,28 @@ class BasicConversation {
         val tokens = PersianNormalizer.tokens(text).filter { it !in FILLER }
         if (tokens.isEmpty()) return null
         val phrase = tokens.joinToString(" ")
-        return when (phrase) {
-            in GREETINGS -> JarvisPhrases.GREETING
-            in HOW_ARE_YOU -> JarvisPhrases.FINE
-            in WHO_ARE_YOU -> JarvisPhrases.MY_NAME
+        val set = tokens.toSet()
+        return when {
+            phrase in GREETINGS || (tokens.size <= 2 && tokens.all { it in GREETING_WORDS }) -> JarvisPhrases.GREETING
+            phrase in HOW_ARE_YOU || (set.contains("حالت") && set.any { it in HOW_WORDS }) -> JarvisPhrases.FINE
+            "من" !in set && (phrase in WHO_ARE_YOU ||
+                ((set.contains("اسمت") || set.contains("نامت") || (set.contains("تو") && (set.contains("اسم") || set.contains("نام")))) &&
+                    set.any { it in WHAT_WORDS })) -> JarvisPhrases.MY_NAME
+            // "چه کارهایی می‌تونی انجام بدی؟" / "چکار بلدی؟" / "چه کاری از دستت برمیاد؟"
+            tokens.any { it.startsWith("کار") || it == "چیکار" || it == "چکار" } &&
+                set.any { it in ABILITY_WORDS } -> JarvisPhrases.CAPABILITIES
             else -> null
         }
     }
 
     private companion object {
         /** Wake-word leftovers and politeness that do not change the meaning. */
-        val FILLER = setOf("جارویس", "هی", "لطفا")
+        val FILLER = setOf("جارویس", "هی", "لطفا", "ارباب", "بله")
 
+        val GREETING_WORDS = setOf("سلام", "درود", "علیکم")
+        val HOW_WORDS = setOf("چطوره", "چطور", "چطوری", "خوبه", "چطوره؟")
+        val WHAT_WORDS = setOf("چیه", "چیست", "چی", "هست", "چیه؟")
+        val ABILITY_WORDS = setOf("تونی", "میتونی", "بلدی", "بلد", "انجام", "برمیاد", "برمی", "توانی", "میتوانی")
         val GREETINGS = setOf("سلام", "درود", "سلام علیکم")
         val HOW_ARE_YOU = setOf(
             "خوبی", "خوبید", "حالت چطوره", "حالت چطور است", "چطوری", "حال شما چطوره", "حالتون چطوره"

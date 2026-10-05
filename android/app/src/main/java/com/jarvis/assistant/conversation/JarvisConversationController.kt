@@ -141,6 +141,7 @@ class JarvisConversationController(
             Log.e(TAG, "Brain threw", e)
             BrainResult.Unknown()
         }
+        Log.i(TAG, "Brain decided: ${result.kind}" + ((result as? BrainResult.Command)?.let { " ${it.action::class.simpleName} conf=${it.confidence}" } ?: ""))
         when (result) {
             // Conversation or unknown: speak, execute nothing, end (wake word resumes).
             is BrainResult.Conversation -> speak(result.responseText) { finish() }
