@@ -5,6 +5,7 @@ import com.k2fsa.sherpa.onnx.OfflineModelConfig
 import com.k2fsa.sherpa.onnx.OfflineNemoEncDecCtcModelConfig
 import com.k2fsa.sherpa.onnx.OfflineRecognizer
 import com.k2fsa.sherpa.onnx.OfflineRecognizerConfig
+import com.k2fsa.sherpa.onnx.VersionInfo
 
 /**
  * Persian speech recognition on sherpa-onnx: NeMo FastConformer CTC (Shenava Rizeh v1.0), fully local.
@@ -18,6 +19,12 @@ class SherpaFarsiSttEngine(
     tokensPath: String,
     numThreads: Int
 ) : OfflineSttEngine {
+
+    init {
+        // Loads libsherpa-onnx-jni.so (+ libonnxruntime.so) and calls into it: a missing library or a Kotlin API that
+        // does not match the .so throws UnsatisfiedLinkError here (caught by the factory) instead of dying later.
+        Log.i(TAG, "sherpa-onnx native ${VersionInfo.version}, onnxruntime ${VersionInfo.onnxruntimeVersion}")
+    }
 
     private val recognizer: OfflineRecognizer = OfflineRecognizer(
         assetManager = null,                              // real files in internal storage

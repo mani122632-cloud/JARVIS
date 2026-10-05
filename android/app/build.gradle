@@ -61,6 +61,19 @@ dependencies {
 if (!sherpaPresent) {
     logger.warn("JARVIS: sherpa-onnx files not found -> building WITHOUT offline TTS (see INTEGRATION.md, tools/install-offline-assets.sh)")
 }
+def sttModelFile = file("src/main/assets/stt-fa/model.onnx")
+def sttTokensFile = file("src/main/assets/stt-fa/tokens.txt")
+if (sttModelFile.exists() || sttTokensFile.exists()) {
+    if (!sttModelFile.exists() || !sttTokensFile.exists()) {
+        logger.warn("JARVIS: assets/stt-fa needs BOTH model.onnx and tokens.txt")
+    }
+    if (!file("src/main/jniLibs/arm64-v8a/libonnxruntime.so").exists()) {
+        logger.warn("JARVIS: jniLibs/arm64-v8a/libonnxruntime.so is missing; libsherpa-onnx-jni.so cannot load without it")
+    }
+    if (!sherpaAsrPresent) {
+        logger.warn("JARVIS: the STT model is bundled but the sherpa-onnx ASR Kotlin API is not -> STT stays disabled")
+    }
+}
 if (!sherpaAsrPresent) {
     logger.warn("JARVIS: sherpa-onnx ASR API not found -> building WITHOUT offline Persian STT (run tools/install-persian-stt.sh)")
 }

@@ -11,6 +11,9 @@ import android.os.SystemClock
 import android.util.Log
 import com.jarvis.assistant.nlu.PersianNormalizer
 import com.jarvis.assistant.speech.CommandSpeechError
+import com.jarvis.assistant.wakeword.TtsStatus
+import com.jarvis.assistant.wakeword.WakeStatus
+import com.jarvis.assistant.wakeword.WakeWordState
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
@@ -65,7 +68,7 @@ class OfflinePersianStt(context: Context) {
     // Written once by the loader task on the worker thread, read by session tasks on the same thread.
     private var engine: OfflineSttEngine? = null
     private var loadError: CommandSpeechError? = null
-    private var released = false
+    @Volatile private var released = false
 
     private val watchdog = Runnable {
         Log.w(TAG, "STT session watchdog fired")
@@ -130,27 +133,52 @@ class OfflinePersianStt(context: Context) {
 
     // ---- model --------------------------------------------------------------------------------------
 
+    /**
+     * The model is big (~117 MB, several hundred MB while ONNX Runtime builds the session). The service creates
+     * this object in onCreate, at the very moment the Gyro voice and the Vosk model are loading too, so the three
+     * loads are serialized: wait (bounded) until those two have settled, then load the STT model.
+     */
+    private fun awaitOtherModels() {
+        try {
+            Thread.sleep(SETTLE_DELAY_MS)       // Vosk's LOADING_MODEL is published a moment after onCreate
+            val deadline = SystemClock.elapsedRealtime() + SETTLE_MAX_MS
+            while (SystemClock.elapsedRealtime() < deadline && !released &&
+                (WakeWordState.tts == TtsStatus.LOADING || WakeWordState.status == WakeStatus.LOADING_MODEL)) {
+                Thread.sleep(100)
+            }
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+    }
+
     private fun loadEngine() {
-        val t0 = SystemClock.elapsedRealtime()
-        when (val r = OfflineSttEngineFactory.create(app)) {
-            is OfflineSttEngineFactory.Result.Ready -> {
-                engine = r.engine
-                Log.i(TAG, "Persian STT model loaded in ${SystemClock.elapsedRealtime() - t0} ms")
+        try {
+            awaitOtherModels()
+            if (released) return
+            val t0 = SystemClock.elapsedRealtime()
+            when (val r = OfflineSttEngineFactory.create(app)) {
+                is OfflineSttEngineFactory.Result.Ready -> {
+                    engine = r.engine
+                    Log.i(TAG, "Persian STT model loaded in ${SystemClock.elapsedRealtime() - t0} ms")
+                }
+                OfflineSttEngineFactory.Result.EngineMissing -> {
+                    loadError = CommandSpeechError.MODEL_MISSING
+                    Log.e(TAG, "Persian STT unavailable: sherpa-onnx ASR API is not part of this build. " +
+                        "Run tools/install-persian-stt.sh and rebuild.")
+                }
+                OfflineSttEngineFactory.Result.ModelMissing -> {
+                    loadError = CommandSpeechError.MODEL_MISSING
+                    Log.e(TAG, "Persian STT unavailable: model files not found in assets/${SttModelInstaller.ASSET_DIR}/ " +
+                        "(model.onnx, tokens.txt). Run tools/install-persian-stt.sh and rebuild.")
+                }
+                is OfflineSttEngineFactory.Result.Failed -> {
+                    loadError = CommandSpeechError.OTHER
+                    Log.e(TAG, "Persian STT model failed to load", r.error)
+                }
             }
-            OfflineSttEngineFactory.Result.EngineMissing -> {
-                loadError = CommandSpeechError.MODEL_MISSING
-                Log.e(TAG, "Persian STT unavailable: sherpa-onnx ASR API is not part of this build. " +
-                    "Run tools/install-persian-stt.sh and rebuild.")
-            }
-            OfflineSttEngineFactory.Result.ModelMissing -> {
-                loadError = CommandSpeechError.MODEL_MISSING
-                Log.e(TAG, "Persian STT unavailable: model files not found in assets/${SttModelInstaller.ASSET_DIR}/ " +
-                    "(model.onnx, tokens.txt). Run tools/install-persian-stt.sh and rebuild.")
-            }
-            is OfflineSttEngineFactory.Result.Failed -> {
-                loadError = CommandSpeechError.OTHER
-                Log.e(TAG, "Persian STT model failed to load", r.error)
-            }
+        } catch (t: Throwable) {          // nothing may escape the worker thread: an uncaught Error would kill the app
+            loadError = CommandSpeechError.OTHER
+            Log.e(TAG, "Persian STT model loading crashed", t)
         }
     }
 
@@ -385,6 +413,8 @@ class OfflinePersianStt(context: Context) {
         private const val OPEN_ATTEMPTS = 3
         private const val OPEN_RETRY_MS = 250L
         private const val MAX_EMPTY_READS = 50
+        private const val SETTLE_DELAY_MS = 1_500L                  // let Gyro/Vosk start loading first
+        private const val SETTLE_MAX_MS = 20_000L                   // never wait longer than this for them
 
         // Endpointing
         private const val START_CHUNKS = 3                          // 60 ms above threshold = speech started
