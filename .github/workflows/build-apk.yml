@@ -13,6 +13,38 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Git LFS pull
+        run: |
+          git lfs install --local
+          git lfs pull
+
+      - name: Verify STT model (Git LFS)
+        run: |
+          MODEL="android/app/src/main/assets/stt-fa/model.onnx"
+          MIN_BYTES=104857600   # 100 MB
+
+          if [ ! -f "$MODEL" ]; then
+            echo "::error::STT model not found: $MODEL"
+            exit 1
+          fi
+
+          SIZE=$(stat -c%s "$MODEL")
+          echo "STT model size: $SIZE bytes ($((SIZE / 1024 / 1024)) MB)"
+
+          if head -c 100 "$MODEL" | grep -q "version https://git-lfs.github.com/spec"; then
+            echo "::error::$MODEL is a Git LFS pointer, not the real model."
+            exit 1
+          fi
+
+          if [ "$SIZE" -lt "$MIN_BYTES" ]; then
+            echo "::error::STT model is smaller than 100 MB ($SIZE bytes). Build aborted."
+            exit 1
+          fi
+
+          echo "STT model verified OK."
 
       - name: Set up JDK
         uses: actions/setup-java@v4
