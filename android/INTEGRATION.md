@@ -68,7 +68,7 @@ app/src/main/jniLibs/arm64-v8a/libsherpa-onnx-jni.so
 app/src/main/jniLibs/arm64-v8a/libonnxruntime.so
 app/src/sherpa/java/com/k2fsa/sherpa/onnx/Tts.kt
 ```
-- مدل پیش‌فرض `vits-piper-fa_IR-amir-medium` (با `VOICE=...` قابل تغییر)، sherpa-onnx نسخهٔ `1.13.7` (با `SHERPA_VERSION=...`). نسخهٔ `Tts.kt` باید هم‌نسخهٔ `.so` باشد.
+- صدای JARVIS: `vits-piper-fa_IR-gyro-medium` (فارسی ایران، آفلاین؛ صدای Amir حذف شده). فقط صدا: `bash tools/install-gyro-voice.sh` (کتابخانه‌های native را دست نمی‌زند)، sherpa-onnx نسخهٔ `1.13.7` (با `SHERPA_VERSION=...`). نسخهٔ `Tts.kt` باید هم‌نسخهٔ `.so` باشد.
 - فقط ABI `arm64-v8a` (`abiFilters` در `app/build.gradle`؛ روی Vosk هم اثر دارد: گوشی ۳۲ بیتی پشتیبانی نمی‌شود).
 - `app/build.gradle` فقط وقتی `Tts.kt` و `libsherpa-onnx-jni.so` وجود دارند source set مربوط به sherpa را اضافه می‌کند؛ پس پروژه بدون آن‌ها هم Build می‌شود.
 - بدون مدل/موتور: `OfflinePersianTts.status` = `MODEL_MISSING` / `ENGINE_MISSING` / `ERROR`، هر `speak()` فوراً `onDone(false)` می‌دهد و Crash نمی‌شود. گفتگو بدون صدا ادامه می‌یابد (Action اجرا می‌شود) و وضعیت در صفحهٔ اصلی نشان داده می‌شود.

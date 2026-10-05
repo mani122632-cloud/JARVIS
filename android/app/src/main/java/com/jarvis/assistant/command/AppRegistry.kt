@@ -21,17 +21,17 @@ class AppRegistry(val entries: List<AppEntry>) {
                 AppEntry(
                     id = "instagram", label = "اینستاگرام",
                     packageNames = listOf("com.instagram.android"),
-                    aliases = listOf("اینستاگرام", "اینستا گرام", "اینستا", "اینستگرام", "instagram")
+                    aliases = listOf("اینستاگرام", "اینستا گرام", "اینستا", "اینستگرام", "ایستاگرام", "اینستاگرم", "اینستا گرم", "اینستاگرامم", "instagram", "insta")
                 ),
                 AppEntry(
                     id = "chrome", label = "کروم",
                     packageNames = listOf("com.android.chrome"),
-                    aliases = listOf("گوگل کروم", "کروم", "chrome")
+                    aliases = listOf("گوگل کروم", "کروم", "کرووم", "گوگل", "chrome")
                 ),
                 AppEntry(
                     id = "youtube", label = "یوتیوب",
                     packageNames = listOf("com.google.android.youtube"),
-                    aliases = listOf("یوتیوب", "یوتوب", "یوتیوپ", "یو تیوب", "youtube")
+                    aliases = listOf("یوتیوب", "یوتوب", "یوتیوپ", "یو تیوب", "یو توب", "یوتیوبم", "youtube")
                 )
             )
         )

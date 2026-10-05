@@ -1,0 +1,7 @@
+# JARVIS-GYRO-WAKE-COMMAND-FIX
+
+- TTS: voice is now `vits-piper-fa_IR-gyro-medium` (Amir removed). Install later in Termux: `cd android && bash tools/install-gyro-voice.sh` (model not in this ZIP). Same Sherpa/Piper architecture; model re-copied automatically via `voice-id.txt` in the installer stamp.
+- Wake word (`WakePhrase`, `VoskWakeWordEngine`): whole-utterance match on a compact form (ی/ي, ک/ك, punctuation, ZWNJ, spaces ignored) so "هی جارویس / جاروویس / جارو یس" all work; timing/duration/high-confidence gates removed (low conf floor 0.30, low RMS floor); partial result accepted after 2 consecutive chunks, final as safety net; one activation per run (AtomicBoolean); no recognizer restarts; Vosk stays suspended during the interaction and resumes after the overlay hides.
+- Commands (`CommandIntentParser`, `AppRegistry`, actions/executor, brain): home words (برو خونه), bare "تایمر"/"آلارم" open the clock screens, glued verbs (بازکن), split/glued app names, more clitics; recognizer alternatives (up to 5) -> Brain picks the one it can handle.
+- Listening timing (`JarvisCommandSpeechController`, `JarvisConversationController`): longer silence hints, 250 ms start delay after the confirmation, ONE silent retry on empty/weak/unknown before "متوجه نشدم."; one SpeechRecognizer at a time; partial text used if the final is empty.
+- Not touched: Arc Reactor / overlay UI, memory, unrelated commands. Not compiled here (no Android toolchain in this environment).

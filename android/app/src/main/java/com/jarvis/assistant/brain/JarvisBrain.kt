@@ -52,4 +52,10 @@ interface JarvisBrain {
      * that is safe to run before the recognizer has finished.
      */
     fun isConfidentCommand(partialText: String): Boolean
+
+    /**
+     * Side-effect-free: of several recognizer alternatives for the SAME utterance, the first one the Brain can
+     * actually handle (memory command, device command, small talk); otherwise the first alternative.
+     */
+    fun pickBest(candidates: List<String>): String = candidates.firstOrNull().orEmpty()
 }

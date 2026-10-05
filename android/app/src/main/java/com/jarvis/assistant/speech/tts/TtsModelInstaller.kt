@@ -22,6 +22,10 @@ object TtsModelInstaller {
     const val TOKENS = "tokens.txt"
     const val DATA_DIR = "espeak-ng-data"
 
+    /** The voice JARVIS is configured for (installed by tools/install-gyro-voice.sh as assets/tts-fa/voice-id.txt). */
+    const val VOICE_ID = "vits-piper-fa_IR-gyro-medium"
+    const val VOICE_ID_FILE = "voice-id.txt"
+
     class Files(val model: File, val tokens: File, val dataDir: File)
 
     /** True when the three required assets are inside the APK. */
@@ -57,7 +61,9 @@ object TtsModelInstaller {
 
     /** Size of the bundled model: changes when the model is replaced, not on every app update. */
     private fun stamp(app: Context): String = try {
-        app.assets.openFd("$ASSET_DIR/$MODEL").use { "len=${it.length}" }
+        // Includes the voice id, so swapping the old voice for Gyro always re-copies the model.
+        val id = try { app.assets.open("$ASSET_DIR/$VOICE_ID_FILE").bufferedReader().use { it.readText().trim() } } catch (e: Exception) { "" }
+        app.assets.openFd("$ASSET_DIR/$MODEL").use { "len=${it.length};voice=$id" }
     } catch (e: Exception) {
         try { "upd=" + app.packageManager.getPackageInfo(app.packageName, 0).lastUpdateTime } catch (e2: Exception) { "0" }
     }

@@ -54,6 +54,18 @@ class DefaultJarvisBrain(
         false
     }
 
+    override fun pickBest(candidates: List<String>): String {
+        val usable = candidates.filter { it.isNotBlank() }
+        if (usable.isEmpty()) return candidates.firstOrNull().orEmpty()
+        for (c in usable) {
+            val handled = try {
+                MemoryCommandParser.parse(c) != null || processor.process(c).handled || conversation.reply(c) != null
+            } catch (e: Exception) { false }
+            if (handled) return c
+        }
+        return usable.first()
+    }
+
     // ---- memory ---------------------------------------------------------------------------------
 
     private fun handleMemory(intent: MemoryIntent): BrainResult = try {

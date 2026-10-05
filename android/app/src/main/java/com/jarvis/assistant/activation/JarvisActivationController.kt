@@ -133,7 +133,7 @@ class JarvisActivationController(
 
     private companion object {
         const val TAG = "JarvisActivation"
-        const val PHRASE = "بله ارباب."
+        val PHRASE = com.jarvis.assistant.speech.JarvisPhrases.ACK      // the configured confirmation phrase
         const val SPEECH_START_TIMEOUT_MS = 3000L
         const val SPEECH_TIMEOUT_MS = 6000L
     }

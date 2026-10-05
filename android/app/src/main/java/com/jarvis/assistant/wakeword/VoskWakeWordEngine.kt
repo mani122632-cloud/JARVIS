@@ -19,7 +19,7 @@ import java.io.File
 import java.io.FileNotFoundException
 
 /**
- * Offline wake word detector («هی جارویس») on top of Vosk.
+ * Offline wake word detector («هی جارویس») on top of Vosk. Matching is spelling/spacing tolerant (see [WakePhrase]).
  *
  * Guarantees:
  *  - At most one capture thread / microphone at a time. [start] is idempotent; a new session first
@@ -109,13 +109,13 @@ class VoskWakeWordEngine(context: Context, private val callback: Callback) {
         if (model == null) emit(s, WakeStatus.LOADING_MODEL)
         val m = obtainModel(s) ?: return
         if (s.stopped || released) return
-        val g = synchronized(modelLock) { grammar }
-        if (g == null) { emit(s, WakeStatus.PHRASE_UNSUPPORTED); return }
+        val g = synchronized(modelLock) { grammar } ?: WakePhrase.build(null)
 
         var recognizer: Recognizer? = null
         var audio: AudioRecord? = null
         try {
-            recognizer = Recognizer(m, SAMPLE_RATE.toFloat(), g.json)
+            recognizer = if (g.json != null) Recognizer(m, SAMPLE_RATE.toFloat(), g.json)
+                         else Recognizer(m, SAMPLE_RATE.toFloat())
             recognizer.setWords(true)
             audio = createAudioRecord()
             if (audio == null) { emit(s, WakeStatus.ERROR); return }
@@ -126,23 +126,40 @@ class VoskWakeWordEngine(context: Context, private val callback: Callback) {
             val buf = ShortArray(CHUNK_SAMPLES)
             var sumSq = 0.0                             // energy of the audio since the last final result
             var count = 0L
+            var peakRms = 0.0                           // loudest chunk of the current utterance
+            var partialHits = 0                         // consecutive chunks whose partial IS the phrase
+            var lastPartial = ""
             while (!s.stopped && !released) {
                 val n = audio.read(buf, 0, buf.size)
                 if (n < 0) { emit(s, WakeStatus.ERROR); return }
                 if (n == 0) continue
-                for (i in 0 until n) { val v = buf[i].toDouble(); sumSq += v * v }
+                var chunkSq = 0.0
+                for (i in 0 until n) { val v = buf[i].toDouble(); chunkSq += v * v }
+                sumSq += chunkSq
                 count += n
+                peakRms = maxOf(peakRms, Math.sqrt(chunkSq / n))
+
                 if (recognizer.acceptWaveForm(buf, n)) {
-                    // FINAL result only (partial results are never looked at).
+                    // FINAL result: the safety net (also catches the phrase when partials flickered).
                     val rms = if (count > 0) Math.sqrt(sumSq / count) else 0.0
-                    sumSq = 0.0; count = 0
-                    if (isWakeWord(g, recognizer.result, rms)) {
-                        s.stopped = true                // we are done; mic is released in finally
-                        // Exactly one activation per engine run, even if something else re-enters here.
-                        if (activationDelivered.compareAndSet(false, true)) {
-                            main.post { if (!released) callback.onWakeWord() }
+                    val loud = maxOf(rms, peakRms)
+                    sumSq = 0.0; count = 0; peakRms = 0.0; partialHits = 0; lastPartial = ""
+                    if (isWakeFinal(g, recognizer.result, loud)) { deliver(s); return }
+                } else {
+                    // Partial results are only READ (never restart the recognizer). The phrase must show up in two
+                    // consecutive chunks (~250 ms) so a single flickering hypothesis cannot trigger JARVIS, but the
+                    // user does not have to wait for Vosk's end-of-speech silence either.
+                    val partial = try { JSONObject(recognizer.partialResult).optString("partial") } catch (e: Exception) { "" }
+                    if (partial.isNotEmpty() && WakePhrase.matches(partial)) {
+                        partialHits = if (partial == lastPartial || partialHits == 0) partialHits + 1 else 1
+                        lastPartial = partial
+                        val rms = if (count > 0) Math.sqrt(sumSq / count) else 0.0
+                        if (partialHits >= PARTIAL_CONFIRM_CHUNKS && maxOf(rms, peakRms) >= WakePhrase.MIN_UTTERANCE_RMS) {
+                            if (debug) { Log.d(TAG, "wake ACCEPT on partial"); WakeWordState.update(heard = partial) }
+                            deliver(s); return
                         }
-                        return
+                    } else {
+                        partialHits = 0; lastPartial = ""
                     }
                 }
             }
@@ -156,12 +173,16 @@ class VoskWakeWordEngine(context: Context, private val callback: Callback) {
         }
     }
 
-    /**
-     * Only called with a FINAL result (acceptWaveForm == true). Partial results are never examined, so a
-     * half-recognised syllable can never wake JARVIS. See [WakePhrase] for the rules.
-     */
-    private fun isWakeWord(g: WakePhrase.Grammar, json: String, rms: Double): Boolean {
-        val verdict = g.evaluate(json).let { v ->
+    /** Exactly one activation per engine run, even if something else re-enters here. The mic is released in finally. */
+    private fun deliver(s: Session) {
+        s.stopped = true
+        if (activationDelivered.compareAndSet(false, true)) {
+            main.post { if (!released) callback.onWakeWord() }
+        }
+    }
+
+    private fun isWakeFinal(g: WakePhrase.Grammar, json: String, rms: Double): Boolean {
+        val verdict = g.evaluateFinal(json).let { v ->
             if (v.accepted) WakePhrase.energyVerdict(rms).let { e -> if (e.accepted) v else e } else v
         }
         if (debug) {
@@ -217,7 +238,7 @@ class VoskWakeWordEngine(context: Context, private val callback: Callback) {
             LibVosk.setLogLevel(LogLevel.WARNINGS)
             val m = Model(dir.absolutePath)
             val g = WakePhrase.build(readVocabulary(dir))
-            Log.i(TAG, "Wake grammar: ${g?.json ?: "UNSUPPORTED (model does not know the phrase)"} tier=${g?.tier}")
+            Log.i(TAG, "Wake grammar: ${g.json ?: "free recognition (model lacks the phrase words)"}")
             synchronized(modelLock) {
                 if (released) { m.close(); return null }
                 model = m
@@ -295,5 +316,6 @@ class VoskWakeWordEngine(context: Context, private val callback: Callback) {
 
         private const val SAMPLE_RATE = 16000
         private const val CHUNK_SAMPLES = 2048          // ~128 ms
+        private const val PARTIAL_CONFIRM_CHUNKS = 2
     }
 }

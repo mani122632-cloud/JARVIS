@@ -12,13 +12,18 @@
 # Overrides (environment variables):
 #   SHERPA_VERSION  sherpa-onnx release, default 1.13.7
 #   VOICE           voice package from the sherpa-onnx "tts-models" release,
-#                   default vits-piper-fa_IR-amir-medium  (alternatives: vits-piper-fa_IR-gyro-medium,
-#                   vits-piper-fa_IR-ganji_adabi-medium)
+#                   default vits-piper-fa_IR-gyro-medium  (the voice JARVIS uses; Amir is not supported)
+#   VOICE_ONLY=1    install only the voice (skip the native libraries and Tts.kt), e.g. via
+#                   tools/install-gyro-voice.sh when the sherpa-onnx files are already in place
 #   ABIS            space separated, default "arm64-v8a"  (must match abiFilters in app/build.gradle)
 set -euo pipefail
 
 SHERPA_VERSION="${SHERPA_VERSION:-1.13.7}"
-VOICE="${VOICE:-vits-piper-fa_IR-amir-medium}"
+VOICE="${VOICE:-vits-piper-fa_IR-gyro-medium}"
+VOICE_ONLY="${VOICE_ONLY:-0}"
+case "$VOICE" in
+  *amir*) echo "ERROR: the Amir voice is no longer used by JARVIS. Use vits-piper-fa_IR-gyro-medium."; exit 1;;
+esac
 ABIS="${ABIS:-arm64-v8a}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,6 +45,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 REL="https://github.com/k2-fsa/sherpa-onnx/releases/download"
 
+if [ "$VOICE_ONLY" != "1" ]; then
 echo "== 1/3 sherpa-onnx v$SHERPA_VERSION native libraries ($ABIS)"
 fetch "$REL/v$SHERPA_VERSION/sherpa-onnx-v$SHERPA_VERSION-android.tar.bz2" "$TMP/android.tar.bz2"
 mkdir -p "$TMP/android" && tar xjf "$TMP/android.tar.bz2" -C "$TMP/android"
@@ -61,6 +67,8 @@ fetch "https://raw.githubusercontent.com/k2-fsa/sherpa-onnx/v$SHERPA_VERSION/she
 grep -q "class OfflineTts" "$TMP/Tts.kt" || { echo "ERROR: downloaded Tts.kt looks wrong"; exit 1; }
 cp -f "$TMP/Tts.kt" "$KT_DIR/Tts.kt"
 
+fi
+
 echo "== 3/3 Persian voice: $VOICE"
 fetch "$REL/tts-models/$VOICE.tar.bz2" "$TMP/voice.tar.bz2"
 mkdir -p "$TMP/voice" && tar xjf "$TMP/voice.tar.bz2" -C "$TMP/voice"
@@ -74,6 +82,7 @@ rm -rf "$DEST" && mkdir -p "$DEST"
 cp -f "$ONNX" "$DEST/model.onnx"
 cp -f "$VDIR/tokens.txt" "$DEST/tokens.txt"
 cp -rf "$VDIR/espeak-ng-data" "$DEST/espeak-ng-data"
+printf '%s\n' "$VOICE" > "$DEST/voice-id.txt"
 
 echo
 echo "Done."

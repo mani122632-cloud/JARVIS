@@ -46,7 +46,7 @@ class CommandIntentParser(
     )
 
     fun parse(raw: String): Parsed {
-        val tokens = PersianNormalizer.tokens(raw)
+        val tokens = expand(PersianNormalizer.tokens(raw))
         val text = tokens.joinToString(" ")
         if (tokens.isEmpty()) return Parsed(JarvisAction.Unknown(raw), 0f, text)
         val input = Input(text, tokens)
@@ -57,6 +57,21 @@ class CommandIntentParser(
         }
         return if (best != null) Parsed(best.action, best.confidence, text)
         else Parsed(JarvisAction.Unknown(raw), 0f, text)
+    }
+
+    /**
+     * Speech recognizers glue and split words differently from run to run ("بازکن", "روشنکن", "ببندش"):
+     * split glued verb forms so the rules below see the same tokens either way.
+     */
+    private fun expand(tokens: List<String>): List<String> {
+        val out = ArrayList<String>(tokens.size + 2)
+        for (tok in tokens) {
+            val base = GLUED_KON_BASES.firstOrNull { tok == it + "کن" || tok == it + "کنید" }
+            if (base != null) { out += base; out += "کن"; continue }
+            if (tok == "بازش" || tok == "بازشکن") { out += "باز"; out += "کن"; continue }
+            out += tok
+        }
+        return out
     }
 
     // ---- dismiss ------------------------------------------------------------------------------------
@@ -70,11 +85,12 @@ class CommandIntentParser(
 
     private fun matchNavigation(inp: Input): Candidate? {
         val t = inp.tokens
-        val homeWord = t.any { it == "هوم" || it == "home" } ||
-            (t.contains("صفحه") && t.any { it == "اصلی" || it == "خانه" || it == "اول" })
+        val homeWord = t.any { it in HOME_WORDS } ||
+            (t.contains("صفحه") && t.any { it == "اصلی" || it == "اول" })
         if (homeWord) {
             val verb = t.any { it in OPEN_VERBS || it in BACK_WORDS }
-            return Candidate(JarvisAction.GoHome, if (verb) 0.95f else 0.88f)
+            val extra = t.filter { it !in NOISE && it !in HOME_WORDS && it !in HOME_PAGE_WORDS }
+            return Candidate(JarvisAction.GoHome, if (verb || extra.isEmpty()) 0.95f else 0.8f)
         }
         val backWord = t.any { it in BACK_WORDS } ||
             (t.contains("صفحه") && t.any { it == "قبل" || it == "قبلی" })
@@ -149,7 +165,8 @@ class CommandIntentParser(
         val t = inp.tokens
         val named = t.any { it in TIMER_WORDS } || inp.text.contains("زمان سنج") || inp.text.contains("شمارش معکوس")
         if (!named) return null
-        val secs = parseDurationSeconds(t) ?: return null
+        val secs = parseDurationSeconds(t)
+            ?: return Candidate(JarvisAction.OpenTimerScreen, 0.8f)          // "تایمر" alone: show the timer screen
         if (secs !in 1..MAX_TIMER_SECONDS) return null
         return Candidate(JarvisAction.CreateTimer(secs), 0.95f)
     }
@@ -169,7 +186,7 @@ class CommandIntentParser(
                 return Candidate(JarvisAction.CreateAlarm(target.hour, target.minute), 0.9f)
             }
         }
-        val time = parseClockTime(t) ?: return null
+        val time = parseClockTime(t) ?: return Candidate(JarvisAction.OpenAlarmScreen, 0.8f)   // "آلارم" alone
         return Candidate(JarvisAction.CreateAlarm(time.hour, time.minute), time.confidence)
     }
 
@@ -332,16 +349,33 @@ class CommandIntentParser(
     private fun matchApp(inp: Input): Candidate? {
         val t = inp.tokens
         if (t.any { it in NEGATIONS || it in CLOSE_WORDS }) return null
+        val openVerb = t.any { it in OPEN_VERBS }
+        val compactText = inp.text.replace(" ", "")
         for (a in aliases) {
-            val idx = indexOfAlias(t, a.tokens)
-            if (idx < 0) continue
+            var idx = indexOfAlias(t, a.tokens)
+            var span = a.tokens.size
+            if (idx < 0) {
+                // The recognizer split or glued the name differently ("اینستا گرام" vs "اینستاگرام").
+                val compactAlias = a.tokens.joinToString("")
+                if (compactAlias.length < 4 || !compactText.contains(compactAlias)) continue
+                idx = t.indexOfFirst { compactAlias.startsWith(it) || it.contains(compactAlias) }.coerceAtLeast(0)
+                span = 0
+            }
             val action = JarvisAction.OpenApp(a.app.id, a.app.label, a.app.packageNames)
-            if (t.any { it in OPEN_VERBS }) return Candidate(action, 0.95f)
-            val rest = t.filterIndexed { i, tok -> (i < idx || i >= idx + a.tokens.size) && tok !in FILLER && tok !in CLITICS }
+            if (openVerb) return Candidate(action, 0.95f)
+            // No explicit verb: accept when nothing but filler / clitics / "کن" surrounds the app name.
+            val rest = t.filterIndexed { i, tok ->
+                tok !in NOISE &&
+                    !(span > 0 && i >= idx && i < idx + span) &&
+                    !(span == 0 && compactAliasContains(a, tok))
+            }
             return if (rest.isEmpty()) Candidate(action, 0.85f) else null
         }
         return null
     }
+
+    private fun compactAliasContains(a: AliasEntry, token: String): Boolean =
+        a.tokens.joinToString("").contains(token) || token.contains(a.tokens.joinToString(""))
 
     /** Index of [alias] inside [t]; a single-word alias may carry a colloquial clitic ("اینستاگرامو"). */
     private fun indexOfAlias(t: List<String>, alias: List<String>): Int {
@@ -365,9 +399,12 @@ class CommandIntentParser(
         val TIME_REGEX = Regex("^(\\d{1,2}):(\\d{2})$")
 
         val FILLER = setOf("جارویس", "جارویز", "هی", "لطفا", "ممنون", "مرسی")
-        val CLITICS = setOf("رو", "را", "ی", "به", "توی", "تو", "داخل", "در", "گوشی")
+        val CLITICS = setOf("رو", "را", "ی", "به", "توی", "تو", "داخل", "در", "گوشی", "تویه", "درون", "برنامه", "اپ", "اپلیکیشن", "اون", "این")
+        val GLUED_KON_BASES = listOf("باز", "روشن", "خاموش", "زیاد", "کم", "بلند", "ببند", "اجرا", "قطع", "وصل", "بیشتر", "کمتر", "پایین", "بالا")
+        val HOME_WORDS = setOf("هوم", "home", "خونه", "خانه", "منزل")
+        val HOME_PAGE_WORDS = setOf("صفحه", "اصلی", "اول")
         val CLITIC_SUFFIXES = setOf("رو", "را", "و")
-        val OPEN_VERBS = setOf("باز", "برو", "بیا", "اجرا", "بزن", "بیار", "بیاور", "open", "run", "start")
+        val OPEN_VERBS = setOf("باز", "برو", "بیا", "اجرا", "بزن", "بیار", "بیاور", "ببر", "برید", "بروید", "بازکن", "open", "run", "start", "launch")
         val NOISE = FILLER + OPEN_VERBS + CLITICS +
             setOf("کن", "کنید", "بکن", "بذار", "بزار", "اون", "این", "یه")
         val NEGATIONS = setOf("نکن", "نه", "نمیخوام")

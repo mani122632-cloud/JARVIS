@@ -47,6 +47,12 @@ class JarvisConversationController(
     private var generation = 0
     private var failedAttempts = 0
 
+    /** Recognizer alternatives of the current final result; the Brain picks the one it can handle. */
+    private var alternatives: List<String> = emptyList()
+
+    /** The single short retry that is allowed before "متوجه نشدم." is spoken. */
+    private var retried = false
+
     /** True once an action of this conversation was handed to the executor: a command runs at most once. */
     private var dispatched = false
 
@@ -56,6 +62,7 @@ class JarvisConversationController(
         commandSpeech.setListener(object : JarvisCommandSpeechController.Listener {
             override fun onListeningStarted() { core()?.setState(JarvisState.LISTENING) }
             override fun onPartialResult(text: String) = onPartial(text)
+            override fun onFinalAlternatives(texts: List<String>) { alternatives = texts }
             override fun onFinalResult(text: String) = onCommand(text)
             override fun onError(error: CommandSpeechError) = onSpeechError(error)
             override fun onVoiceLevel(level: Float) { if (state == State.COMMAND_LISTENING) core()?.setVoiceAmplitude(level) }
@@ -66,6 +73,8 @@ class JarvisConversationController(
     fun begin() {
         if (state != State.IDLE) return
         failedAttempts = 0
+        retried = false
+        alternatives = emptyList()
         dispatched = false
         main.removeCallbacks(overallTimeout)
         main.postDelayed(overallTimeout, OVERALL_TIMEOUT_MS)
@@ -87,7 +96,8 @@ class JarvisConversationController(
         setState(State.COMMAND_LISTENING)
         core()?.setState(JarvisState.LISTENING)
         // Short pause so the recognizer doesn't hear the tail of our own voice.
-        main.postDelayed({ if (gen == generation && state == State.COMMAND_LISTENING) commandSpeech.startListening() }, LISTEN_DELAY_MS)
+        val delay = if (retried || failedAttempts > 0) RETRY_DELAY_MS else LISTEN_DELAY_MS
+        main.postDelayed({ if (gen == generation && state == State.COMMAND_LISTENING) commandSpeech.startListening() }, delay)
     }
 
     /**
@@ -122,8 +132,11 @@ class JarvisConversationController(
         setState(State.COMMAND_PROCESSING)
         core()?.setVoiceAmplitude(0f)
         core()?.setState(JarvisState.THINKING)
+        val candidates = (listOf(text) + alternatives).distinct()
+        alternatives = emptyList()
+        val best = try { brain.pickBest(candidates).ifBlank { text } } catch (e: Exception) { text }
         val result = try {
-            brain.think(text)
+            brain.think(best)
         } catch (e: Exception) {                          // the Brain promises not to throw; stay safe
             Log.e(TAG, "Brain threw", e)
             BrainResult.Unknown()
@@ -131,7 +144,7 @@ class JarvisConversationController(
         when (result) {
             // Conversation or unknown: speak, execute nothing, end (wake word resumes).
             is BrainResult.Conversation -> speak(result.responseText) { finish() }
-            is BrainResult.Unknown -> speak(result.responseText) { finish() }
+            is BrainResult.Unknown -> if (retryOnce()) Unit else speak(result.responseText) { finish() }
             is BrainResult.Command -> runCommand(result)
         }
     }
@@ -139,7 +152,7 @@ class JarvisConversationController(
     private fun runCommand(result: BrainResult.Command) {
         val action = result.action
         if (action is JarvisAction.Unknown) {              // never executed
-            speak(JarvisPhrases.NOT_UNDERSTOOD) { finish() }
+            if (!retryOnce()) speak(JarvisPhrases.NOT_UNDERSTOOD) { finish() }
             return
         }
         speak(result.responseText) {                       // "حتماً."
@@ -161,8 +174,9 @@ class JarvisConversationController(
         if (state != State.COMMAND_LISTENING) return
         generation++
         when (error) {
-            CommandSpeechError.NO_SPEECH -> finish()                                   // user said nothing
-            CommandSpeechError.NO_MATCH -> speak(JarvisPhrases.NOT_UNDERSTOOD) { finish() }
+            // Empty / weak first result: ONE short silent retry, only then "متوجه نشدم.".
+            CommandSpeechError.NO_SPEECH, CommandSpeechError.NO_MATCH ->
+                if (!retryOnce()) speak(JarvisPhrases.NOT_UNDERSTOOD) { finish() }
             CommandSpeechError.NO_PERMISSION -> speak("اجازه میکروفون لازم است.") { finish() }
             CommandSpeechError.NOT_AVAILABLE -> speak("تشخیص گفتار روی این گوشی در دسترس نیست.") { finish() }
             CommandSpeechError.NETWORK -> speak("برای تشخیص گفتار به اینترنت نیاز دارم.") { finish() }
@@ -172,6 +186,17 @@ class JarvisConversationController(
                 if (failedAttempts >= MAX_FAILED_ATTEMPTS) finish() else listen()
             }
         }
+    }
+
+    /** First empty/unrecognized result: listen once more without speaking. False when the retry is already used. */
+    private fun retryOnce(): Boolean {
+        if (retried || dispatched) return false
+        retried = true
+        Log.i(TAG, "Empty or unrecognized result; one retry")
+        main.removeCallbacks(partialRunnable)
+        commandSpeech.stopListening()
+        listen()
+        return true
     }
 
     /** Speaks [text]; [then] runs when done or failed, or if TTS never starts / hangs. Never blocks long. */
@@ -226,7 +251,8 @@ class JarvisConversationController(
         val SPEAK_TOKEN = Any()
         const val MAX_FAILED_ATTEMPTS = 2
         const val TAG = "JarvisConversation"
-        const val LISTEN_DELAY_MS = 100L
+        const val LISTEN_DELAY_MS = 250L          // lets the tail of our own voice die out
+        const val RETRY_DELAY_MS = 400L
         const val PARTIAL_STABLE_MS = 500L
         const val SPEAK_START_TIMEOUT_MS = 3000L
         const val SPEAK_TIMEOUT_MS = 8000L

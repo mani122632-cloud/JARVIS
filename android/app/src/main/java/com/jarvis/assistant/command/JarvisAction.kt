@@ -29,6 +29,9 @@ sealed class JarvisAction {
     data class CreateAlarm(val hour: Int, val minute: Int) : JarvisAction()
     /** [seconds] 1..86400. */
     data class CreateTimer(val seconds: Int) : JarvisAction()
+    /** "تایمر" / "آلارم" without a time: open the clock app's timer / alarm screen. */
+    object OpenTimerScreen : JarvisAction()
+    object OpenAlarmScreen : JarvisAction()
     object GoHome : JarvisAction()
     object GoBack : JarvisAction()
     object DismissAssistant : JarvisAction()

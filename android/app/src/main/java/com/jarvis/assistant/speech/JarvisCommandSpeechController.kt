@@ -24,6 +24,8 @@ class JarvisCommandSpeechController(context: Context) {
         fun onListeningStarted() {}
         fun onPartialResult(text: String) {}
         fun onFinalResult(text: String) {}
+        /** All alternatives of the final result (best first). Called right before [onFinalResult] with the same best text. */
+        fun onFinalAlternatives(texts: List<String>) {}
         fun onError(error: CommandSpeechError) {}
         /** Always called once per session, after the final result or error. */
         fun onListeningStopped() {}
@@ -38,6 +40,7 @@ class JarvisCommandSpeechController(context: Context) {
     private var session = 0
     private var active = false
     private var lastPartial = ""
+    private var lastAlternatives: List<String> = emptyList()
 
     private val watchdog = Runnable {
         val id = session
@@ -63,6 +66,7 @@ class JarvisCommandSpeechController(context: Context) {
         val id = ++session
         active = true
         lastPartial = ""
+        lastAlternatives = emptyList()
         try {
             val r = SpeechRecognizer.createSpeechRecognizer(app)
             recognizer = r
@@ -73,11 +77,12 @@ class JarvisCommandSpeechController(context: Context) {
                     putExtra(RecognizerIntent.EXTRA_LANGUAGE, "fa-IR")
                     putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "fa-IR")
                     putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                    putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+                    putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)      // alternatives: the parser picks the best
                     putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, app.packageName)
-                    // Hints for a quicker end-of-speech (honored by some recognizers, ignored by others).
-                    putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 900L)
-                    putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 700L)
+                    // Give the user time to speak naturally (honored by some recognizers, ignored by others).
+                    putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1600L)
+                    putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1300L)
+                    putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 1500L)
                 }
             )
             main.postDelayed(watchdog, MAX_SESSION_MS)
@@ -115,8 +120,14 @@ class JarvisCommandSpeechController(context: Context) {
         releaseRecognizer()
         val l = listener
         when {
-            !finalText.isNullOrBlank() -> l?.onFinalResult(finalText)
-            error == CommandSpeechError.NO_MATCH && lastPartial.isNotBlank() -> l?.onFinalResult(lastPartial)
+            !finalText.isNullOrBlank() -> {
+                l?.onFinalAlternatives(if (lastAlternatives.isEmpty()) listOf(finalText) else lastAlternatives)
+                l?.onFinalResult(finalText)
+            }
+            (error == CommandSpeechError.NO_MATCH || error == CommandSpeechError.NO_SPEECH) && lastPartial.isNotBlank() -> {
+                l?.onFinalAlternatives(listOf(lastPartial))
+                l?.onFinalResult(lastPartial)
+            }
             else -> l?.onError(error ?: CommandSpeechError.NO_MATCH)
         }
         l?.onListeningStopped()
@@ -132,8 +143,10 @@ class JarvisCommandSpeechController(context: Context) {
             if (!t.isNullOrBlank()) { lastPartial = t; listener?.onPartialResult(t) }
         }
         override fun onResults(results: Bundle?) {
-            val t = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
-            finish(id, finalText = t, error = CommandSpeechError.NO_MATCH)
+            val all = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                ?.filter { it.isNotBlank() }.orEmpty()
+            if (id == session && active) lastAlternatives = all
+            finish(id, finalText = all.firstOrNull(), error = CommandSpeechError.NO_MATCH)
         }
         override fun onError(error: Int) {
             finish(id, error = when (error) {
@@ -157,6 +170,6 @@ class JarvisCommandSpeechController(context: Context) {
 
     private companion object {
         const val TAG = "JarvisCommandSpeech"
-        const val MAX_SESSION_MS = 12_000L
+        const val MAX_SESSION_MS = 15_000L
     }
 }

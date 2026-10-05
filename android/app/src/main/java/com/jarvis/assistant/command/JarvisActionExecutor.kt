@@ -81,6 +81,8 @@ class JarvisActionExecutor(context: Context) {
         is JarvisAction.SetVolume -> setVolume(action.change)
         is JarvisAction.CreateAlarm -> createAlarm(action)
         is JarvisAction.CreateTimer -> createTimer(action)
+        JarvisAction.OpenTimerScreen -> startActivity(Intent(AlarmClock.ACTION_SHOW_TIMERS), "برنامه ساعت برای نمایش تایمر پیدا نشد.")
+        JarvisAction.OpenAlarmScreen -> startActivity(Intent(AlarmClock.ACTION_SHOW_ALARMS), "برنامه ساعت برای نمایش آلارم پیدا نشد.")
         JarvisAction.GoHome -> startActivity(
             Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME),
             "نتوانستم به صفحه اصلی بروم."
