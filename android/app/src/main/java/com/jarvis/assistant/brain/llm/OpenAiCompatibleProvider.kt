@@ -107,7 +107,7 @@ class OpenAiCompatibleProvider(
             LlmRole.USER -> o.put("role", "user").put("content", m.content)
             LlmRole.ASSISTANT -> {
                 o.put("role", "assistant")
-                o.put("content", if (m.content.isBlank() && m.toolCalls.isNotEmpty()) JSONObject.NULL else m.content)
+                o.put("content", m.content)    // "" (not null) when only tools were called: llama.cpp chat templates need a string
                 if (m.toolCalls.isNotEmpty()) {
                     val calls = JSONArray()
                     for (c in m.toolCalls) {

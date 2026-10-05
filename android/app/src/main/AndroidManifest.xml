@@ -28,6 +28,7 @@
         android:theme="@style/AppTheme"
         android:label="JARVIS"
         android:allowBackup="false"
+        android:networkSecurityConfig="@xml/network_security_config"
         android:supportsRtl="true">
 
         <activity

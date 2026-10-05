@@ -25,19 +25,37 @@ data class LlmConfig(
     val baseUrl: String,
     val model: String,
     val apiKey: String = "",
-    val connectTimeoutMs: Int = 6_000,
-    val readTimeoutMs: Int = 12_000,
+    // A model running on the phone itself: connecting is instant, generating on a phone CPU is slow.
+    val connectTimeoutMs: Int = 1_500,
+    val readTimeoutMs: Int = 30_000,
     /** Some newer OpenAI models want "max_completion_tokens". */
     val maxTokensField: String = "max_tokens"
 ) {
-    val isUsable: Boolean get() = baseUrl.isNotBlank() && model.isNotBlank()
+    /** Usable only for a LOCAL endpoint (127.0.0.1 / localhost / ::1): JARVIS never talks to a remote server. */
+    val isUsable: Boolean get() = model.isNotBlank() && isLocalEndpoint(baseUrl)
+
+    companion object {
+        /** Local llama.cpp server (OpenAI-compatible) on the phone. */
+        const val DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1"
+        const val DEFAULT_MODEL = "qwen2.5-1.5b-instruct"
+
+        fun isLocalEndpoint(url: String): Boolean = try {
+            val uri = java.net.URI(url.trim())
+            val scheme = uri.scheme?.lowercase()
+            val host = uri.host?.lowercase()?.removePrefix("[")?.removeSuffix("]")
+            (scheme == "http" || scheme == "https") && (host == "127.0.0.1" || host == "localhost" || host == "::1")
+        } catch (t: Throwable) {
+            false
+        }
+    }
 
     // Keeps the key out of accidental log lines.
     override fun toString(): String = "LlmConfig(baseUrl=$baseUrl, model=$model, apiKey=***)"
 }
 
 /**
- * Where the configuration comes from. NOTHING is stored in the repository.
+ * Where the configuration comes from. NOTHING is stored in the repository. With nothing configured the local
+ * llama.cpp server on the phone is used (http://127.0.0.1:8080/v1, qwen2.5-1.5b-instruct, no API key).
  *  1. private SharedPreferences `jarvis_llm_config` (keys: base_url, model, api_key): written by [save], e.g. by a
  *     future settings screen;
  *  2. optional BuildConfig string fields JARVIS_LLM_BASE_URL / JARVIS_LLM_MODEL / JARVIS_LLM_API_KEY, read by
@@ -54,9 +72,11 @@ class LlmConfigStore(context: Context) {
     fun load(): LlmConfig? = try {
         val p = prefs()
         val base = p.getString(K_URL, null).orEmpty().ifBlank { buildConfigString("JARVIS_LLM_BASE_URL") }
+            .ifBlank { LlmConfig.DEFAULT_BASE_URL }
         val model = p.getString(K_MODEL, null).orEmpty().ifBlank { buildConfigString("JARVIS_LLM_MODEL") }
+            .ifBlank { LlmConfig.DEFAULT_MODEL }
         val key = p.getString(K_KEY, null).orEmpty().ifBlank { buildConfigString("JARVIS_LLM_API_KEY") }
-        if (base.isBlank() || model.isBlank()) null else LlmConfig(base.trim(), model.trim(), key.trim())
+        LlmConfig(base.trim(), model.trim(), key.trim())    // the default needs no API key
     } catch (t: Throwable) {
         null
     }

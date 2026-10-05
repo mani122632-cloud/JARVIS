@@ -349,7 +349,7 @@ class LlmJarvisBrain(
         const val TAG = "LlmJarvisBrain"
         const val MAX_ROUNDS = 3
         const val MAX_TOTAL_CALLS = 4
-        const val OVERALL_TIMEOUT_MS = 30_000L
+        const val OVERALL_TIMEOUT_MS = 40_000L      // must stay below the controller's 45 s PROCESSING_TIMEOUT_MS
         const val SHORT_PAUSE_MS = 60_000L
         const val LONG_PAUSE_MS = 5 * 60_000L
         const val MAX_REPLY_CHARS = 320
