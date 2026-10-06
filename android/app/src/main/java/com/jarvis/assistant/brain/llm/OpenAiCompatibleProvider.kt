@@ -1,5 +1,6 @@
 package com.jarvis.assistant.brain.llm
 
+import android.os.SystemClock
 import android.util.Log
 import com.jarvis.assistant.command.ParamType
 import com.jarvis.assistant.command.ToolSpec
@@ -18,54 +19,96 @@ import org.json.JSONException
 import org.json.JSONObject
 
 /**
- * [LlmProvider] for any OpenAI-compatible `chat/completions` endpoint with function calling (OpenAI, OpenRouter,
- * vLLM, Ollama's /v1, LM Studio, ...). Plain HttpURLConnection, no extra dependency. The config is read on
- * every call, so a settings change applies immediately. Neither the API key nor any request/response text is logged.
- * HTTPS is required by Android's default network security config (cleartext http:// is blocked).
+ * [LlmProvider] for any OpenAI-compatible `chat/completions` endpoint with function calling (llama.cpp server,
+ * vLLM, Ollama's /v1, LM Studio, ...). No extra dependency. The config is read on every call, so a settings change
+ * applies immediately. Neither the API key nor any request/response text is logged.
+ *
+ * Transport: `http://` (the local llama.cpp server on 127.0.0.1) goes through [LoopbackHttp], because
+ * HttpURLConnection refuses cleartext HTTP, loopback included, under Android's default network security config;
+ * `https://` uses HttpURLConnection.
+ *
+ * Tools: a server that was started without tool support (llama.cpp without --jinja answers HTTP 500/400 to any
+ * request that carries `tools`) must still hold a normal conversation. In that case the same request is repeated
+ * as plain chat, and [toolsAvailable] stays false for [TOOLS_RETRY_AFTER_MS] so the Brain neither offers tools nor
+ * pays for a failing request on every utterance.
  */
 class OpenAiCompatibleProvider(
     private val configSource: () -> LlmConfig?
 ) : LlmProvider {
 
+    @Volatile private var toolsRejectedUntil = 0L
+
     override val isConfigured: Boolean
         get() = try { configSource()?.isUsable == true } catch (t: Throwable) { false }
+
+    override val toolsAvailable: Boolean
+        get() = SystemClock.elapsedRealtime() >= toolsRejectedUntil
 
     override fun generate(request: LlmRequest): LlmResponse {
         val cfg = try { configSource() } catch (t: Throwable) { null }
         if (cfg == null || !cfg.isUsable) return LlmResponse.Failure(LlmFailureKind.NOT_CONFIGURED)
 
+        val withTools = request.tools.isNotEmpty() && toolsAvailable
+        val first = post(cfg, request, withTools)
+        if (!withTools || !looksLikeToolsRejected(first)) return first
+
+        Log.w(TAG, "LLM server rejected the tools; repeating the request as plain chat")
+        val second = post(cfg, request, false)
+        if (second is LlmResponse.Success) toolsRejectedUntil = SystemClock.elapsedRealtime() + TOOLS_RETRY_AFTER_MS
+        return second
+    }
+
+    /** A quick HTTP error (not "model is still loading", 503) to a request that carried tools. */
+    private fun looksLikeToolsRejected(r: LlmResponse): Boolean =
+        r is LlmResponse.Failure && r.kind == LlmFailureKind.HTTP_ERROR &&
+            r.detail.startsWith("HTTP ") && r.detail != "HTTP 503"
+
+    private fun post(cfg: LlmConfig, request: LlmRequest, withTools: Boolean): LlmResponse {
         var conn: HttpURLConnection? = null
         try {
-            val body = buildBody(cfg, request).toString().toByteArray(Charsets.UTF_8)
-            conn = URL(endpoint(cfg.baseUrl)).openConnection() as HttpURLConnection
-            conn.requestMethod = "POST"
-            conn.connectTimeout = cfg.connectTimeoutMs
-            conn.readTimeout = cfg.readTimeoutMs
-            conn.doOutput = true
-            conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
-            conn.setRequestProperty("Accept", "application/json")
-            if (cfg.apiKey.isNotBlank()) conn.setRequestProperty("Authorization", "Bearer ${cfg.apiKey}")
-            conn.outputStream.use { it.write(body) }
-
-            val code = conn.responseCode
-            if (code !in 200..299) {
-                try { conn.errorStream?.use { readLimited(it) } } catch (e: IOException) { /* ignore */ }
-                Log.w(TAG, "LLM HTTP $code")
-                return LlmResponse.Failure(kindForHttp(code), "HTTP $code")
+            val body = buildBody(cfg, request, withTools).toString().toByteArray(Charsets.UTF_8)
+            val url = endpoint(cfg.baseUrl)
+            val reply: LoopbackHttp.Reply
+            if (url.startsWith("http://", ignoreCase = true)) {
+                val headers = LinkedHashMap<String, String>()
+                headers["Content-Type"] = "application/json; charset=utf-8"
+                headers["Accept"] = "application/json"
+                if (cfg.apiKey.isNotBlank()) headers["Authorization"] = "Bearer ${cfg.apiKey}"
+                reply = LoopbackHttp.post(url, headers, body, cfg.connectTimeoutMs, cfg.readTimeoutMs, MAX_RESPONSE_BYTES)
+            } else {
+                conn = URL(url).openConnection() as HttpURLConnection
+                conn.requestMethod = "POST"
+                conn.connectTimeout = cfg.connectTimeoutMs
+                conn.readTimeout = cfg.readTimeoutMs
+                conn.doOutput = true
+                conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                conn.setRequestProperty("Accept", "application/json")
+                if (cfg.apiKey.isNotBlank()) conn.setRequestProperty("Authorization", "Bearer ${cfg.apiKey}")
+                conn.outputStream.use { it.write(body) }
+                val c = conn.responseCode
+                val stream = if (c in 200..299) conn.inputStream else conn.errorStream
+                reply = LoopbackHttp.Reply(c, try { stream?.use { readLimited(it) } ?: "" } catch (e: IOException) { "" })
             }
-            val text = conn.inputStream.use { readLimited(it) }
-            return parse(text)
+
+            if (reply.code !in 200..299) {
+                Log.w(TAG, "LLM HTTP ${reply.code}")
+                return LlmResponse.Failure(kindForHttp(reply.code), "HTTP ${reply.code}")
+            }
+            return parse(reply.body)
         } catch (e: SocketTimeoutException) {
+            Log.w(TAG, "LLM timed out")
             return LlmResponse.Failure(LlmFailureKind.TIMEOUT)
         } catch (e: UnknownHostException) {
             return LlmResponse.Failure(LlmFailureKind.NO_NETWORK)
         } catch (e: ConnectException) {
+            Log.w(TAG, "LLM server not reachable (is llama.cpp running on the configured port?)")
             return LlmResponse.Failure(LlmFailureKind.NO_NETWORK)
         } catch (e: MalformedURLException) {
             return LlmResponse.Failure(LlmFailureKind.NOT_CONFIGURED, "bad URL")
         } catch (e: SSLException) {
             return LlmResponse.Failure(LlmFailureKind.HTTP_ERROR, "TLS error")
         } catch (e: IOException) {
+            Log.w(TAG, "LLM I/O error: ${e.javaClass.simpleName}")     // class only: never the message or any text
             return LlmResponse.Failure(LlmFailureKind.NO_NETWORK)
         } catch (e: JSONException) {
             return LlmResponse.Failure(LlmFailureKind.MALFORMED)
@@ -84,7 +127,7 @@ class OpenAiCompatibleProvider(
         return if (b.endsWith("/chat/completions")) b else "$b/chat/completions"
     }
 
-    private fun buildBody(cfg: LlmConfig, request: LlmRequest): JSONObject {
+    private fun buildBody(cfg: LlmConfig, request: LlmRequest, withTools: Boolean): JSONObject {
         val messages = JSONArray()
         for (m in request.messages) messages.put(messageJson(m))
         val body = JSONObject()
@@ -92,7 +135,7 @@ class OpenAiCompatibleProvider(
             .put("messages", messages)
             .put("temperature", request.temperature.toDouble())
             .put(cfg.maxTokensField, request.maxTokens)
-        if (request.tools.isNotEmpty()) {
+        if (withTools) {
             val tools = JSONArray()
             for (t in request.tools) tools.put(toolJson(t))
             body.put("tools", tools).put("tool_choice", "auto")
@@ -244,5 +287,6 @@ class OpenAiCompatibleProvider(
     private companion object {
         const val TAG = "OpenAiProvider"
         const val MAX_RESPONSE_BYTES = 256 * 1024
+        const val TOOLS_RETRY_AFTER_MS = 10 * 60_000L
     }
 }

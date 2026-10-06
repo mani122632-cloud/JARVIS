@@ -112,7 +112,7 @@ class OfflineConversationBrain(
      */
     fun chat(text: String, recent: List<String>): String {
         val tokens = PersianNormalizer.tokens(text).filter { it !in FILLER }
-        if (tokens.isEmpty()) return JarvisPhrases.ACK
+        if (tokens.isEmpty()) return JarvisPhrases.NOT_UNDERSTOOD
         val set = tokens.toSet()
         val negated = set.any { it in NEGATION_WORDS }
         return when {
@@ -125,7 +125,9 @@ class OfflineConversationBrain(
             set.any { it in QUESTION_WORDS } ->
                 fresh(recent, "متأسفانه جواب دقیقی برای این ندارم ارباب.", "این را نمی‌دانم ارباب، ولی در کارهای گوشی کمکتان می‌کنم.")
             else ->
-                fresh(recent, "بله ارباب، می‌شنوم.", "متوجهم ارباب.", "باشه ارباب، ادامه بدهید.")
+                // Not an acknowledgement ("بله ارباب" is only the wake-up reply): this is reached only when the LLM is
+                // unavailable, so say what is actually possible instead of pretending to have understood.
+                fresh(recent, "الان فقط می‌توانم دستورهای گوشی را انجام بدهم ارباب.", "برای گفتگوی بیشتر باید مدل هوش مصنوعی روی گوشی فعال باشد ارباب.")
         }
     }
 

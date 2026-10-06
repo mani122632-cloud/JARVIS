@@ -11,6 +11,12 @@ interface LlmProvider {
     val isConfigured: Boolean
 
     /**
+     * False while the backend is known not to accept tool definitions (e.g. llama.cpp started without --jinja).
+     * The Brain then offers no tools and keeps the conversation going as plain chat.
+     */
+    val toolsAvailable: Boolean get() = true
+
+    /**
      * Blocking call. The Brain always calls it on a background thread, never on the main thread.
      * Must NOT throw: every problem is returned as [LlmResponse.Failure].
      */
@@ -25,9 +31,11 @@ data class LlmConfig(
     val baseUrl: String,
     val model: String,
     val apiKey: String = "",
-    // A model running on the phone itself: connecting is instant, generating on a phone CPU is slow.
-    val connectTimeoutMs: Int = 1_500,
-    val readTimeoutMs: Int = 30_000,
+    // A model running on the phone itself: connecting is instant, generating on a phone CPU is slow (the prompt with
+    // the tool definitions alone can take tens of seconds on the first turn). Must stay below the Brain's overall
+    // timeout (58 s) and the controller's processing timeout (65 s).
+    val connectTimeoutMs: Int = 2_000,
+    val readTimeoutMs: Int = 52_000,
     /** Some newer OpenAI models want "max_completion_tokens". */
     val maxTokensField: String = "max_tokens"
 ) {

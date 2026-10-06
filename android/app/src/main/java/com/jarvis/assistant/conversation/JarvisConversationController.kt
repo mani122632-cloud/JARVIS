@@ -407,7 +407,7 @@ class JarvisConversationController(
         const val SILENCE_TIMEOUT_MS = 25_000L           // no speech for this long ends the session (quietly)
         const val WATCHDOG_SLACK_MS = 20_000L            // covers one STT window (7 s wait + 12 s speech)
         const val MAX_SESSION_MS = 10 * 60_000L
-        const val PROCESSING_TIMEOUT_MS = 45_000L        // upper bound for one Brain decision (LLM round trips included)
+        const val PROCESSING_TIMEOUT_MS = 65_000L        // upper bound for one Brain decision (LLM round trips included); above the LLM Brain's 58 s
         const val MAX_FAILED_ATTEMPTS = 5
         const val MAX_EMPTY_STREAK = 4
         const val MAX_PREPARE_WAIT_MS = 150_000L         // a loading STT model may extend the silence watchdog this long

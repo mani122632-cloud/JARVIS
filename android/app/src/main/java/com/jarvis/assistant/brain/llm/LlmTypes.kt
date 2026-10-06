@@ -39,7 +39,7 @@ data class LlmRequest(
     val messages: List<LlmMessage>,
     val tools: List<ToolSpec> = emptyList(),
     val temperature: Float = 0.3f,
-    val maxTokens: Int = 300
+    val maxTokens: Int = 220
 )
 
 enum class LlmFailureKind { NOT_CONFIGURED, NO_NETWORK, TIMEOUT, AUTH, RATE_LIMIT, HTTP_ERROR, MALFORMED, UNKNOWN }
