@@ -8,7 +8,6 @@ import com.jarvis.assistant.brain.BrainResult
 import com.jarvis.assistant.brain.JarvisBrain
 import com.jarvis.assistant.brain.llm.ReplyStreamSink
 import com.jarvis.assistant.brain.llm.StreamingJarvisBrain
-import com.jarvis.assistant.command.CallTool
 import com.jarvis.assistant.command.JarvisAction
 import com.jarvis.assistant.command.JarvisActionExecutor
 import com.jarvis.assistant.core.JarvisCoreView
@@ -416,7 +415,7 @@ class JarvisConversationController(
         if (action == JarvisAction.DismissAssistant) { finish(); return }
         // call_contact: the contact lookup runs in the background (executeAsync); the outcome arrives on the main
         // thread and goes through the same spoken-reply path below. Runs exactly once per command.
-        if (action is JarvisAction.ToolCall && action.tool == CallTool.NAME) {
+        if (executor.runsAsync(action)) {
             val gen = ++generation
             try {
                 executor.executeAsync(action) { outcome ->

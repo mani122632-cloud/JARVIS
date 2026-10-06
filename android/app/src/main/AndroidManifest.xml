@@ -5,6 +5,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
 
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <uses-permission android:name="android.permission.CALL_PHONE" />
 
     <!-- LLM Brain: HTTPS calls to the configured LLM endpoint. Speech recognition, wake word and TTS stay offline. -->
     <uses-permission android:name="android.permission.INTERNET" />
