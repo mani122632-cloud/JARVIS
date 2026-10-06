@@ -291,6 +291,21 @@ class JarvisConversationController(
 
     private fun executeAndContinue(action: JarvisAction) {
         if (action == JarvisAction.DismissAssistant) { finish(); return }
+        // call_contact: the contact lookup runs in the background (executeAsync); the outcome arrives on the main
+        // thread and goes through the same spoken-reply path below. Runs exactly once per command.
+        if (executor.runsAsync(action)) {
+            val gen = ++generation
+            try {
+                executor.executeAsync(action) { outcome ->
+                    if (gen != generation || state == State.IDLE) return@executeAsync   // session cancelled / finished meanwhile
+                    guarded { handleOutcome(action, outcome) }
+                }
+            } catch (e: RuntimeException) {
+                Log.e(TAG, "Executor threw", e)
+                handleOutcome(action, JarvisActionExecutor.Outcome(false, null))
+            }
+            return
+        }
         val outcome = try {
             executor.execute(action)
         } catch (e: RuntimeException) {                // executor promises not to throw; stay safe

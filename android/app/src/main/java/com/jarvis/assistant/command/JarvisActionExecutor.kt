@@ -52,7 +52,7 @@ class JarvisActionExecutor(
      */
     data class Outcome(val success: Boolean, val message: String? = null)
 
-    private val registry = ToolRegistry(tools ?: listOf(AlarmTool(app), TimerTool(app)))
+    private val registry = ToolRegistry(tools ?: listOf(AlarmTool(app), TimerTool(app), CallTool(app)))
 
     /** Adds (or replaces, by name) a tool, e.g. a future call / SMS / contacts / search tool. */
     fun register(tool: JarvisTool) = registry.register(tool)
@@ -87,6 +87,27 @@ class JarvisActionExecutor(
     } catch (e: RuntimeException) {            // SecurityException, IllegalState, background start refused, ...
         Log.e(TAG, "Action failed: $action", e)
         Outcome(false, GENERIC_FAILURE)
+    }
+
+    /** True when [action] must run through [executeAsync] (its tool does blocking work, e.g. a contact lookup). */
+    fun runsAsync(action: JarvisAction): Boolean = registry.find(action) is CallTool
+
+    /**
+     * Runs [action] without blocking the main thread; [onResult] is invoked on the main thread, once. Tools that
+     * block (call: contact lookup) work on a background thread, every other action runs like [execute].
+     */
+    fun executeAsync(action: JarvisAction, onResult: (Outcome) -> Unit) {
+        val tool = try { registry.find(action) } catch (e: RuntimeException) { null }
+        if (tool is CallTool) {
+            try {
+                tool.executeAsync(action, onResult)
+            } catch (e: RuntimeException) {
+                Log.e(TAG, "Async action failed: $action", e)
+                onResult(Outcome(false, GENERIC_FAILURE))
+            }
+        } else {
+            onResult(execute(action))
+        }
     }
 
     private fun dispatch(action: JarvisAction): Outcome = when (action) {
