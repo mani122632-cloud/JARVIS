@@ -6,12 +6,15 @@ import android.os.SystemClock
 import android.util.Log
 import com.jarvis.assistant.brain.BrainResult
 import com.jarvis.assistant.brain.JarvisBrain
+import com.jarvis.assistant.brain.MemoryCommandParser
+import com.jarvis.assistant.brain.llm.LocalFirstBrain
 import com.jarvis.assistant.brain.llm.ReplyStreamSink
 import com.jarvis.assistant.brain.llm.StreamingJarvisBrain
 import com.jarvis.assistant.command.JarvisAction
 import com.jarvis.assistant.command.JarvisActionExecutor
 import com.jarvis.assistant.core.JarvisCoreView
 import com.jarvis.assistant.core.JarvisState
+import com.jarvis.assistant.nlu.PersianNormalizer
 import com.jarvis.assistant.speech.CommandSpeechError
 import com.jarvis.assistant.speech.JarvisPhrases
 import com.jarvis.assistant.speech.JarvisSpeechController
@@ -23,9 +26,11 @@ import com.jarvis.assistant.speech.StreamingSpeechAdapter
  *
  *   COMMAND_LISTENING -> COMMAND_PROCESSING (Brain) -> RESPONDING (TTS [+ action]) -> COMMAND_LISTENING -> ...
  *
- * The user keeps talking WITHOUT the wake word. Every utterance goes through the Brain, which asks the EXISTING
- * command system first (JarvisCommandProcessor -> JarvisActionExecutor) and only then the offline conversation
- * brain. After a command or a reply the session stays open and JARVIS listens again.
+ * The user keeps talking WITHOUT the wake word. Every utterance is routed LOCAL FIRST: the offline brain (the EXISTING
+ * command system, JarvisCommandProcessor -> JarvisActionExecutor) decides immediately. A recognised command, a local
+ * slot question / answer ("چه ساعتی ارباب؟"), an end of conversation or an explicit memory command is handled right
+ * there and the LLM is never called. Only free conversation goes to the LLM brain (streamed). After a command or a reply the
+ * session stays open and JARVIS listens again.
  *
  * Incomplete requests are completed across turns: "آلارم بذار" -> JARVIS asks "چه ساعتی ارباب؟" -> the next
  * utterance ("هفت صبح") is the answer (the open question lives in [ConversationContext.pending]; the Brain
@@ -273,11 +278,9 @@ class JarvisConversationController(
         val turnGen = generation
         main.removeCallbacks(processingTimeout)
         abortReplyStream()
-        val streaming = brain as? StreamingJarvisBrain
-        val stream = if (streaming != null) ReplyStream(turnGen) else null
-        replyStream = stream
         processingTimeout = Runnable {
             // A streamed reply that is already being spoken is ended there; otherwise the turn is unusable.
+            val streaming = conversationBrain as? StreamingJarvisBrain
             val rs = replyStream
             val result = if (rs != null && rs.delivered) {
                 rs.finalSpoken = true
@@ -289,11 +292,80 @@ class JarvisConversationController(
             deliverBrainResult(turnGen, result)
         }
         main.postDelayed(processingTimeout, PROCESSING_TIMEOUT_MS)
+        routeUtterance(best, turnGen)
+    }
+
+    /** The brain that talks (LLM, streaming); the wrapper's local half only decides commands. */
+    private val conversationBrain: JarvisBrain
+        get() = (brain as? LocalFirstBrain)?.llm ?: brain
+
+    /**
+     * Local first. The offline brain (DefaultJarvisBrain -> JarvisCommandProcessor) is synchronous and never touches the
+     * network. A command, a slot question / answer, an end of conversation or an explicit memory command is delivered
+     * directly: the LLM is not called. Only free conversation goes on to [thinkConversation].
+     */
+    private fun routeUtterance(text: String, turnGen: Int) {
+        val local = (brain as? LocalFirstBrain)?.local
+        if (local == null) { thinkConversation(text, turnGen); return }
+        val decision = try {
+            decideLocally(local, text)
+        } catch (e: Exception) {
+            Log.e(TAG, "Local brain threw", e)
+            null
+        }
+        if (decision != null) deliverBrainResult(turnGen, decision) else thinkConversation(text, turnGen)
+    }
+
+    /**
+     * Mirrors the real order of DefaultJarvisBrain.decide, but never lets its generic chat fallback (the last step of
+     * think(text, context)) answer: that is free conversation. A memory command is the only thing with a side effect,
+     * so it is run exactly once and its result is final; every other probe below is pure.
+     * Returns null when the utterance is free conversation.
+     */
+    private fun decideLocally(local: JarvisBrain, text: String): BrainResult? {
+        val ctx = conversationContext
+
+        // A question is open ("آلارم بذار" -> "چه ساعتی؟"): the brain owns the turn - answer, cancel ("ولش کن"),
+        // ask once more, or a new command that replaces it. Always a local result.
+        if (ctx.pending != null) return local.think(text, ctx).takeUnless { it is BrainResult.Unknown }
+
+        val cleaned = stripLeadIns(text)
+
+        // Explicit memory command: the one side effect. Once, locally, final.
+        if (MemoryCommandParser.parse(cleaned) != null) return local.think(cleaned, ctx)
+
+        // Pure from here on: without context and without a memory command, think() only reads the command system.
+        return when (val probe = local.think(cleaned)) {
+            is BrainResult.Command -> if (probe.action !is JarvisAction.Unknown) probe else null
+            is BrainResult.EndConversation -> probe
+            // Alarm / timer without a time: the same decision with the session context stores the open question.
+            is BrainResult.Clarify -> local.think(cleaned, ctx).takeIf { it is BrainResult.Clarify } ?: probe
+            // Small talk / live-data request / not understood: not a phone command -> LLM.
+            is BrainResult.Conversation, is BrainResult.Unknown -> null
+        }
+    }
+
+    /** Same as DefaultJarvisBrain.stripLeadIns (private there): "راستی برو اینستاگرام" is a command. */
+    private fun stripLeadIns(text: String): String {
+        val tokens = PersianNormalizer.tokens(text)
+        var i = 0
+        while (i < tokens.size && tokens[i] in LEAD_INS) i++
+        if (i == 0 || i >= tokens.size) return text
+        return tokens.drop(i).joinToString(" ")
+    }
+
+    /** Free conversation / unrecognised input: the LLM brain, streamed when it can stream. */
+    private fun thinkConversation(text: String, turnGen: Int) {
+        if (turnGen != generation || state != State.COMMAND_PROCESSING) return
+        val cb = conversationBrain
+        val streaming = cb as? StreamingJarvisBrain
+        val stream = if (streaming != null) ReplyStream(turnGen) else null
+        replyStream = stream
         try {
             if (streaming != null && stream != null) {
-                streaming.thinkStreamAsync(best, conversationContext, stream.sink) { result -> deliverBrainResult(turnGen, result) }
+                streaming.thinkStreamAsync(text, conversationContext, stream.sink) { result -> deliverBrainResult(turnGen, result) }
             } else {
-                brain.thinkAsync(best, conversationContext) { result -> deliverBrainResult(turnGen, result) }
+                cb.thinkAsync(text, conversationContext) { result -> deliverBrainResult(turnGen, result) }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Brain threw", e)
@@ -305,7 +377,7 @@ class JarvisConversationController(
     private fun abortReplyStream() {
         replyStream = null
         speechStream.cancel()
-        try { (brain as? StreamingJarvisBrain)?.cancelStreaming() } catch (t: Throwable) { Log.w(TAG, "cancelStreaming failed", t) }
+        try { (conversationBrain as? StreamingJarvisBrain)?.cancelStreaming() } catch (t: Throwable) { Log.w(TAG, "cancelStreaming failed", t) }
     }
 
     /**
@@ -527,6 +599,7 @@ class JarvisConversationController(
 
     private companion object {
         val SPEAK_TOKEN = Any()
+        val LEAD_INS = setOf("راستی", "خب", "خو", "حالا", "ببین", "راستش", "میگم", "آها", "اها", "اوه", "عه", "هی", "جارویس", "ارباب")
         const val TAG = "JarvisConversation"
 
         const val SILENCE_TIMEOUT_MS = 25_000L           // no speech for this long ends the session (quietly)

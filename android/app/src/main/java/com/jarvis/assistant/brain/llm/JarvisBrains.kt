@@ -18,10 +18,24 @@ object JarvisBrains {
         offline: JarvisBrain,
         memory: JarvisMemory,
         configStore: LlmConfigStore = LlmConfigStore(context)
-    ): JarvisBrain = LlmJarvisBrain(
-        provider = OpenAiCompatibleProvider { configStore.load() },
-        catalog = LlmToolCatalog(executor, memory),
-        memory = memory,
-        fallback = offline
+    ): JarvisBrain = LocalFirstBrain(
+        llm = LlmJarvisBrain(
+            provider = OpenAiCompatibleProvider { configStore.load() },
+            catalog = LlmToolCatalog(executor, memory),
+            memory = memory,
+            fallback = offline
+        ),
+        local = offline
     )
 }
+
+/**
+ * The brain handed to the conversation controller: the LLM brain plus the offline (local) brain beside it.
+ * Every member of the [JarvisBrain] interface is delegated to [llm] unchanged; the controller reads [local] and [llm]
+ * to route: phone commands (and the local slot questions / end of conversation / memory commands) are decided by
+ * [local] and never reach the LLM; only free conversation goes to [llm] (streaming).
+ */
+class LocalFirstBrain(
+    val llm: LlmJarvisBrain,
+    val local: JarvisBrain
+) : JarvisBrain by llm
