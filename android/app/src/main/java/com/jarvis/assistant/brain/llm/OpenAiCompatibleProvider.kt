@@ -45,6 +45,7 @@ class OpenAiCompatibleProvider(
 ) : LlmProvider {
 
     @Volatile private var toolsRejectedUntil = 0L
+    @Volatile private var toolsFailStreak = 0               // consecutive tool requests the server refused
     @Volatile private var streamRejectedUntil = 0L          // streaming refused for any request
     @Volatile private var streamToolsRejectedUntil = 0L     // streaming refused only together with tools
 
@@ -60,11 +61,17 @@ class OpenAiCompatibleProvider(
 
         val withTools = request.tools.isNotEmpty() && toolsAvailable
         val first = post(cfg, request, withTools)
+        if (withTools && first is LlmResponse.Success) toolsFailStreak = 0
         if (!withTools || !looksLikeToolsRejected(first)) return first
 
+        // One refused request is not proof that the server has no tool support: a 1.5B model sometimes produces a
+        // tool call llama.cpp cannot parse (HTTP 500). Tools are switched off only after two refusals in a row.
         Log.w(TAG, "LLM server rejected the tools; repeating the request as plain chat")
         val second = post(cfg, request, false)
-        if (second is LlmResponse.Success) toolsRejectedUntil = SystemClock.elapsedRealtime() + TOOLS_RETRY_AFTER_MS
+        if (second is LlmResponse.Success && ++toolsFailStreak >= TOOLS_FAIL_LIMIT) {
+            toolsRejectedUntil = SystemClock.elapsedRealtime() + TOOLS_RETRY_AFTER_MS
+            toolsFailStreak = 0
+        }
         return second
     }
 
@@ -79,9 +86,12 @@ class OpenAiCompatibleProvider(
         val now = SystemClock.elapsedRealtime()
         if (now < streamRejectedUntil || (withTools && now < streamToolsRejectedUntil)) return generate(request)
 
-        val acc = StreamAccumulator(listener)
+        val acc = StreamAccumulator(listener, toolNames(request, withTools))
         val result = postStream(cfg, request, withTools, acc, cancel)
-        if (result is LlmResponse.Success) return result
+        if (result is LlmResponse.Success) {
+            if (withTools) toolsFailStreak = 0
+            return result
+        }
         val failure = result as LlmResponse.Failure
         if (cancel.isCancelled) return LlmResponse.Failure(LlmFailureKind.UNKNOWN, "cancelled")
 
@@ -194,7 +204,7 @@ class OpenAiCompatibleProvider(
      * A server that ignores `stream` and answers with one plain JSON body is understood too ([result] parses it).
      * No text is logged.
      */
-    private inner class StreamAccumulator(private val listener: LlmStreamListener) {
+    private inner class StreamAccumulator(private val listener: LlmStreamListener, private val names: Set<String>) {
         val textBuf = StringBuilder()
         private val calls = TreeMap<Int, StreamCallBuilder>()
         private val raw = StringBuilder()
@@ -204,11 +214,13 @@ class OpenAiCompatibleProvider(
         private var serverError = false
         private var malformed = false
         private var toolStarted = false
+        private var decided = false                      // is the kind of this reply (text / tool call as text) known?
+        private var holding = false                      // text that looks like a tool call is kept back, not spoken
 
         val text: String get() = textBuf.toString()
 
         /** Text or a tool call reached the listener: the request must not be repeated. */
-        val hasOutput: Boolean get() = textBuf.isNotEmpty() || toolStarted
+        val hasOutput: Boolean get() = (textBuf.isNotEmpty() && !holding) || toolStarted
 
         /** @return false to stop reading. */
         fun onLine(line: String): Boolean {
@@ -239,7 +251,23 @@ class OpenAiCompatibleProvider(
             val content = delta.opt("content")
             if (content is String && content.isNotEmpty()) {
                 textBuf.append(content)
-                if (!listener.onTextDelta(content)) { stoppedByListener = true; return false }
+                val wasDecided = decided
+                if (!decided) {
+                    // A small model may write its tool call as text (`<tool_call>{...}`) instead of `tool_calls`.
+                    // Such text must not be spoken: it is held back and recovered in result().
+                    val t = textBuf.toString().trimStart()
+                    if (t.isNotEmpty()) {
+                        val couldBeTag = names.isNotEmpty() && t.length < TOOL_OPEN.length && TOOL_OPEN.startsWith(t)
+                        if (!couldBeTag) {
+                            decided = true
+                            holding = names.isNotEmpty() && (t[0] == '{' || t[0] == '[' || t.startsWith(TOOL_OPEN))
+                        }
+                    }
+                }
+                if (decided && !holding) {
+                    val out = if (wasDecided) content else textBuf.toString().trimStart()
+                    if (!listener.onTextDelta(out)) { stoppedByListener = true; return false }
+                }
             }
             val arr = delta.optJSONArray("tool_calls")
             if (arr != null) {
@@ -277,13 +305,24 @@ class OpenAiCompatibleProvider(
             if (!sse) {
                 // The server did not stream: parse the body as a normal completion (nothing was delivered live).
                 if (raw.isBlank()) return LlmResponse.Failure(LlmFailureKind.MALFORMED, "empty stream")
-                return try { parse(raw.toString()) } catch (e: JSONException) { LlmResponse.Failure(LlmFailureKind.MALFORMED) }
+                return try { parse(raw.toString(), names) } catch (e: JSONException) { LlmResponse.Failure(LlmFailureKind.MALFORMED) }
             }
-            if (!done && !stoppedByListener && !hasOutput) return LlmResponse.Failure(LlmFailureKind.MALFORMED, "empty stream")
+            if (!done && !stoppedByListener && textBuf.isEmpty() && !toolStarted) {
+                return LlmResponse.Failure(LlmFailureKind.MALFORMED, "empty stream")
+            }
             val out = ArrayList<ToolCallRequest>()
             for (b in calls.values) {
-                if (b.name.isEmpty()) continue
-                out.add(toolCall(b.id, b.name, b.args.toString()))
+                val n = b.name.trim()
+                if (n.isEmpty()) continue
+                out.add(toolCall(b.id, n, b.args.toString()))
+            }
+            if (holding && out.isEmpty()) {
+                val s = salvageToolCalls(textBuf.toString(), names)
+                if (s != null) {
+                    listener.onToolCallStarted()
+                    return LlmResponse.Success(s.text, s.calls)
+                }
+                return LlmResponse.Success("", out)       // unusable tool-call text: never spoken
             }
             return LlmResponse.Success(textBuf.toString(), out)
         }
@@ -338,7 +377,7 @@ class OpenAiCompatibleProvider(
                 Log.w(TAG, "LLM HTTP ${reply.code}")
                 return LlmResponse.Failure(kindForHttp(reply.code), "HTTP ${reply.code}")
             }
-            return parse(reply.body)
+            return parse(reply.body, toolNames(request, withTools))
         } catch (e: SocketTimeoutException) {
             Log.w(TAG, "LLM timed out")
             return LlmResponse.Failure(LlmFailureKind.TIMEOUT)
@@ -440,7 +479,7 @@ class OpenAiCompatibleProvider(
 
     // ---- response --------------------------------------------------------------------------------
 
-    private fun parse(text: String): LlmResponse {
+    private fun parse(text: String, names: Set<String> = emptySet()): LlmResponse {
         val root = JSONObject(text)
         if (root.has("error") && !root.isNull("error")) return LlmResponse.Failure(LlmFailureKind.HTTP_ERROR, "error object")
         val choices = root.optJSONArray("choices")
@@ -464,7 +503,92 @@ class OpenAiCompatibleProvider(
                 calls.add(toolCall(if (c.isNull("id")) "" else c.optString("id", ""), name, rawArgs))
             }
         }
+        if (calls.isEmpty()) {
+            val s = salvageToolCalls(content, names)
+            if (s != null) return LlmResponse.Success(s.text, s.calls)
+        }
         return LlmResponse.Success(content, calls)
+    }
+
+    private fun toolNames(request: LlmRequest, withTools: Boolean): Set<String> =
+        if (withTools) request.tools.map { it.name }.toSet() else emptySet()
+
+    /** Tool calls the model wrote into its text, and the text that is left once they are removed. */
+    private class Salvaged(val text: String, val calls: List<ToolCallRequest>)
+
+    /**
+     * Qwen2.5-1.5B often prints its call as `<tool_call>{"name": ..., "arguments": {...}}</tool_call>` (or as bare JSON)
+     * in a form llama.cpp does not turn into `tool_calls`. Only a call to a tool that was offered in this request is
+     * accepted; anything else stays plain text. Null = nothing usable.
+     */
+    private fun salvageToolCalls(text: String, names: Set<String>): Salvaged? {
+        if (names.isEmpty() || text.isBlank()) return null
+        val calls = ArrayList<ToolCallRequest>()
+        val rest = StringBuilder()
+        var sawTag = false
+        var i = 0
+        while (i < text.length) {
+            val open = text.indexOf(TOOL_OPEN, i)
+            if (open < 0) { rest.append(text, i, text.length); break }
+            sawTag = true
+            rest.append(text, i, open)
+            val bodyStart = open + TOOL_OPEN.length
+            val close = text.indexOf(TOOL_CLOSE, bodyStart)
+            val end = if (close < 0) text.length else close
+            calls.addAll(callsFromJson(text.substring(bodyStart, end), names))
+            i = if (close < 0) text.length else close + TOOL_CLOSE.length
+        }
+        if (!sawTag) {
+            val t = text.trim()
+            val bare = (t.startsWith("{") && t.endsWith("}")) || (t.startsWith("[") && t.endsWith("]"))
+            if (!bare) return null
+            calls.addAll(callsFromJson(t, names))
+            rest.setLength(0)
+        }
+        if (calls.isEmpty()) return null
+        Log.i(TAG, "Recovered ${calls.size} tool call(s) written as text")
+        return Salvaged(rest.toString().trim(), calls)
+    }
+
+    private fun callsFromJson(body: String, names: Set<String>): List<ToolCallRequest> {
+        val out = ArrayList<ToolCallRequest>()
+        var k = 0
+        while (k < body.length) {
+            val s = body.indexOf('{', k)
+            if (s < 0) break
+            val e = objectEnd(body, s)
+            if (e < 0) break
+            k = e + 1
+            val obj = try { JSONObject(body.substring(s, e + 1)) } catch (ex: JSONException) { continue }
+            val fn = obj.optJSONObject("function") ?: obj
+            val name = fn.optString("name", "").trim()
+            if (name !in names) continue
+            val a: Any? = when {
+                fn.has("arguments") && !fn.isNull("arguments") -> fn.get("arguments")
+                fn.has("parameters") && !fn.isNull("parameters") -> fn.get("parameters")
+                else -> null
+            }
+            out.add(toolCall("", name, if (a == null) "" else if (a is String) a else a.toString()))
+        }
+        return out
+    }
+
+    /** Index of the `}` that closes the object opened at [start]; -1 when it never closes (cut-off output). */
+    private fun objectEnd(s: String, start: Int): Int {
+        var depth = 0
+        var inStr = false
+        var esc = false
+        for (i in start until s.length) {
+            val c = s[i]
+            if (inStr) {
+                if (esc) esc = false else if (c == '\\') esc = true else if (c == '"') inStr = false
+            } else when (c) {
+                '"' -> inStr = true
+                '{' -> depth++
+                '}' -> { depth--; if (depth == 0) return i }
+            }
+        }
+        return -1
     }
 
     private fun contentText(msg: JSONObject): String {
@@ -524,6 +648,9 @@ class OpenAiCompatibleProvider(
         const val MAX_RESPONSE_BYTES = 256 * 1024
         const val MAX_STREAM_BYTES = 512 * 1024
         const val STREAM_RETRY_AFTER_MS = 5 * 60_000L
-        const val TOOLS_RETRY_AFTER_MS = 10 * 60_000L
+        const val TOOLS_RETRY_AFTER_MS = 2 * 60_000L
+        const val TOOLS_FAIL_LIMIT = 2
+        const val TOOL_OPEN = "<tool_call>"
+        const val TOOL_CLOSE = "</tool_call>"
     }
 }
