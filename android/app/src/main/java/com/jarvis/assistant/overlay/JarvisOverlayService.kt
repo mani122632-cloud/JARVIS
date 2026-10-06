@@ -23,6 +23,10 @@ import com.jarvis.assistant.command.JarvisActionExecutor
 import com.jarvis.assistant.command.JarvisCommandProcessor
 import com.jarvis.assistant.conversation.JarvisConversationController
 import com.jarvis.assistant.memory.SharedPreferencesJarvisMemory
+import com.jarvis.assistant.online.JarvisToolCatalog
+import com.jarvis.assistant.online.OnlineBrain
+import com.jarvis.assistant.online.OnlineNetwork
+import com.jarvis.assistant.online.OnlineProviderRegistry
 import com.jarvis.assistant.speech.SpeechInputFactory
 import com.jarvis.assistant.core.JarvisCoreView
 import com.jarvis.assistant.speech.JarvisSpeechController
@@ -57,6 +61,7 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
     private lateinit var activation: JarvisActivationController
     private lateinit var conversation: JarvisConversationController
     private lateinit var executor: JarvisActionExecutor
+    private lateinit var online: OnlineBrain
     private var lastStartId = 0
 
     private lateinit var wake: VoskWakeWordEngine
@@ -84,10 +89,21 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
         })
         wake.preload()      // load the Vosk model in the background now (no microphone); start() reuses it
         executor = JarvisActionExecutor(this)
+        // Online Brain Stage 1: no provider is registered, so Online stays off (isAvailable() == false) and the
+        // Brain never escalates; behaviour is exactly the offline one.
+        online = OnlineBrain(
+            provider = OnlineProviderRegistry.provider,
+            tools = JarvisToolCatalog(executor),
+            isNetworkAvailable = { OnlineNetwork.isConnected(this) }
+        )
         conversation = JarvisConversationController(
             tts = speech,
             commandSpeech = SpeechInputFactory.create(this),
-            brain = DefaultJarvisBrain(JarvisCommandProcessor(), SharedPreferencesJarvisMemory(this)),
+            brain = DefaultJarvisBrain(
+                JarvisCommandProcessor(),
+                SharedPreferencesJarvisMemory(this),
+                canEscalate = { online.isAvailable() }
+            ),
             executor = executor,
             core = { window.currentCore },
             callback = object : JarvisConversationController.Callback {
@@ -101,7 +117,8 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
                     })
                 }
                 override fun onConversationFinished() = endInteraction()   // hides overlay, then Vosk resumes
-            }
+            },
+            onlineBrain = online
         )
         activation.listener = object : JarvisActivationController.Listener {
             override fun onReadyForCommand() {
@@ -304,6 +321,7 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
         if (WakeWordState.isActive()) WakeWordState.update(status = WakeStatus.OFF)
         WakeWordState.update(flow = AssistantFlow.IDLE)
         conversation.release()       // stops the command recognizer, frees the microphone
+        online.release()             // cancels any online turn, stops its background thread
         executor.release()           // unregisters the torch-state callback
         activation.unbind()          // cancels speech callbacks/timeouts
         window.remove()              // never leak the WindowManager view

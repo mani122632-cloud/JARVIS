@@ -4,7 +4,7 @@ import com.jarvis.assistant.command.JarvisAction
 import com.jarvis.assistant.conversation.ConversationContext
 import com.jarvis.assistant.speech.JarvisPhrases
 
-enum class BrainKind { COMMAND, CONVERSATION, CLARIFY, END_CONVERSATION, UNKNOWN }
+enum class BrainKind { COMMAND, CONVERSATION, CLARIFY, END_CONVERSATION, UNKNOWN, ESCALATE }
 
 /**
  * What the Brain decided about one Persian utterance. [responseText] is always what JARVIS says (through
@@ -47,6 +47,17 @@ sealed class BrainResult {
     /** Not understood: say "متوجه نشدم."; nothing is executed. */
     data class Unknown(override val responseText: String = JarvisPhrases.NOT_UNDERSTOOD) : BrainResult() {
         override val kind: BrainKind get() = BrainKind.UNKNOWN
+    }
+
+    /**
+     * Online Brain Stage 1: a complex / conversational request that no local rule handled. The caller hands
+     * [text] to the OnlineBrain; whenever that is impossible or fails BEFORE anything was said, it falls back to
+     * [offlineFallback] (exactly what the offline Brain would have decided: Conversation or Unknown, never
+     * another Escalate). [responseText] is the fallback's text.
+     */
+    data class Escalate(val text: String, val offlineFallback: BrainResult) : BrainResult() {
+        override val kind: BrainKind get() = BrainKind.ESCALATE
+        override val responseText: String get() = offlineFallback.responseText
     }
 }
 

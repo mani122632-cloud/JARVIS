@@ -41,7 +41,12 @@ class DefaultJarvisBrain(
     private val processor: JarvisCommandProcessor,
     private val memory: JarvisMemory,
     private val conversation: OfflineConversationBrain = OfflineConversationBrain(),
-    private val slots: SlotFiller = SlotFiller()
+    private val slots: SlotFiller = SlotFiller(),
+    /**
+     * Online Brain Stage 1: true only while an online provider is configured AND reachable. While it is false
+     * (the default) this Brain behaves exactly as before and never returns [BrainResult.Escalate].
+     */
+    private val canEscalate: () -> Boolean = { false }
 ) : JarvisBrain {
 
     /** Key of the last fact remembered or recalled, so "این رو فراموش کن" knows what "این" is. */
@@ -145,13 +150,24 @@ class DefaultJarvisBrain(
         val cleaned = stripLeadIns(text)
         val result = decide(cleaned, context)
         if (result is BrainResult.Unknown && cleaned.isNotBlank()) {
-            if (looksLikeCommandAttempt(cleaned)) BrainResult.Conversation(JarvisPhrases.NOT_UNDERSTOOD)
-            else BrainResult.Conversation(conversation.chat(cleaned, context.recentResponses))
+            val offline =
+                if (looksLikeCommandAttempt(cleaned)) BrainResult.Conversation(JarvisPhrases.NOT_UNDERSTOOD)
+                else BrainResult.Conversation(conversation.chat(cleaned, context.recentResponses))
+            // Not a local command, not small talk: a complex / conversational request.
+            if (shouldEscalate()) BrainResult.Escalate(cleaned, offline) else offline
+        } else if (result is BrainResult.Conversation && cleaned.isNotBlank() && shouldEscalate() &&
+            MemoryCommandParser.parse(cleaned) == null &&
+            conversation.classify(cleaned) == OfflineConversationBrain.Topic.ONLINE_REQUIRED
+        ) {
+            // "Needs live data" (weather, news, ...): offline can only say "I must be online"; try online first.
+            BrainResult.Escalate(cleaned, result)
         } else result
     } catch (e: Exception) {
         Log.e(TAG, "Brain failed; treating the utterance as unknown", e)
         BrainResult.Unknown()
     }
+
+    private fun shouldEscalate(): Boolean = try { canEscalate() } catch (e: Exception) { false }
 
     /** Drops leading "راستی / خب / حالا ..." so a command said mid-conversation reaches the parser unchanged. */
     private fun stripLeadIns(text: String): String {

@@ -10,6 +10,9 @@ import com.jarvis.assistant.command.JarvisAction
 import com.jarvis.assistant.command.JarvisActionExecutor
 import com.jarvis.assistant.core.JarvisCoreView
 import com.jarvis.assistant.core.JarvisState
+import com.jarvis.assistant.online.Cancellable
+import com.jarvis.assistant.online.Failure
+import com.jarvis.assistant.online.OnlineBrain
 import com.jarvis.assistant.speech.CommandSpeechError
 import com.jarvis.assistant.speech.JarvisPhrases
 import com.jarvis.assistant.speech.JarvisSpeechController
@@ -47,7 +50,9 @@ class JarvisConversationController(
     private val core: () -> JarvisCoreView?,
     private val callback: Callback,
     /** Bounded in-RAM history of this session (cleared at start and end). */
-    val conversationContext: ConversationContext = ConversationContext()
+    val conversationContext: ConversationContext = ConversationContext(),
+    /** Online Brain Stage 1. Null (or unavailable) = a [BrainResult.Escalate] falls back to the offline answer. */
+    private val onlineBrain: OnlineBrain? = null
 ) {
     enum class State { IDLE, COMMAND_LISTENING, COMMAND_PROCESSING, RESPONDING }
 
@@ -61,6 +66,24 @@ class JarvisConversationController(
 
     private val main = Handler(Looper.getMainLooper())
     private var generation = 0
+
+    /**
+     * Identity of the current online turn, independent of [generation]. Bumped (= every callback of the previous
+     * online turn becomes stale) by begin, cancel, finish, release (via cancel) and every new utterance.
+     */
+    private var onlineTurnId = 0
+    private var onlineHandle: Cancellable? = null
+    private var onlineTurn: OnlineTurn? = null
+
+    /** One streamed online answer being spoken: chunks wait here and are spoken ONE AT A TIME. */
+    private class OnlineTurn(val id: Int, val fallback: BrainResult) {
+        val queue = ArrayDeque<String>()
+        var speaking = false          // a chunk is being spoken: no second speak() until its onDone
+        var streamEnded = false
+        var failure: Failure? = null
+        var spoke = false             // at least one chunk was handed to the TTS
+        var fullText = ""
+    }
 
     /** Uptime when the current turn started waiting for the user (silent re-listens do not reset it). */
     private var turnStartedAt = 0L
@@ -114,6 +137,7 @@ class JarvisConversationController(
             cancel()
         }
         conversationContext.clear()
+        invalidateOnline(resetHistory = true)
         emptyStreak = 0
         failedAttempts = 0
         alternatives = emptyList()
@@ -126,6 +150,7 @@ class JarvisConversationController(
     /** Aborts everything silently (no finished callback). */
     fun cancel() {
         generation++
+        invalidateOnline(resetHistory = true)
         main.removeCallbacksAndMessages(null)
         try { commandSpeech.stopListening() } catch (t: Throwable) { Log.w(TAG, "stopListening failed", t) }
         try { tts.stop() } catch (t: Throwable) { Log.w(TAG, "tts.stop failed", t) }
@@ -236,6 +261,7 @@ class JarvisConversationController(
     private fun onUtterance(text: String) {
         if (state != State.COMMAND_LISTENING) return       // late duplicate
         generation++
+        invalidateOnline(resetHistory = false)             // a new utterance makes any older online turn stale
         main.removeCallbacks(silenceWatchdog)
         Log.i(TAG, "Utterance received (${text.length} chars)")   // text itself is never logged
         if (text.isBlank()) { alternatives = emptyList(); handleUnusable(); return }
@@ -261,6 +287,10 @@ class JarvisConversationController(
         }
         Log.i(TAG, "Brain decided: ${result.kind}" +
             ((result as? BrainResult.Command)?.let { " ${it.action::class.simpleName} conf=${it.confidence}" } ?: ""))
+        handleResult(result)
+    }
+
+    private fun handleResult(result: BrainResult) {
         when (result) {
             is BrainResult.Conversation -> {
                 conversationContext.addResponse(result.responseText)
@@ -278,6 +308,109 @@ class JarvisConversationController(
             }
             is BrainResult.Unknown -> handleUnusable()
             is BrainResult.Command -> runCommand(result)
+            is BrainResult.Escalate -> startOnline(result)
+        }
+    }
+
+    // ---- online brain (Stage 1) -----------------------------------------------------------------
+
+    /** Makes every callback of the running online turn stale and stops its request. Speech is stopped by the caller. */
+    private fun invalidateOnline(resetHistory: Boolean) {
+        onlineTurnId++
+        main.removeCallbacks(onlineWatchdog)
+        val h = onlineHandle
+        onlineHandle = null
+        onlineTurn = null
+        if (h != null) try { h.cancel() } catch (t: Throwable) { Log.w(TAG, "online cancel failed", t) }
+        if (resetHistory) try { onlineBrain?.resetSession() } catch (t: Throwable) { Log.w(TAG, "online reset failed", t) }
+    }
+
+    private val onlineWatchdog = Runnable {
+        val turn = onlineTurn ?: return@Runnable
+        Log.w(TAG, "Online turn watchdog fired")
+        guarded { onlineFailed(turn, null) }
+    }
+
+    private fun startOnline(result: BrainResult.Escalate) {
+        val fallback = result.offlineFallback.takeUnless { it is BrainResult.Escalate } ?: BrainResult.Unknown()
+        val online = onlineBrain
+        if (online == null || !online.isAvailable()) { handleResult(fallback); return }   // Online off: today's behaviour
+        invalidateOnline(resetHistory = false)
+        val id = onlineTurnId
+        val turn = OnlineTurn(id, fallback)
+        onlineTurn = turn
+        main.postDelayed(onlineWatchdog, ONLINE_MAX_MS)
+        Log.i(TAG, "Escalating to the online brain (turn $id)")
+        onlineHandle = online.ask(result.text, object : OnlineBrain.Listener {
+            override fun onSentence(text: String) { if (id == onlineTurnId) guarded { onlineSentence(turn, text) } }
+            override fun onFinished(fullText: String) { if (id == onlineTurnId) guarded { onlineFinished(turn, fullText) } }
+            override fun onFailed(failure: Failure) { if (id == onlineTurnId) guarded { onlineFailed(turn, failure) } }
+        })
+    }
+
+    private fun onlineSentence(turn: OnlineTurn, text: String) {
+        if (turn.id != onlineTurnId || state == State.IDLE) return
+        turn.queue.addLast(text)
+        if (!turn.speaking) playNextOnline(turn)
+    }
+
+    private fun onlineFinished(turn: OnlineTurn, fullText: String) {
+        if (turn.id != onlineTurnId || state == State.IDLE) return
+        turn.streamEnded = true
+        turn.fullText = fullText
+        if (!turn.speaking && turn.queue.isEmpty()) completeOnline(turn)
+    }
+
+    private fun onlineFailed(turn: OnlineTurn, failure: Failure?) {
+        if (turn.id != onlineTurnId || state == State.IDLE) return
+        turn.streamEnded = true
+        turn.failure = failure ?: Failure(com.jarvis.assistant.online.FailureKind.TIMEOUT, null)
+        // Stop the request, but keep the turn: chunks already queued are still spoken before the fallback.
+        try { onlineHandle?.cancel() } catch (t: Throwable) { Log.w(TAG, "online cancel failed", t) }
+        onlineHandle = null
+        if (!turn.speaking && turn.queue.isEmpty()) completeOnline(turn)
+    }
+
+    /** Speaks the next queued chunk; called only when no chunk is being spoken (never two speak() at once). */
+    private fun playNextOnline(turn: OnlineTurn) {
+        if (turn.id != onlineTurnId || state == State.IDLE) return
+        val next = turn.queue.removeFirstOrNull()
+        if (next == null) {
+            turn.speaking = false
+            if (turn.streamEnded) completeOnline(turn) else core()?.setState(JarvisState.THINKING)
+            return
+        }
+        turn.speaking = true
+        turn.spoke = true
+        speak(next) {                                   // `then` runs after this chunk's onDone (or its timeout)
+            if (turn.id != onlineTurnId) return@speak
+            turn.speaking = false
+            playNextOnline(turn)
+        }
+    }
+
+    /** Stream ended and the queue is empty: continue the session, or fall back if nothing could be said. */
+    private fun completeOnline(turn: OnlineTurn) {
+        if (turn.id != onlineTurnId) return
+        main.removeCallbacks(onlineWatchdog)
+        onlineHandle = null
+        onlineTurn = null
+        val failure = turn.failure
+        val toolMessage: String? = failure?.lastToolMessage
+        when {
+            failure == null && turn.spoke -> {
+                conversationContext.addResponse(turn.fullText)
+                listen(LISTEN_DELAY_MS, newTurn = true)
+            }
+            // Failed after some speech: do not repeat or contradict it, just keep the session going.
+            turn.spoke -> listen(LISTEN_DELAY_MS, newTurn = true)
+            // A tool already ran: say its real result instead of pretending nothing happened.
+            toolMessage != null -> {
+                conversationContext.addResponse(toolMessage)
+                speak(toolMessage) { listen(LISTEN_DELAY_MS, newTurn = true) }
+            }
+            // Nothing was said and nothing ran: exactly what the offline Brain would have done.
+            else -> handleResult(turn.fallback)
         }
     }
 
@@ -376,6 +509,7 @@ class JarvisConversationController(
     private fun finish() {
         if (state == State.IDLE) return                   // already finished: never report twice
         generation++
+        invalidateOnline(resetHistory = true)
         main.removeCallbacksAndMessages(null)
         try { commandSpeech.stopListening() } catch (t: Throwable) { Log.w(TAG, "stopListening failed", t) }
         try { tts.stop() } catch (t: Throwable) { Log.w(TAG, "tts.stop failed", t) }
@@ -425,5 +559,7 @@ class JarvisConversationController(
         const val SPEAK_BASE_MS = 14_000L
         const val SPEAK_PER_CHAR_MS = 90L
         const val SPEAK_MAX_MS = 40_000L
+
+        const val ONLINE_MAX_MS = 80_000L                // safety net above the OnlineBrain's own turn timeout
     }
 }
