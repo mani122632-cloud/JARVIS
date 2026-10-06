@@ -8,6 +8,7 @@ import com.jarvis.assistant.brain.BrainResult
 import com.jarvis.assistant.brain.JarvisBrain
 import com.jarvis.assistant.brain.llm.ReplyStreamSink
 import com.jarvis.assistant.brain.llm.StreamingJarvisBrain
+import com.jarvis.assistant.command.CallTool
 import com.jarvis.assistant.command.JarvisAction
 import com.jarvis.assistant.command.JarvisActionExecutor
 import com.jarvis.assistant.core.JarvisCoreView
@@ -413,12 +414,31 @@ class JarvisConversationController(
 
     private fun executeAndContinue(action: JarvisAction) {
         if (action == JarvisAction.DismissAssistant) { finish(); return }
+        // call_contact: the contact lookup runs in the background (executeAsync); the outcome arrives on the main
+        // thread and goes through the same spoken-reply path below. Runs exactly once per command.
+        if (action is JarvisAction.ToolCall && action.tool == CallTool.NAME) {
+            val gen = ++generation
+            try {
+                executor.executeAsync(action) { outcome ->
+                    if (gen != generation || state == State.IDLE) return@executeAsync   // session cancelled / finished meanwhile
+                    guarded { handleOutcome(action, outcome) }
+                }
+            } catch (e: RuntimeException) {
+                Log.e(TAG, "Executor threw", e)
+                handleOutcome(action, JarvisActionExecutor.Outcome(false, null))
+            }
+            return
+        }
         val outcome = try {
             executor.execute(action)
         } catch (e: RuntimeException) {                // executor promises not to throw; stay safe
             Log.e(TAG, "Executor threw", e)
             JarvisActionExecutor.Outcome(false, null)
         }
+        handleOutcome(action, outcome)
+    }
+
+    private fun handleOutcome(action: JarvisAction, outcome: JarvisActionExecutor.Outcome) {
         val message = outcome.message
         when {
             // Back's only real effect is closing the assistant, so the session ends with it.
