@@ -41,6 +41,17 @@ import org.json.JSONObject
  * LLM as FAILED and, if the LLM cannot answer afterwards, JARVIS speaks the tool's own (Persian) message, so a
  * failure is never reported as success. Tools that already ran are never repeated by the offline fallback.
  * User text is never logged.
+ *
+ * Streaming ([StreamingJarvisBrain]): when the caller passes a [ReplyStreamSink], the reply text of every round is
+ * cut into natural segments (see [ReplyStreamer]) and handed to the sink WHILE the LLM is still writing, so the voice
+ * can start with the first sentence. Rules that keep it safe:
+ *  - one LLM request at a time (the worker is single-threaded; a cancelled / timed-out turn closes its connection);
+ *  - text is spoken only from a round that turns out not to be a tool call, tool results still go back to the LLM
+ *    and the next round (the spoken confirmation) is streamed the same way;
+ *  - what is spoken is what is stored in the conversation history, and a reply is never spoken twice
+ *    ([ReplyStreamSink.onFinalReplySpoken]);
+ *  - if the server cannot stream, the provider uses the normal request and the complete text is cut into segments
+ *    afterwards, so the previous behaviour is the fallback.
  */
 class LlmJarvisBrain(
     private val provider: LlmProvider,
@@ -53,7 +64,10 @@ class LlmJarvisBrain(
     private val main: Handler = Handler(Looper.getMainLooper()),
     private val now: () -> LocalDateTime = { LocalDateTime.now() },
     private val clock: () -> Long = { SystemClock.elapsedRealtime() }
-) : JarvisBrain {
+) : JarvisBrain, StreamingJarvisBrain {
+
+    /** The streamed turn in progress (main thread), so the controller can cancel it. */
+    private var activeRun: Run? = null
 
     /** After a provider failure the LLM is skipped for a while, so every utterance does not wait for a timeout. */
     @Volatile private var unavailableUntil = 0L
@@ -68,7 +82,20 @@ class LlmJarvisBrain(
     override fun think(text: String, context: ConversationContext): BrainResult = offline(text, context)
 
     override fun thinkAsync(text: String, context: ConversationContext, onResult: (BrainResult) -> Unit) {
-        Run(text, context, onResult).start()
+        Run(text, context, null, onResult).start()
+    }
+
+    override fun thinkStreamAsync(
+        text: String,
+        context: ConversationContext,
+        sink: ReplyStreamSink,
+        onResult: (BrainResult) -> Unit
+    ) {
+        Run(text, context, sink, onResult).start()
+    }
+
+    override fun cancelStreaming() {
+        activeRun?.cancelFromController()
     }
 
     /** With a working LLM nothing runs from a partial result; the offline fast path is used only as fallback. */
@@ -120,9 +147,14 @@ class LlmJarvisBrain(
     private inner class Run(
         private val text: String,
         private val ctx: ConversationContext,
+        private val sink: ReplyStreamSink?,
         private val onResult: (BrainResult) -> Unit
     ) {
         private val finished = AtomicBoolean(false)
+        private val cancel = LlmCancel()                     // closes the connection of a streamed request
+        @Volatile private var stopStream = false             // the listener tells the provider to stop reading
+        private var streamer: ReplyStreamer? = null          // the round being streamed (main thread)
+        private val spokenAll = StringBuilder()              // everything handed to the sink in this utterance
         private val messages = ArrayList<LlmMessage>()
         private val executed = ArrayList<ToolOutcome>()      // tools that really ran this utterance (main thread)
         private var totalCalls = 0
@@ -131,6 +163,7 @@ class LlmJarvisBrain(
         private val watchdog = Runnable { onWatchdog() }
 
         fun start() {
+            if (sink != null) activeRun = this
             try {
                 if (MemoryCommandParser.parse(text) != null) {
                     // An explicit memory command: the deterministic offline path handles it.
@@ -187,11 +220,14 @@ class LlmJarvisBrain(
             // Tools are offered only for the first request of an utterance. The follow-up after a tool result is just the
             // spoken confirmation: offering tools again lets a small model repeat the same action (a flashlight toggled twice).
             val tools = if (round == 0 && provider.toolsAvailable) catalog.specs() else emptyList()
-            val req = LlmRequest(ArrayList(messages), tools)
+            // The follow-up after a tool result is only a short spoken confirmation: a small budget keeps it short.
+            val req = LlmRequest(ArrayList(messages), tools, maxTokens = if (round == 0) FIRST_MAX_TOKENS else FOLLOWUP_MAX_TOKENS)
+            val st: ReplyStreamer? = if (sink != null) ReplyStreamer(MAX_REPLY_CHARS) { seg -> deliver(seg) } else null
+            streamer = st
             try {
                 worker.execute {
                     val resp = try {
-                        provider.generate(req)
+                        if (st != null) provider.generateStream(req, streamListener(st), cancel) else provider.generate(req)
                     } catch (t: Throwable) {
                         LlmResponse.Failure(LlmFailureKind.UNKNOWN, t.javaClass.simpleName)
                     }
@@ -200,6 +236,45 @@ class LlmJarvisBrain(
             } catch (e: RejectedExecutionException) {
                 failOver()
             }
+        }
+
+        /** Worker thread: hands every delta to the main thread, in order, and tells the provider when to stop reading. */
+        private fun streamListener(st: ReplyStreamer) = object : LlmStreamListener {
+            override fun onTextDelta(delta: String): Boolean {
+                if (stopStream) return false
+                main.post {
+                    if (!finished.get() && streamer === st && !stopStream) {
+                        if (!sessionActive()) {
+                            abandon()
+                        } else if (!st.onDelta(delta)) {
+                            stopStream = true               // length cap reached: no need to generate any more
+                        }
+                    }
+                }
+                return !stopStream
+            }
+
+            override fun onToolCallStarted() {
+                main.post { if (!finished.get() && streamer === st) st.onToolCallStarted() }
+            }
+        }
+
+        /** Main thread: one finished segment of the reply goes to the voice. */
+        private fun deliver(seg: String) {
+            val s = sink ?: return
+            if (finished.get()) return
+            if (spokenAll.isNotEmpty()) spokenAll.append(' ')
+            spokenAll.append(seg)
+            s.onSegment(seg)
+        }
+
+        /** The turn is still wanted: waiting for the LLM, or (streaming only) its first sentences are being spoken. */
+        private fun sessionActive(): Boolean =
+            ctx.sessionState == SessionState.PROCESSING ||
+                (sink != null && ctx.sessionState == SessionState.SPEAKING)
+
+        fun cancelFromController() {
+            abandon()
         }
 
         private fun guarded(block: () -> Unit) {
@@ -213,7 +288,7 @@ class LlmJarvisBrain(
 
         private fun onResponse(resp: LlmResponse, round: Int) {
             // The session ended (or was cancelled) while the LLM was thinking: do nothing more.
-            if (ctx.sessionState != SessionState.PROCESSING) {
+            if (!sessionActive()) {
                 abandon()
                 return
             }
@@ -227,7 +302,37 @@ class LlmJarvisBrain(
             }
         }
 
+        /** A streamed round: the text was already cut into segments; a tool-call round is not spoken. */
+        private fun onStreamedSuccess(resp: LlmResponse.Success, round: Int, st: ReplyStreamer) {
+            if (resp.toolCalls.isEmpty()) {
+                // The server (or the fallback request) did not stream: cut the complete text the same way.
+                if (!st.sawDeltas) st.onDelta(resp.text)
+                st.finish()
+                val reply = st.spoken
+                if (reply.isBlank()) {
+                    noteFailure(LlmFailureKind.MALFORMED)
+                    failOver()
+                } else {
+                    ctx.llmPending = null
+                    sink?.onFinalReplySpoken()                 // the result below is already spoken
+                    finish(BrainResult.Conversation(reply))
+                }
+                return
+            }
+            if (round >= MAX_ROUNDS) {
+                finish(BrainResult.Conversation(if (executed.isEmpty()) JarvisPhrases.NOT_UNDERSTOOD else summary()))
+                return
+            }
+            st.onToolCallStarted()
+            processCalls(resp.toolCalls, st.spoken, round, alreadySpoken = st.hasSpoken)
+        }
+
         private fun onSuccess(resp: LlmResponse.Success, round: Int) {
+            val st = streamer
+            if (st != null) {
+                onStreamedSuccess(resp, round, st)
+                return
+            }
             val reply = clean(resp.text)
             if (resp.toolCalls.isEmpty()) {
                 if (reply.isBlank()) {
@@ -246,7 +351,9 @@ class LlmJarvisBrain(
             processCalls(resp.toolCalls, reply, round)
         }
 
-        private fun processCalls(calls: List<ToolCallRequest>, reply: String, round: Int) {
+        private fun processCalls(calls: List<ToolCallRequest>, reply: String, round: Int, alreadySpoken: Boolean = false) {
+            // Text of this round that was already spoken must not be spoken again by the result.
+            val replyToSpeak = if (alreadySpoken) "" else reply
             val echoed = ArrayList<ToolCallRequest>()
             val results = ArrayList<ToolCallResult>()
             var endRequested = false
@@ -297,7 +404,7 @@ class LlmJarvisBrain(
             ctx.llmPending = null
 
             if (endRequested) {
-                val bye = farewell.ifBlank { reply }.ifBlank { JarvisPhrases.GOODBYE }
+                val bye = farewell.ifBlank { replyToSpeak }.ifBlank { JarvisPhrases.GOODBYE }
                 val done = if (executed.isEmpty()) "" else summary() + " "
                 finish(BrainResult.EndConversation(done + bye))
                 return
@@ -305,7 +412,7 @@ class LlmJarvisBrain(
             val action = deferred
             if (action != null) {
                 // go_back closes the assistant: the controller runs it (and ends the session).
-                finish(BrainResult.Command(action, reply, TOOL_CONFIDENCE))
+                finish(BrainResult.Command(action, replyToSpeak, TOOL_CONFIDENCE))
                 return
             }
 
@@ -345,25 +452,45 @@ class LlmJarvisBrain(
         /** LLM unusable. Before any tool ran: the offline brain. After: only report what happened, never re-run. */
         private fun failOver() {
             if (finished.get()) return
-            if (executed.isEmpty()) finish(offline(text, ctx))
-            else finish(BrainResult.Conversation(summary()))
+            if (executed.isEmpty()) {
+                if (spokenAll.isNotEmpty()) {
+                    // Part of the answer was already spoken: end it there instead of adding an unrelated offline reply.
+                    sink?.onFinalReplySpoken()
+                    finish(BrainResult.Conversation(spokenAll.toString()))
+                } else {
+                    finish(offline(text, ctx))
+                }
+            } else {
+                finish(BrainResult.Conversation(summary()))
+            }
         }
 
         private fun onWatchdog() {
             if (finished.get()) return
-            if (ctx.sessionState != SessionState.PROCESSING) { abandon(); return }
+            if (!sessionActive()) { abandon(); return }
             Log.w(TAG, "LLM turn timed out")
             noteFailure(LlmFailureKind.TIMEOUT)
             guarded { failOver() }
         }
 
         private fun abandon() {
-            if (finished.compareAndSet(false, true)) main.removeCallbacks(watchdog)
+            if (finished.compareAndSet(false, true)) {
+                main.removeCallbacks(watchdog)
+                releaseStream()
+            }
+        }
+
+        /** Ends a streamed request that may still be running: the connection is closed, so the server stops too. */
+        private fun releaseStream() {
+            stopStream = true
+            cancel.cancel()
+            if (activeRun === this) activeRun = null
         }
 
         private fun finish(result: BrainResult) {
             if (!finished.compareAndSet(false, true)) return
             main.removeCallbacks(watchdog)
+            releaseStream()
             try {
                 onResult(result)
             } catch (e: Exception) {
@@ -402,6 +529,8 @@ class LlmJarvisBrain(
         const val SHORT_PAUSE_MS = 15_000L
         const val LONG_PAUSE_MS = 5 * 60_000L
         const val MAX_REPLY_CHARS = 320
+        const val FIRST_MAX_TOKENS = 220            // same as LlmRequest's default
+        const val FOLLOWUP_MAX_TOKENS = 80          // the spoken confirmation after a tool result
         const val GOODNIGHT_FAREWELL = "شب بخیر ارباب. هر وقت لازم شد صدایم کنید."
         val THINK_BLOCK = Regex("(?s)<think>.*?(</think>|$)")
         val TOOL_BLOCK = Regex("(?s)<tool_call>.*?(</tool_call>|$)")

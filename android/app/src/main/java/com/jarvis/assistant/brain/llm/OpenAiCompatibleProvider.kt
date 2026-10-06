@@ -4,8 +4,10 @@ import android.os.SystemClock
 import android.util.Log
 import com.jarvis.assistant.command.ParamType
 import com.jarvis.assistant.command.ToolSpec
+import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.io.InputStreamReader
 import java.io.InputStream
 import java.net.ConnectException
 import java.net.HttpURLConnection
@@ -13,6 +15,7 @@ import java.net.MalformedURLException
 import java.net.SocketTimeoutException
 import java.net.URL
 import java.net.UnknownHostException
+import java.util.TreeMap
 import javax.net.ssl.SSLException
 import org.json.JSONArray
 import org.json.JSONException
@@ -31,12 +34,19 @@ import org.json.JSONObject
  * request that carries `tools`) must still hold a normal conversation. In that case the same request is repeated
  * as plain chat, and [toolsAvailable] stays false for [TOOLS_RETRY_AFTER_MS] so the Brain neither offers tools nor
  * pays for a failing request on every utterance.
+ *
+ * Streaming ([generateStream]): the same endpoint with `"stream": true`; the reply arrives as Server-Sent Events and
+ * its text is passed on while it is generated. If the server cannot stream (HTTP error before anything arrived, or a
+ * non-SSE answer) the very same request is repeated through [generate], so the previous behaviour is the fallback.
+ * Nothing is ever repeated once text was delivered. The streaming request uses the same timeouts as [generate].
  */
 class OpenAiCompatibleProvider(
     private val configSource: () -> LlmConfig?
 ) : LlmProvider {
 
     @Volatile private var toolsRejectedUntil = 0L
+    @Volatile private var streamRejectedUntil = 0L          // streaming refused for any request
+    @Volatile private var streamToolsRejectedUntil = 0L     // streaming refused only together with tools
 
     override val isConfigured: Boolean
         get() = try { configSource()?.isUsable == true } catch (t: Throwable) { false }
@@ -57,6 +67,240 @@ class OpenAiCompatibleProvider(
         if (second is LlmResponse.Success) toolsRejectedUntil = SystemClock.elapsedRealtime() + TOOLS_RETRY_AFTER_MS
         return second
     }
+
+    // ---- streaming -------------------------------------------------------------------------------
+
+    override fun generateStream(request: LlmRequest, listener: LlmStreamListener, cancel: LlmCancel): LlmResponse {
+        val cfg = try { configSource() } catch (t: Throwable) { null }
+        if (cfg == null || !cfg.isUsable) return LlmResponse.Failure(LlmFailureKind.NOT_CONFIGURED)
+        if (cancel.isCancelled) return LlmResponse.Failure(LlmFailureKind.UNKNOWN, "cancelled")
+
+        val withTools = request.tools.isNotEmpty() && toolsAvailable
+        val now = SystemClock.elapsedRealtime()
+        if (now < streamRejectedUntil || (withTools && now < streamToolsRejectedUntil)) return generate(request)
+
+        val acc = StreamAccumulator(listener)
+        val result = postStream(cfg, request, withTools, acc, cancel)
+        if (result is LlmResponse.Success) return result
+        val failure = result as LlmResponse.Failure
+        if (cancel.isCancelled) return LlmResponse.Failure(LlmFailureKind.UNKNOWN, "cancelled")
+
+        // Text already reached the listener (and the voice): never ask again, keep what was said.
+        if (acc.hasOutput) {
+            Log.w(TAG, "LLM stream ended early (${failure.kind}); using the partial reply")
+            return if (acc.text.isNotBlank()) LlmResponse.Success(acc.text, emptyList()) else failure
+        }
+        return when (failure.kind) {
+            LlmFailureKind.HTTP_ERROR, LlmFailureKind.MALFORMED, LlmFailureKind.UNKNOWN -> {
+                if (failure.detail == "HTTP 503") return failure          // model still loading: plain request would wait too
+                Log.w(TAG, "LLM streaming failed (${failure.kind}); using the non-streaming request")
+                val until = SystemClock.elapsedRealtime() + STREAM_RETRY_AFTER_MS
+                if (withTools) streamToolsRejectedUntil = until else streamRejectedUntil = until
+                generate(request)
+            }
+            // Timeout / connection refused / wrong key / rate limit: the plain request would fail the same way.
+            else -> failure
+        }
+    }
+
+    private fun postStream(
+        cfg: LlmConfig,
+        request: LlmRequest,
+        withTools: Boolean,
+        acc: StreamAccumulator,
+        cancel: LlmCancel
+    ): LlmResponse {
+        var conn: HttpURLConnection? = null
+        try {
+            val body = buildBody(cfg, request, withTools).put("stream", true).toString().toByteArray(Charsets.UTF_8)
+            val url = endpoint(cfg.baseUrl)
+            val code: Int
+            if (url.startsWith("http://", ignoreCase = true)) {
+                val headers = LinkedHashMap<String, String>()
+                headers["Content-Type"] = "application/json; charset=utf-8"
+                headers["Accept"] = "text/event-stream"
+                if (cfg.apiKey.isNotBlank()) headers["Authorization"] = "Bearer ${cfg.apiKey}"
+                code = LoopbackHttp.postStream(
+                    url, headers, body, cfg.connectTimeoutMs, cfg.readTimeoutMs, MAX_STREAM_BYTES, cancel
+                ) { line -> acc.onLine(line) }
+            } else {
+                val c = URL(url).openConnection() as HttpURLConnection
+                conn = c
+                cancel.attach { try { c.disconnect() } catch (t: Throwable) { /* ignore */ } }
+                c.requestMethod = "POST"
+                c.connectTimeout = cfg.connectTimeoutMs
+                c.readTimeout = cfg.readTimeoutMs
+                c.doOutput = true
+                c.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                c.setRequestProperty("Accept", "text/event-stream")
+                if (cfg.apiKey.isNotBlank()) c.setRequestProperty("Authorization", "Bearer ${cfg.apiKey}")
+                c.outputStream.use { it.write(body) }
+                code = c.responseCode
+                if (code in 200..299) {
+                    BufferedReader(InputStreamReader(c.inputStream, Charsets.UTF_8)).use { r ->
+                        while (true) {
+                            val line = r.readLine() ?: break
+                            if (!acc.onLine(line)) break
+                        }
+                    }
+                }
+            }
+            if (code !in 200..299) {
+                Log.w(TAG, "LLM HTTP $code (stream)")
+                return LlmResponse.Failure(kindForHttp(code), "HTTP $code")
+            }
+            return acc.result()
+        } catch (t: Throwable) {
+            return failureFor(t)
+        } finally {
+            cancel.detach()
+            try { conn?.disconnect() } catch (t: Throwable) { /* ignore */ }
+        }
+    }
+
+    private fun failureFor(e: Throwable): LlmResponse.Failure = when (e) {
+        is SocketTimeoutException -> {
+            Log.w(TAG, "LLM timed out")
+            LlmResponse.Failure(LlmFailureKind.TIMEOUT)
+        }
+        is UnknownHostException -> LlmResponse.Failure(LlmFailureKind.NO_NETWORK)
+        is ConnectException -> {
+            Log.w(TAG, "LLM server not reachable (is llama.cpp running on the configured port?)")
+            LlmResponse.Failure(LlmFailureKind.NO_NETWORK)
+        }
+        is MalformedURLException -> LlmResponse.Failure(LlmFailureKind.NOT_CONFIGURED, "bad URL")
+        is SSLException -> LlmResponse.Failure(LlmFailureKind.HTTP_ERROR, "TLS error")
+        is IOException -> {
+            Log.w(TAG, "LLM I/O error: ${e.javaClass.simpleName}")     // class only: never the message or any text
+            LlmResponse.Failure(LlmFailureKind.NO_NETWORK)
+        }
+        is JSONException -> LlmResponse.Failure(LlmFailureKind.MALFORMED)
+        else -> {
+            Log.w(TAG, "LLM call failed: ${e.javaClass.simpleName}")
+            LlmResponse.Failure(LlmFailureKind.UNKNOWN, e.javaClass.simpleName)
+        }
+    }
+
+    /** Pieces of one streamed tool call (a nested class is not allowed inside an inner class). */
+    private class StreamCallBuilder {
+        var id = ""
+        var name = ""
+        val args = StringBuilder()
+    }
+
+    /**
+     * Collects a streamed completion line by line: `data: {chunk}` events with `delta.content` text and
+     * `delta.tool_calls` fragments (assembled per index), ended by `data: [DONE]` or by the connection closing.
+     * A server that ignores `stream` and answers with one plain JSON body is understood too ([result] parses it).
+     * No text is logged.
+     */
+    private inner class StreamAccumulator(private val listener: LlmStreamListener) {
+        val textBuf = StringBuilder()
+        private val calls = TreeMap<Int, StreamCallBuilder>()
+        private val raw = StringBuilder()
+        private var sse = false
+        private var done = false
+        private var stoppedByListener = false
+        private var serverError = false
+        private var malformed = false
+        private var toolStarted = false
+
+        val text: String get() = textBuf.toString()
+
+        /** Text or a tool call reached the listener: the request must not be repeated. */
+        val hasOutput: Boolean get() = textBuf.isNotEmpty() || toolStarted
+
+        /** @return false to stop reading. */
+        fun onLine(line: String): Boolean {
+            if (done) return false
+            if (line.isEmpty()) return true
+            if (line.startsWith("data:")) {
+                sse = true
+                val payload = line.substring(5).trim()
+                if (payload == "[DONE]") { done = true; return false }
+                if (payload.isEmpty()) return true
+                return onPayload(payload)
+            }
+            if (line.startsWith(":") || line.startsWith("event:") || line.startsWith("id:") || line.startsWith("retry:")) return true
+            if (!sse) {                                      // not SSE: a plain JSON body (server ignored "stream")
+                raw.append(line).append('\n')
+                if (raw.length > MAX_RESPONSE_BYTES) { malformed = true; return false }
+            }
+            return true
+        }
+
+        private fun onPayload(payload: String): Boolean {
+            val root = try { JSONObject(payload) } catch (e: JSONException) { malformed = true; return false }
+            if (root.has("error") && !root.isNull("error")) { serverError = true; return false }
+            val choices = root.optJSONArray("choices")
+            if (choices == null || choices.length() == 0) return true
+            val delta = choices.optJSONObject(0)?.optJSONObject("delta") ?: return true
+
+            val content = delta.opt("content")
+            if (content is String && content.isNotEmpty()) {
+                textBuf.append(content)
+                if (!listener.onTextDelta(content)) { stoppedByListener = true; return false }
+            }
+            val arr = delta.optJSONArray("tool_calls")
+            if (arr != null) {
+                for (i in 0 until arr.length()) {
+                    val c = arr.optJSONObject(i) ?: continue
+                    val index = if (c.has("index") && !c.isNull("index")) c.optInt("index", i) else i
+                    val b = calls.getOrPut(index) { StreamCallBuilder() }
+                    if (!c.isNull("id")) {
+                        val id = c.optString("id", "")
+                        if (id.isNotEmpty() && b.id.isEmpty()) b.id = id
+                    }
+                    val fn = c.optJSONObject("function")
+                    if (fn != null) {
+                        if (!fn.isNull("name")) {
+                            val n = fn.optString("name", "")
+                            if (n.isNotEmpty() && b.name.isEmpty()) b.name = n
+                        }
+                        if (fn.has("arguments") && !fn.isNull("arguments")) {
+                            val a = fn.get("arguments")
+                            b.args.append(if (a is String) a else a.toString())
+                        }
+                    }
+                    if (!toolStarted) {
+                        toolStarted = true
+                        listener.onToolCallStarted()
+                    }
+                }
+            }
+            return true
+        }
+
+        fun result(): LlmResponse {
+            if (serverError) return LlmResponse.Failure(LlmFailureKind.HTTP_ERROR, "error object")
+            if (malformed) return LlmResponse.Failure(LlmFailureKind.MALFORMED)
+            if (!sse) {
+                // The server did not stream: parse the body as a normal completion (nothing was delivered live).
+                if (raw.isBlank()) return LlmResponse.Failure(LlmFailureKind.MALFORMED, "empty stream")
+                return try { parse(raw.toString()) } catch (e: JSONException) { LlmResponse.Failure(LlmFailureKind.MALFORMED) }
+            }
+            if (!done && !stoppedByListener && !hasOutput) return LlmResponse.Failure(LlmFailureKind.MALFORMED, "empty stream")
+            val out = ArrayList<ToolCallRequest>()
+            for (b in calls.values) {
+                if (b.name.isEmpty()) continue
+                out.add(toolCall(b.id, b.name, b.args.toString()))
+            }
+            return LlmResponse.Success(textBuf.toString(), out)
+        }
+    }
+
+    private fun toolCall(id: String, name: String, rawArgs: String): ToolCallRequest {
+        val parsed = parseArgs(rawArgs)
+        return ToolCallRequest(
+            id = id,
+            name = name,
+            arguments = parsed ?: emptyMap(),
+            rawArguments = rawArgs,
+            malformed = parsed == null
+        )
+    }
+
+    // ---- plain request ---------------------------------------------------------------------------
 
     /** A quick HTTP error (not "model is still loading", 503) to a request that carried tools. */
     private fun looksLikeToolsRejected(r: LlmResponse): Boolean =
@@ -217,16 +461,7 @@ class OpenAiCompatibleProvider(
                     !fn.has("arguments") || fn.isNull("arguments") -> ""
                     else -> fn.get("arguments").let { if (it is String) it else it.toString() }
                 }
-                val parsed = parseArgs(rawArgs)
-                calls.add(
-                    ToolCallRequest(
-                        id = if (c.isNull("id")) "" else c.optString("id", ""),
-                        name = name,
-                        arguments = parsed ?: emptyMap(),
-                        rawArguments = rawArgs,
-                        malformed = parsed == null
-                    )
-                )
+                calls.add(toolCall(if (c.isNull("id")) "" else c.optString("id", ""), name, rawArgs))
             }
         }
         return LlmResponse.Success(content, calls)
@@ -287,6 +522,8 @@ class OpenAiCompatibleProvider(
     private companion object {
         const val TAG = "OpenAiProvider"
         const val MAX_RESPONSE_BYTES = 256 * 1024
+        const val MAX_STREAM_BYTES = 512 * 1024
+        const val STREAM_RETRY_AFTER_MS = 5 * 60_000L
         const val TOOLS_RETRY_AFTER_MS = 10 * 60_000L
     }
 }

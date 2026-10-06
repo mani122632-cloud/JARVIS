@@ -6,6 +6,8 @@ import android.os.SystemClock
 import android.util.Log
 import com.jarvis.assistant.brain.BrainResult
 import com.jarvis.assistant.brain.JarvisBrain
+import com.jarvis.assistant.brain.llm.ReplyStreamSink
+import com.jarvis.assistant.brain.llm.StreamingJarvisBrain
 import com.jarvis.assistant.command.JarvisAction
 import com.jarvis.assistant.command.JarvisActionExecutor
 import com.jarvis.assistant.core.JarvisCoreView
@@ -14,6 +16,7 @@ import com.jarvis.assistant.speech.CommandSpeechError
 import com.jarvis.assistant.speech.JarvisPhrases
 import com.jarvis.assistant.speech.JarvisSpeechController
 import com.jarvis.assistant.speech.SpeechInput
+import com.jarvis.assistant.speech.StreamingSpeechAdapter
 
 /**
  * Multi-turn conversation SESSION, started after wake word + "بله ارباب.":
@@ -35,6 +38,12 @@ import com.jarvis.assistant.speech.SpeechInput
  *  - [MAX_SESSION_MS] have passed,
  *  - the STT is unusable (model missing, no permission, repeated audio failure),
  *  - the command was "dismiss" or "back" (their only effect is closing the assistant).
+ *
+ * Streamed replies: with a [StreamingJarvisBrain] the reply is spoken WHILE the LLM is still writing it. The Brain
+ * hands over natural segments ([ReplyStreamSink]); [StreamingSpeechAdapter] plays them one after another through the
+ * same [tts] (Gyro), so the first sentence starts as soon as it exists. The turn's result still arrives once; a
+ * Conversation result whose text was already spoken is not spoken again, anything else (a question, a command, an
+ * end of conversation, a tool summary) is handled as before, after the queued speech has finished.
  *
  * The microphone belongs to [commandSpeech] for the whole session; the caller keeps Vosk suspended until
  * [Callback.onConversationFinished]. Main thread only.
@@ -61,6 +70,12 @@ class JarvisConversationController(
 
     private val main = Handler(Looper.getMainLooper())
     private var generation = 0
+
+    /** Plays the segments of a streamed reply, one at a time, through [tts]. */
+    private val speechStream = StreamingSpeechAdapter(tts)
+
+    /** The streamed reply of the current turn (null when the turn is not streamed or already finished). */
+    private var replyStream: ReplyStream? = null
 
     /** Uptime when the current turn started waiting for the user (silent re-listens do not reset it). */
     private var turnStartedAt = 0L
@@ -126,6 +141,7 @@ class JarvisConversationController(
     /** Aborts everything silently (no finished callback). */
     fun cancel() {
         generation++
+        abortReplyStream()
         main.removeCallbacksAndMessages(null)
         try { commandSpeech.stopListening() } catch (t: Throwable) { Log.w(TAG, "stopListening failed", t) }
         try { tts.stop() } catch (t: Throwable) { Log.w(TAG, "tts.stop failed", t) }
@@ -256,13 +272,94 @@ class JarvisConversationController(
         // result is delivered once, on the main thread, and dropped if this turn was cancelled meanwhile.
         val turnGen = generation
         main.removeCallbacks(processingTimeout)
-        processingTimeout = Runnable { deliverBrainResult(turnGen, BrainResult.Unknown()) }
+        abortReplyStream()
+        val streaming = brain as? StreamingJarvisBrain
+        val stream = if (streaming != null) ReplyStream(turnGen) else null
+        replyStream = stream
+        processingTimeout = Runnable {
+            // A streamed reply that is already being spoken is ended there; otherwise the turn is unusable.
+            val rs = replyStream
+            val result = if (rs != null && rs.delivered) {
+                rs.finalSpoken = true
+                streaming?.cancelStreaming()
+                BrainResult.Conversation("")
+            } else {
+                BrainResult.Unknown()
+            }
+            deliverBrainResult(turnGen, result)
+        }
         main.postDelayed(processingTimeout, PROCESSING_TIMEOUT_MS)
         try {
-            brain.thinkAsync(best, conversationContext) { result -> deliverBrainResult(turnGen, result) }
+            if (streaming != null && stream != null) {
+                streaming.thinkStreamAsync(best, conversationContext, stream.sink) { result -> deliverBrainResult(turnGen, result) }
+            } else {
+                brain.thinkAsync(best, conversationContext) { result -> deliverBrainResult(turnGen, result) }
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Brain threw", e)
             deliverBrainResult(turnGen, BrainResult.Unknown())
+        }
+    }
+
+    /** Drops a streamed reply in progress: silence, and the Brain closes its LLM connection. */
+    private fun abortReplyStream() {
+        replyStream = null
+        speechStream.cancel()
+        try { (brain as? StreamingJarvisBrain)?.cancelStreaming() } catch (t: Throwable) { Log.w(TAG, "cancelStreaming failed", t) }
+    }
+
+    /**
+     * The spoken side of one streamed turn. The Brain delivers segments ([sink]); the first one switches the session to
+     * RESPONDING and starts the voice. When the Brain's result arrives it waits until the queued speech is finished and
+     * only then continues, so a command never cuts the sentence that announces it.
+     */
+    private inner class ReplyStream(val turnGen: Int) : StreamingSpeechAdapter.Listener {
+        var delivered = false
+        var finalSpoken = false
+        private var pendingResult: BrainResult? = null
+
+        val sink = object : ReplyStreamSink {
+            override fun onSegment(text: String) { this@ReplyStream.onSegment(text) }
+            override fun onFinalReplySpoken() { if (isCurrent()) finalSpoken = true }
+        }
+
+        private fun isCurrent(): Boolean =
+            replyStream === this && turnGen == generation &&
+                (state == State.COMMAND_PROCESSING || state == State.RESPONDING)
+
+        private fun onSegment(text: String) {
+            if (!isCurrent()) return
+            if (!delivered) {
+                delivered = true
+                setState(State.RESPONDING)
+                speechStream.open(this)
+            }
+            speechStream.enqueue(text)
+        }
+
+        override fun onFirstAudio() {
+            if (isCurrent()) core()?.setState(JarvisState.SPEAKING)
+        }
+
+        /** The Brain finished: continue after the last queued segment has been spoken. */
+        fun complete(result: BrainResult) {
+            pendingResult = result
+            speechStream.close()
+        }
+
+        override fun onDrained(success: Boolean) {
+            if (replyStream !== this || turnGen != generation) return      // cancelled meanwhile
+            replyStream = null
+            val result = pendingResult ?: return
+            guarded {
+                if (result is BrainResult.Conversation && finalSpoken) {
+                    // Already spoken while it was written: only remember it and listen again.
+                    conversationContext.addResponse(result.responseText)
+                    listen(LISTEN_DELAY_MS, newTurn = true)
+                } else {
+                    handleBrainResult(result)
+                }
+            }
         }
     }
 
@@ -270,8 +367,16 @@ class JarvisConversationController(
     private var processingTimeout = Runnable { }
 
     private fun deliverBrainResult(turnGen: Int, result: BrainResult) {
-        if (turnGen != generation || state != State.COMMAND_PROCESSING) return     // cancelled / finished / duplicate
+        if (turnGen != generation) return                                          // cancelled / finished / duplicate
+        val rs = replyStream
+        if (rs != null && rs.turnGen == turnGen && rs.delivered && state == State.RESPONDING) {
+            main.removeCallbacks(processingTimeout)
+            rs.complete(result)                                                    // continues once the voice is done
+            return
+        }
+        if (state != State.COMMAND_PROCESSING) return
         main.removeCallbacks(processingTimeout)
+        replyStream = null                                                         // nothing was spoken from the stream
         guarded { handleBrainResult(result) }
     }
 
@@ -373,6 +478,7 @@ class JarvisConversationController(
     private fun finish() {
         if (state == State.IDLE) return                   // already finished: never report twice
         generation++
+        abortReplyStream()
         main.removeCallbacksAndMessages(null)
         try { commandSpeech.stopListening() } catch (t: Throwable) { Log.w(TAG, "stopListening failed", t) }
         try { tts.stop() } catch (t: Throwable) { Log.w(TAG, "tts.stop failed", t) }

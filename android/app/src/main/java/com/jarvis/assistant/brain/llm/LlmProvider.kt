@@ -21,6 +21,17 @@ interface LlmProvider {
      * Must NOT throw: every problem is returned as [LlmResponse.Failure].
      */
     fun generate(request: LlmRequest): LlmResponse
+
+    /**
+     * Same request, but the reply text is reported to [listener] while it is generated. Blocking, background thread,
+     * must NOT throw. The returned response is the complete one (text + tool calls), exactly like [generate].
+     *
+     * The default does not stream: it calls [generate] and never touches [listener], so the caller speaks the
+     * complete text afterwards. Implementations that stream must fall back to [generate] themselves when the
+     * server cannot stream, but only while NOTHING was delivered to [listener] yet (a reply is never repeated).
+     * [cancel] aborts the request from another thread.
+     */
+    fun generateStream(request: LlmRequest, listener: LlmStreamListener, cancel: LlmCancel): LlmResponse = generate(request)
 }
 
 /**
