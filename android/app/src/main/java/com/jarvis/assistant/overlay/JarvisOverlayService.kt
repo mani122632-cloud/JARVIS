@@ -82,6 +82,7 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
             override fun onWakeWord() = onWakeWordDetected()
             override fun onStatus(status: WakeStatus) = onWakeStatus(status)
         })
+        wake.preload()      // load the Vosk model in the background now (no microphone); start() reuses it
         executor = JarvisActionExecutor(this)
         conversation = JarvisConversationController(
             tts = speech,

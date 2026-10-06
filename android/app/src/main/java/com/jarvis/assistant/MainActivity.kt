@@ -22,6 +22,7 @@ import com.jarvis.assistant.overlay.JarvisOverlayService
 import com.jarvis.assistant.speech.tts.OfflinePersianTts
 import com.jarvis.assistant.speech.JarvisSpeechController
 import com.jarvis.assistant.wakeword.TtsStatus
+import com.jarvis.assistant.wakeword.VoskWakeWordEngine
 import com.jarvis.assistant.wakeword.WakeStatus
 import com.jarvis.assistant.wakeword.WakeWordState
 
@@ -54,6 +55,8 @@ class MainActivity : Activity() {
             window.navigationBarColor = BG
         }
         setContentView(buildUi())
+        // Load the Vosk model now (background, no microphone, no service) so the first wake-word start is instant.
+        if (!WakeWordState.isActive()) VoskWakeWordEngine.warmUp(this)
     }
 
     override fun onStart() {

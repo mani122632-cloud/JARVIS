@@ -47,12 +47,14 @@ class VoskWakeWordEngine(context: Context, private val callback: Callback) {
     private val lock = Any()
     private var lastSession: Session? = null          // guarded by lock
     private val modelLock = Any()
+    private val loadLock = Any()                      // one model load at a time (preload() vs a session): never two Models
     private var model: Model? = null                  // guarded by modelLock
     private var grammar: WakePhrase.Grammar? = null   // built once per loaded model; guarded by modelLock
     @Volatile private var released = false
 
     /** True once a wake word was delivered; reset only by the next explicit [start]. */
     private val activationDelivered = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val preloading = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /** Starts listening. No-op if a session is already running. */
     fun start() {
@@ -64,6 +66,28 @@ class VoskWakeWordEngine(context: Context, private val callback: Callback) {
             val s = Session(cur)
             lastSession = s
             s.start()
+        }
+    }
+
+    /**
+     * Loads the Vosk model (and builds the wake grammar) on a background thread so the first [start] does not pay
+     * for it. Never opens the microphone, never starts a [Session], never reports a status or a wake word. Returns
+     * immediately; a no-op if the model is loaded, a preload is running, or the engine was released. If a [start]
+     * runs meanwhile it waits for the same load ([loadLock]) instead of loading a second copy. A failed preload is
+     * silent: the next [start] retries and reports the problem as before.
+     */
+    fun preload() {
+        if (released) return
+        synchronized(modelLock) { if (model != null) return }
+        if (!preloading.compareAndSet(false, true)) return
+        try {
+            Thread({
+                try { obtainModel(null) }
+                catch (t: Throwable) { Log.w(TAG, "Preload failed", t) }
+                finally { preloading.set(false) }
+            }, "JarvisWakePreload").apply { isDaemon = true }.start()
+        } catch (t: Throwable) {
+            preloading.set(false)
         }
     }
 
@@ -222,33 +246,73 @@ class VoskWakeWordEngine(context: Context, private val callback: Callback) {
 
     // ---- model --------------------------------------------------------------------------------
 
-    private fun obtainModel(s: Session): Model? {
+    /** [s] is null for [preload]: no session to report to, so problems are only logged. */
+    private fun obtainModel(s: Session?): Model? {
         synchronized(modelLock) { model?.let { return it } }
-        try {
-            val dir = File(app.filesDir, "vosk/$ASSET_DIR")
-            val marker = File(dir, ".ok")
-            val stamp = installStamp()
-            if (!marker.exists() || marker.readText() != stamp) {
-                if (!assetModelPresent()) { emit(s, WakeStatus.MODEL_MISSING); return null }
-                dir.deleteRecursively()
-                copyAsset(ASSET_DIR, dir)
-                marker.writeText(stamp)
+        synchronized(loadLock) {
+            synchronized(modelLock) { model?.let { return it } }      // another loader finished while we waited
+            if (released) return null
+            takeWarm()?.let { (m, g) ->                                // loaded earlier by warmUp(): no second Model
+                synchronized(modelLock) {
+                    if (released) { m.close(); return null }
+                    model = m
+                    grammar = g
+                }
+                return m
             }
-            if (s.stopped || released) return null
-            LibVosk.setLogLevel(LogLevel.WARNINGS)
-            val m = Model(dir.absolutePath)
-            val g = WakePhrase.build(readVocabulary(dir))
-            Log.i(TAG, "Wake grammar: ${g.json ?: "free recognition (model lacks the phrase words)"}")
+            try {
+                val dir = File(app.filesDir, "vosk/$ASSET_DIR")
+                val marker = File(dir, ".ok")
+                val stamp = installStamp()
+                if (!marker.exists() || marker.readText() != stamp) {
+                    if (!assetModelPresent()) { s?.let { emit(it, WakeStatus.MODEL_MISSING) }; return null }
+                    dir.deleteRecursively()
+                    copyAsset(ASSET_DIR, dir)
+                    marker.writeText(stamp)
+                }
+                if (s?.stopped == true || released) return null
+                LibVosk.setLogLevel(LogLevel.WARNINGS)
+                val m = Model(dir.absolutePath)
+                val g = WakePhrase.build(readVocabulary(dir))
+                Log.i(TAG, "Wake grammar: ${g.json ?: "free recognition (model lacks the phrase words)"}")
+                synchronized(modelLock) {
+                    if (released) { m.close(); return null }
+                    model = m
+                    grammar = g
+                }
+                return m
+            } catch (t: Throwable) {
+                Log.e(TAG, "Could not load Vosk model", t)
+                s?.let { emit(it, WakeStatus.ERROR) }
+                return null
+            }
+        }
+        @Suppress("UNREACHABLE_CODE")
+        return null
+    }
+
+    /** Takes over the model of the engine created by [warmUp] (waiting for its load if still running), once. */
+    private fun takeWarm(): Pair<Model, WakePhrase.Grammar>? {
+        val w = synchronized(warmGuard) {
+            val e = warmEngine
+            if (e == null || e === this) return null
+            warmEngine = null
+            e
+        }
+        return w.surrender()
+    }
+
+    /** Gives the loaded model away and retires this (session-less) engine so it can never load or close it again. */
+    private fun surrender(): Pair<Model, WakePhrase.Grammar>? {
+        synchronized(loadLock) {
             synchronized(modelLock) {
-                if (released) { m.close(); return null }
-                model = m
-                grammar = g
+                val m = model
+                val g = grammar
+                model = null
+                grammar = null
+                released = true
+                return if (m != null && g != null) m to g else null
             }
-            return m
-        } catch (t: Throwable) {
-            Log.e(TAG, "Could not load Vosk model", t)
-            emit(s, WakeStatus.ERROR)
-            return null
         }
     }
 
@@ -310,6 +374,27 @@ class VoskWakeWordEngine(context: Context, private val callback: Callback) {
 
     companion object {
         private const val TAG = "VoskWakeWord"
+
+        private val warmGuard = Any()
+        private var warmEngine: VoskWakeWordEngine? = null       // guarded by warmGuard
+
+        private val NO_OP = object : Callback {
+            override fun onWakeWord() {}
+            override fun onStatus(status: WakeStatus) {}
+        }
+
+        /**
+         * Loads the Vosk model in the background BEFORE the service exists (call from the Activity). No microphone,
+         * no service, no foreground-service rules involved. The next engine that needs a model (the overlay
+         * service's) adopts it instead of loading its own. Idempotent; main thread; returns immediately. Holds one
+         * model in RAM until it is adopted, so call it only while the wake word is not already running.
+         */
+        fun warmUp(context: Context) {
+            synchronized(warmGuard) {
+                if (warmEngine != null) return
+                warmEngine = VoskWakeWordEngine(context, NO_OP).also { it.preload() }
+            }
+        }
 
         /** Folder inside app/src/main/assets that holds the unpacked Vosk Persian model. */
         const val ASSET_DIR = "model-fa"
