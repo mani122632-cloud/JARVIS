@@ -21,14 +21,26 @@ class CommandIntentParser(
     private val clock: () -> LocalTime = { LocalTime.now() }
 ) {
 
-    data class Parsed(val action: JarvisAction, val confidence: Float, val normalized: String)
+    /** [intent] / [slots] are the NLU view of [action] (Stage 46.6); both have defaults so older callers compile unchanged. */
+    data class Parsed(
+        val action: JarvisAction,
+        val confidence: Float,
+        val normalized: String,
+        val intent: NluIntent = NluIntent.UNKNOWN,
+        val slots: Map<String, String> = emptyMap()
+    )
 
     /** Time extraction + Alarm/Timer intent detection (Stage 46.5); the old keyword rules lived here. */
     private val time = PersianTimeParser(clock)
     private val scheduling = SchedulingIntentParser(time)
 
     private class Input(val text: String, val tokens: List<String>, val compact: String)
-    private class Candidate(val action: JarvisAction, val confidence: Float)
+    private class Candidate(
+        val action: JarvisAction,
+        val confidence: Float,
+        val intent: NluIntent = NluIntent.OTHER,
+        val slots: Map<String, String> = emptyMap()
+    )
 
     /** App aliases in folded, space-free form (longest first): "اینستا گرام" and "اینستاگرام" are the same key. */
     private class AppKey(val app: AppEntry, val key: String)
@@ -62,7 +74,7 @@ class CommandIntentParser(
             val c = rule(input) ?: continue
             if (best == null || c.confidence > best.confidence) best = c
         }
-        return if (best != null) Parsed(best.action, best.confidence, text)
+        return if (best != null) Parsed(best.action, best.confidence, text, best.intent, best.slots)
         else Parsed(JarvisAction.Unknown(raw), 0f, text)
     }
 
@@ -154,28 +166,28 @@ class CommandIntentParser(
                 verb && extra.size <= 1 -> 0.75f
                 else -> return null
             }
-            return Candidate(JarvisAction.GoHome, c)
+            return Candidate(JarvisAction.GoHome, c, NluIntent.GO_HOME)
         }
         val backWord = t.any { it in BACK_WORDS } ||
             (t.contains("صفحه") && t.any { it == "قبل" || it == "قبلی" })
         if (!backWord) return null
         val extra = t.filter { it !in NOISE && it !in BACK_WORDS && it !in BACK_PAGE_WORDS }
-        return Candidate(JarvisAction.GoBack, if (extra.isEmpty()) 0.92f else 0.55f)
+        return Candidate(JarvisAction.GoBack, if (extra.isEmpty()) 0.92f else 0.55f, NluIntent.GO_BACK)
     }
 
     // ---- flashlight ---------------------------------------------------------------------------------
 
     private fun matchFlashlight(inp: Input): Candidate? {
         val t = inp.tokens
-        val named = hasKeyword(inp, "چراغقوه") || t.any { it in FLASH_WORDS }
+        val named = hasKeyword(inp, "چراغقوه", "چراغگوشی", "چراغموبایل") || t.any { it in FLASH_WORDS }
         if (!named) return null
         val on = t.any { it in ON_WORDS }
         val off = t.any { it in OFF_WORDS }
         return when {
             on && off -> null
-            on -> Candidate(JarvisAction.ToggleFlashlight(TorchMode.ON), 0.95f)
-            off -> Candidate(JarvisAction.ToggleFlashlight(TorchMode.OFF), 0.95f)
-            else -> Candidate(JarvisAction.ToggleFlashlight(TorchMode.TOGGLE), 0.75f)
+            on -> Candidate(JarvisAction.ToggleFlashlight(TorchMode.ON), 0.95f, NluIntent.TOGGLE_FLASHLIGHT, mapOf(NluSlot.MODE to NluSlot.MODE_ON))
+            off -> Candidate(JarvisAction.ToggleFlashlight(TorchMode.OFF), 0.95f, NluIntent.TOGGLE_FLASHLIGHT, mapOf(NluSlot.MODE to NluSlot.MODE_OFF))
+            else -> Candidate(JarvisAction.ToggleFlashlight(TorchMode.TOGGLE), 0.75f, NluIntent.TOGGLE_FLASHLIGHT, mapOf(NluSlot.MODE to NluSlot.MODE_TOGGLE))
         }
     }
 
@@ -183,25 +195,40 @@ class CommandIntentParser(
 
     private class PercentHit(val value: Int, val explicit: Boolean)
 
+    private fun volume(change: VolumeChange, confidence: Float, slots: Map<String, String>) =
+        Candidate(JarvisAction.SetVolume(change), confidence, NluIntent.SET_VOLUME, slots)
+
+    private fun volumePercent(value: Int, confidence: Float) = volume(
+        VolumeChange.Percent(value), confidence,
+        mapOf(NluSlot.ACTION to NluSlot.ACTION_SET, NluSlot.PERCENT to value.toString())
+    )
+
     private fun matchVolume(inp: Input): Candidate? {
         val t = inp.tokens
-        if (t.none { it in VOLUME_NAMES }) return null
+        if (t.any { it in NEGATIONS }) return null
+        val named = t.any { it in VOLUME_NAMES }
         val up = t.any { it in UP_WORDS }
         val down = t.any { it in DOWN_WORDS }
+
+        // "بی‌صدا کن" / "سکوت" / "mute" / "صدا رو قطع کن" = volume 0.
+        val hardMute = t.any { it in MUTE_WORDS } || hasKeyword(inp, "بیصدا")
+        val softMute = named && t.any { it in OFF_WORDS }
+        if ((hardMute || softMute) && !up && !down && findPercent(t) == null) {
+            return volumePercent(0, if (hardMute) 0.9f else 0.85f)
+        }
+        if (!named) return null
 
         val pct = findPercent(t)
         if (pct != null) {
             if (up || down || pct.value !in 0..100) return null
-            return Candidate(
-                JarvisAction.SetVolume(VolumeChange.Percent(pct.value)),
-                if (pct.explicit) 0.95f else 0.8f
-            )
+            return volumePercent(pct.value, if (pct.explicit) 0.95f else 0.8f)
         }
         return when {
             up && down -> null
-            up -> Candidate(JarvisAction.SetVolume(VolumeChange.Up), 0.95f)
-            down -> Candidate(JarvisAction.SetVolume(VolumeChange.Down), 0.95f)
-            t.any { it in MAX_WORDS } -> Candidate(JarvisAction.SetVolume(VolumeChange.Percent(100)), 0.9f)
+            up -> volume(VolumeChange.Up, 0.95f, mapOf(NluSlot.ACTION to NluSlot.ACTION_UP))
+            down -> volume(VolumeChange.Down, 0.95f, mapOf(NluSlot.ACTION to NluSlot.ACTION_DOWN))
+            t.any { it in MAX_WORDS } -> volumePercent(100, 0.9f)
+            t.any { it in HALF_WORDS } -> volumePercent(50, 0.85f)
             else -> null
         }
     }
@@ -241,6 +268,7 @@ class CommandIntentParser(
         if (wifi && bluetooth) return null
         if (wifi || bluetooth) {
             val action = if (wifi) JarvisAction.OpenWifiSettings else JarvisAction.OpenBluetoothSettings
+            val intent = if (wifi) NluIntent.OPEN_WIFI_SETTINGS else NluIntent.OPEN_BLUETOOTH_SETTINGS
             val confidence = when {
                 settingsWord -> 0.95f
                 openVerb -> 0.9f
@@ -253,7 +281,7 @@ class CommandIntentParser(
                     if (rest.isEmpty()) 0.8f else return null     // bare "وای فای" only; never inside other speech
                 }
             }
-            return Candidate(action, confidence)
+            return Candidate(action, confidence, intent)
         }
         if (!settingsWord) return null
         val extra = t.filter { it !in NOISE && it !in SETTINGS_WORDS }
@@ -262,7 +290,7 @@ class CommandIntentParser(
             openVerb && extra.size <= 1 -> 0.75f
             else -> 0.5f
         }
-        return Candidate(JarvisAction.OpenSettings, confidence)
+        return Candidate(JarvisAction.OpenSettings, confidence, NluIntent.OPEN_SETTINGS)
     }
 
     // ---- apps ---------------------------------------------------------------------------------------
@@ -277,10 +305,11 @@ class CommandIntentParser(
             if (a.key.length < 4 && !openVerb) continue
             val span = findSpan(folded, a.key) ?: continue
             val action = JarvisAction.OpenApp(a.app.id, a.app.label, a.app.packageNames)
-            if (openVerb) return Candidate(action, 0.95f)
+            val slots = mapOf(NluSlot.APP_ID to a.app.id.toString(), NluSlot.APP_NAME to a.app.label.toString())
+            if (openVerb) return Candidate(action, 0.95f, NluIntent.OPEN_APP, slots)
             // No verb: only the name plus filler / "رو" / "کن" around it.
             val rest = t.filterIndexed { i, tok -> i !in span && tok !in NOISE }
-            return if (rest.isEmpty()) Candidate(action, 0.85f) else null
+            return if (rest.isEmpty()) Candidate(action, 0.85f, NluIntent.OPEN_APP, slots) else null
         }
         return null
     }
@@ -358,10 +387,10 @@ class CommandIntentParser(
         val GLUED_VERBS = listOf("کنید", "کنین", "بکن", "کن")
         val CLITIC_FOLDED = setOf("رو", "را", "و")
         val HOME_STRONG = setOf("هوم", "home")
-        val HOME_PLACE = setOf("خونه", "خانه", "منزل")
+        val HOME_PLACE = setOf("خونه", "خانه", "منزل", "دسکتاپ")
         val HOME_PAGE_WORDS = setOf("صفحه", "اصلی", "اول")
         val CLITIC_SUFFIXES = setOf("رو", "را", "و")
-        val OPEN_VERBS = setOf("باز", "برو", "بیا", "اجرا", "بزن", "بیار", "بیاور", "ببر", "برید", "بروید", "بازکن", "open", "run", "start", "launch")
+        val OPEN_VERBS = setOf("باز", "برو", "بیا", "اجرا", "بزن", "بیار", "بیاور", "ببر", "برید", "بروید", "بازکن", "بازش", "بازشو", "open", "run", "start", "launch")
         val NOISE = FILLER + OPEN_VERBS + CLITICS +
             setOf("کن", "کنید", "بکن", "بذار", "بزار", "اون", "این", "یه", "میشه", "می", "شه", "میتونی", "تونی", "ممکنه", "جان", "عزیزم", "بده", "بدی")
         val NEGATIONS = setOf("نکن", "نه", "نمیخوام")
@@ -371,8 +400,8 @@ class CommandIntentParser(
             "هیچی", "ولش کن", "بیخیال", "بی خیال", "لغو", "کنسل", "خداحافظ", "بسه", "تمام",
             "مهم نیست", "فراموشش کن"
         )
-        val BACK_WORDS = setOf("برگرد", "برگردید", "بازگشت", "عقب")
-        val BACK_PAGE_WORDS = setOf("صفحه", "قبل", "قبلی")
+        val BACK_WORDS = setOf("برگرد", "برگردید", "بازگشت", "برگشت", "عقب", "back", "بک")
+        val BACK_PAGE_WORDS = setOf("صفحه", "قبل", "قبلی", "قدم")
 
         val FLASH_WORDS = setOf("چراغقوه", "فلش", "فلشلایت", "flashlight", "torch", "تورچ")
         val ON_WORDS = setOf("روشن", "بزن", "وصل", "فعال", "on")
@@ -381,7 +410,9 @@ class CommandIntentParser(
         val VOLUME_NAMES = setOf("صدا", "صدارو", "صداو", "صدای", "صدام", "ولوم", "volume")
         val UP_WORDS = setOf("زیاد", "زیادتر", "بیشتر", "بالا", "بلند", "بلندتر", "افزایش")
         val DOWN_WORDS = setOf("کم", "کمتر", "پایین", "آروم", "آرومتر", "آهسته", "کاهش")
-        val MAX_WORDS = setOf("حداکثر", "ماکزیمم", "فول", "max")
+        val MAX_WORDS = setOf("حداکثر", "ماکزیمم", "فول", "max", "ماکس", "آخر", "کامل", "بیشترین")
+        val HALF_WORDS = setOf("نصف", "نیمه", "متوسط")
+        val MUTE_WORDS = setOf("سکوت", "میوت", "mute", "سایلنت", "silent")
         val SET_VERBS = setOf("بذار", "بزار", "بگذار", "تنظیم", "روی")
 
         val TIMER_WORDS = setOf("تایمر", "تایمیر", "timer", "زمانسنج")
@@ -394,7 +425,7 @@ class CommandIntentParser(
             for (group in listOf(
                 OPEN_VERBS, BACK_WORDS, BACK_PAGE_WORDS, HOME_STRONG, HOME_PLACE, HOME_PAGE_WORDS, FLASH_WORDS,
                 ON_WORDS, OFF_WORDS, VOLUME_NAMES, UP_WORDS, DOWN_WORDS, MAX_WORDS, SET_VERBS, TIMER_WORDS,
-                ALARM_WORDS, SETTINGS_WORDS, CLOSE_WORDS, setOf("کن", "صفحه", "قبل", "قبلی")
+                ALARM_WORDS, SETTINGS_WORDS, CLOSE_WORDS, HALF_WORDS, MUTE_WORDS, setOf("کن", "صفحه", "قبل", "قبلی")
             )) all += group
         }
     }
