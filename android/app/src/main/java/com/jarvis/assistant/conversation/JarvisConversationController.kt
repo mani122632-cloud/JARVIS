@@ -312,6 +312,11 @@ class JarvisConversationController(
             Log.e(TAG, "Executor threw", e)
             JarvisActionExecutor.Outcome(false, null)
         }
+        handleOutcome(action, outcome)
+    }
+
+    /** Speaks the executor's result (or just listens again); shared by the sync and the async (call_contact) paths. */
+    private fun handleOutcome(action: JarvisAction, outcome: JarvisActionExecutor.Outcome) {
         val message = outcome.message
         when {
             // Back's only real effect is closing the assistant, so the session ends with it.
