@@ -13,6 +13,7 @@ import com.jarvis.assistant.core.JarvisState
 import com.jarvis.assistant.online.Cancellable
 import com.jarvis.assistant.online.Failure
 import com.jarvis.assistant.online.OnlineBrain
+import com.jarvis.assistant.online.OnlineFallbackPhrases
 import com.jarvis.assistant.speech.CommandSpeechError
 import com.jarvis.assistant.speech.JarvisPhrases
 import com.jarvis.assistant.speech.JarvisSpeechController
@@ -408,6 +409,11 @@ class JarvisConversationController(
             toolMessage != null -> {
                 conversationContext.addResponse(toolMessage)
                 speak(toolMessage) { listen(LISTEN_DELAY_MS, newTurn = true) }
+            }
+            // Every online provider failed AND the offline Brain has nothing usable: say so instead of "متوجه نشدم".
+            failure != null && turn.fallback is BrainResult.Unknown -> {
+                conversationContext.addResponse(OnlineFallbackPhrases.NO_AI)
+                speak(OnlineFallbackPhrases.NO_AI) { listen(LISTEN_DELAY_MS, newTurn = true) }
             }
             // Nothing was said and nothing ran: exactly what the offline Brain would have done.
             else -> handleResult(turn.fallback)

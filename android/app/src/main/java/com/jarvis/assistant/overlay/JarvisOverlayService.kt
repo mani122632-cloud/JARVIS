@@ -24,10 +24,12 @@ import com.jarvis.assistant.command.JarvisCommandProcessor
 import com.jarvis.assistant.conversation.JarvisConversationController
 import com.jarvis.assistant.memory.SharedPreferencesJarvisMemory
 import com.jarvis.assistant.online.GeminiProvider
+import com.jarvis.assistant.online.GroqProvider
 import com.jarvis.assistant.online.JarvisToolCatalog
 import com.jarvis.assistant.online.OnlineBrain
 import com.jarvis.assistant.online.OnlineNetwork
 import com.jarvis.assistant.online.OnlineProviderRegistry
+import com.jarvis.assistant.online.OnlineProviderRouter
 import com.jarvis.assistant.speech.SpeechInputFactory
 import com.jarvis.assistant.core.JarvisCoreView
 import com.jarvis.assistant.speech.JarvisSpeechController
@@ -90,11 +92,15 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
         })
         wake.preload()      // load the Vosk model in the background now (no microphone); start() reuses it
         executor = JarvisActionExecutor(this)
-        // Online Brain Stage 2: the Gemini provider (API key encrypted in the Android Keystore, entered in
-        // GeminiSetupActivity). Without a saved key isAvailable() is false, the Brain never escalates and the
-        // behaviour is exactly the offline one. Simple local commands never reach this provider.
-        if (OnlineProviderRegistry.provider == null) {
-            OnlineProviderRegistry.provider = GeminiProvider(applicationContext)
+        // Online Brain: Gemini -> Groq -> offline, through ONE router (API keys encrypted in the Android Keystore,
+        // entered in GeminiSetupActivity). The router is registered whenever the service starts and is available
+        // as soon as EITHER key exists, so a Groq-only setup works. Without any key isAvailable() is false, the Brain
+        // never escalates and the behaviour is exactly the offline one. Simple local commands never reach it.
+        if (OnlineProviderRegistry.provider !is OnlineProviderRouter) {
+            OnlineProviderRegistry.provider = OnlineProviderRouter(
+                gemini = GeminiProvider(applicationContext),
+                groq = GroqProvider(applicationContext)
+            )
         }
         online = OnlineBrain(
             provider = OnlineProviderRegistry.provider,

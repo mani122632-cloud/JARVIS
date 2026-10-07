@@ -16,7 +16,9 @@ import android.widget.TextView
  * The smallest possible UI to give JARVIS its Gemini API key: one field, Save / Test / Delete. Built in code (no
  * layout or resource files) and separate from the main screen, so the JARVIS look is untouched.
  *
- * The key goes straight into [GeminiConfigStore] (Android Keystore encryption). It is never shown again, never
+ * A second section configures Groq (the automatic fallback after Gemini): key, model, Save / Test / Delete.
+ *
+ * The key goes straight into [GeminiConfigStore] / [GroqConfigStore] (Android Keystore encryption). It is never shown again, never
  * logged, and the window is FLAG_SECURE (no screenshots / recents thumbnail of the field).
  */
 class GeminiSetupActivity : Activity() {
@@ -29,10 +31,19 @@ class GeminiSetupActivity : Activity() {
     private lateinit var testButton: Button
     private var testHandle: Cancellable? = null
 
+    private lateinit var groqConfig: GroqConfigStore
+    private lateinit var groqStatus: TextView
+    private lateinit var groqKeyField: EditText
+    private lateinit var groqModelField: EditText
+    private lateinit var groqResult: TextView
+    private lateinit var groqTestButton: Button
+    private var groqTestHandle: Cancellable? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
         config = GeminiConfigStore.get(this)
+        groqConfig = GroqConfigStore.get(this)
 
         val pad = dp(20)
         val column = LinearLayout(this).apply {
@@ -79,17 +90,60 @@ class GeminiSetupActivity : Activity() {
         result = label("", 14f).apply { setPadding(0, dp(12), 0, 0) }
         column.addView(result)
 
+        // ---- Groq (fallback after Gemini) ----
+        column.addView(label("اتصال به Groq (پشتیبان خودکار)", 22f, bold = true).apply { setPadding(0, dp(32), 0, 0) })
+        groqStatus = label("", 15f).apply { setPadding(0, dp(8), 0, dp(16)) }
+        column.addView(groqStatus)
+
+        groqKeyField = EditText(this).apply {
+            hint = "کلید API جدید (Groq Console)"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD or
+                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            setSingleLine(true)
+            setTextColor(TEXT)
+            setHintTextColor(HINT)
+            importantForAutofill = android.view.View.IMPORTANT_FOR_AUTOFILL_NO
+            gravity = Gravity.START
+        }
+        column.addView(groqKeyField)
+
+        column.addView(label("مدل Groq", 13f).apply { setPadding(0, dp(16), 0, 0) })
+        groqModelField = EditText(this).apply {
+            hint = GroqConfigStore.DEFAULT_MODEL
+            setText(groqConfig.getModel())
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            setSingleLine(true)
+            setTextColor(TEXT)
+            setHintTextColor(HINT)
+            importantForAutofill = android.view.View.IMPORTANT_FOR_AUTOFILL_NO
+            gravity = Gravity.START
+        }
+        column.addView(groqModelField)
+
+        val groqSave = Button(this).apply { text = "ذخیره Groq"; setOnClickListener { onGroqSave() } }
+        groqTestButton = Button(this).apply { text = "تست اتصال Groq"; setOnClickListener { onGroqTest() } }
+        val groqDelete = Button(this).apply { text = "حذف کلید Groq"; setOnClickListener { onGroqDelete() } }
+        column.addView(groqSave)
+        column.addView(groqTestButton)
+        column.addView(groqDelete)
+
+        groqResult = label("", 14f).apply { setPadding(0, dp(12), 0, 0) }
+        column.addView(groqResult)
+
         setContentView(ScrollView(this).apply {
             setBackgroundColor(BACKGROUND)
             isFillViewport = true
             addView(column)
         })
         refreshStatus()
+        refreshGroqStatus()
     }
 
     override fun onDestroy() {
         testHandle?.cancel()
         testHandle = null
+        groqTestHandle?.cancel()
+        groqTestHandle = null
         super.onDestroy()
     }
 
@@ -125,8 +179,8 @@ class GeminiSetupActivity : Activity() {
             return
         }
         testHandle?.cancel()
-        val provider = OnlineProviderRegistry.provider
-            ?: GeminiProvider(applicationContext).also { OnlineProviderRegistry.provider = it }
+        // Test Gemini ALONE (not the router), so a fallback to Groq can never hide a Gemini problem.
+        val provider = GeminiProvider(applicationContext)
         testButton.isEnabled = false
         result.text = "در حال تست…"
         var gotText = false
@@ -156,6 +210,74 @@ class GeminiSetupActivity : Activity() {
 
     private fun refreshStatus() {
         status.text = if (config.hasApiKey()) "کلید ذخیره شده است. مدل: ${config.getModel()}" else "کلیدی ذخیره نشده است."
+    }
+
+    // ---- Groq ------------------------------------------------------------------------------------
+
+    private fun onGroqSave() {
+        val newKey = groqKeyField.text.toString().trim()
+        if (!groqConfig.setModel(groqModelField.text.toString())) {
+            groqResult.text = "نام مدل نامعتبر است."
+            return
+        }
+        if (newKey.isNotEmpty()) {
+            if (!groqConfig.saveApiKey(newKey)) {
+                groqResult.text = "کلید ذخیره نشد؛ کلید نامعتبر است یا ذخیره‌ی امن در این دستگاه ممکن نیست."
+                return
+            }
+            groqKeyField.setText("")
+        }
+        groqModelField.setText(groqConfig.getModel())
+        groqResult.text = "ذخیره شد."
+        refreshGroqStatus()
+    }
+
+    private fun onGroqDelete() {
+        groqTestHandle?.cancel()
+        groqConfig.clearApiKey()
+        groqKeyField.setText("")
+        groqResult.text = "کلید Groq حذف شد."
+        refreshGroqStatus()
+    }
+
+    private fun onGroqTest() {
+        if (!groqConfig.hasApiKey()) {
+            groqResult.text = "ابتدا یک کلید Groq ذخیره کن."
+            return
+        }
+        groqTestHandle?.cancel()
+        // Groq ALONE (not the router): the test must show Groq's own state.
+        val provider = GroqProvider(applicationContext)
+        groqTestButton.isEnabled = false
+        groqResult.text = "در حال تست…"
+        var gotText = false
+        val request = ChatRequest(
+            systemPrompt = "Reply with the single word OK.",
+            messages = listOf(ChatMessage(ChatRole.USER, "Say OK.")),
+            tools = emptyList()
+        )
+        groqTestHandle = provider.stream(request, StreamListener { event ->
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                when (event) {
+                    is StreamEvent.TextDelta -> { gotText = true }
+                    is StreamEvent.ToolCallRequest -> Unit
+                    is StreamEvent.Finished -> {
+                        groqResult.text = if (gotText) "اتصال Groq موفق بود." else "پاسخی دریافت نشد."
+                        groqTestButton.isEnabled = true
+                    }
+                    is StreamEvent.Error -> {
+                        groqResult.text = "خطا: ${event.kind}${event.detail?.let { " ($it)" } ?: ""}"
+                        groqTestButton.isEnabled = true
+                    }
+                }
+            }
+        })
+    }
+
+    private fun refreshGroqStatus() {
+        groqStatus.text =
+            if (groqConfig.hasApiKey()) "کلید ذخیره شده است. مدل: ${groqConfig.getModel()}" else "کلیدی ذخیره نشده است."
     }
 
     private fun label(text: String, sizeSp: Float, bold: Boolean = false) = TextView(this).apply {
