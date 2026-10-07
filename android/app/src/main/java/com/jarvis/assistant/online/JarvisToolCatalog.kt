@@ -105,7 +105,9 @@ class JarvisToolCatalog(
         spec("go_home", "Go to the phone's home screen.", obj()),
         spec("open_maps", "Open the Google Maps app.", obj()),
         spec("web_answer", "Search the live internet for up-to-date facts you cannot know (today's gold / coin / currency / crypto prices, news, weather, sports results, current events) and get real result snippets. Answer in Persian only from the returned results. Not for phone actions.",
-            obj("query" to strProp("Short search query, Persian or English, e.g. \"قیمت طلا امروز\"", maxLen = 200), required = listOf("query")))
+            obj("query" to strProp("Short search query, Persian or English, e.g. \"قیمت طلا امروز\"", maxLen = 200), required = listOf("query"))),
+        spec("browser_search", "Open Chrome on a real Google search page. Only when the user explicitly asks to search / google something (سرچ کن، جستجو کن). Shows results in the browser; it does NOT return an answer to you.",
+            obj("query" to strProp("What to search for, Persian or English", maxLen = 200), required = listOf("query")))
     )
 
     /** Validates [argumentsJson] for tool [name]; nothing is executed here. */
@@ -190,6 +192,11 @@ class JarvisToolCatalog(
                     allowOnly(args, "query")
                     val q = str(args, "query", 200, required = true)!!
                     ready(name, JarvisAction.ToolCall(WEB_ANSWER, mapOf("query" to q)), "q=${q.lowercase()}", WEB_TIMEOUT_MS)
+                }
+                "browser_search" -> {
+                    allowOnly(args, "query")
+                    val q = str(args, "query", 200, required = true)!!
+                    ready(name, JarvisAction.ToolCall("browser_search", mapOf("query" to q)), "q=${q.lowercase()}", DEFAULT_TIMEOUT_MS)
                 }
                 else -> PreparedTool.Rejected(ToolResult.error(ToolErrorCode.UNSUPPORTED, "unknown tool"))
             }
