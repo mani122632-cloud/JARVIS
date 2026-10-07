@@ -26,6 +26,7 @@
         <package android:name="com.instagram.android" />
         <package android:name="com.android.chrome" />
         <package android:name="com.google.android.youtube" />
+        <package android:name="com.google.android.apps.maps" />
         <intent><action android:name="android.speech.RecognitionService" /></intent>
     </queries>
 

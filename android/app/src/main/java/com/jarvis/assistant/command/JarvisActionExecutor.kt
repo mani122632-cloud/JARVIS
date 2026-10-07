@@ -184,7 +184,7 @@ class JarvisActionExecutor(
      */
     private fun goBack(): Outcome {
         Log.i(TAG, "GoBack: closing the assistant overlay (Android offers no global Back to normal apps)")
-        return Outcome(true)
+        return Outcome(false, "اندروید به برنامه‌ها اجازه‌ی زدن دکمه‌ی بازگشت نمی‌دهد؛ فقط پنجره‌ی جارویس بسته شد.")
     }
 
     // ---- flashlight -----------------------------------------------------------------------------

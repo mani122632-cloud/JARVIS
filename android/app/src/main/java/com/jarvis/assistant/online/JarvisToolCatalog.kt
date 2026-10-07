@@ -49,7 +49,7 @@ sealed class PreparedTool {
 
 /**
  * The tools the online model may call: alarm, timer, call_contact, open_app, flashlight, set_volume,
- * open_settings, go_home. Each has a name, a description, a JSON Schema, argument validation, a conversion to a
+ * open_settings, go_home, open_maps. Each has a name, a description, a JSON Schema, argument validation, a conversion to a
  * [JarvisAction] and a REAL execution through the existing [JarvisActionExecutor] (no executor of its own).
  *
  * Threading: [prepare] is pure (any thread). [execute] is called from a background thread; the executor runs on
@@ -95,7 +95,8 @@ class JarvisToolCatalog(
             )),
         spec("open_settings", "Open the system settings screen (general, wifi or bluetooth).",
             obj("section" to enumProp("general (default), wifi or bluetooth", listOf("general", "wifi", "bluetooth")))),
-        spec("go_home", "Go to the phone's home screen.", obj())
+        spec("go_home", "Go to the phone's home screen.", obj()),
+        spec("open_maps", "Open the Google Maps app.", obj())
     )
 
     /** Validates [argumentsJson] for tool [name]; nothing is executed here. */
@@ -171,6 +172,10 @@ class JarvisToolCatalog(
                 "go_home" -> {
                     allowOnly(args)
                     ready(name, JarvisAction.GoHome, "home", DEFAULT_TIMEOUT_MS)
+                }
+                "open_maps" -> {
+                    allowOnly(args)
+                    ready(name, JarvisAction.OpenApp("maps", "گوگل مپ", listOf("com.google.android.apps.maps")), "maps", DEFAULT_TIMEOUT_MS)
                 }
                 else -> PreparedTool.Rejected(ToolResult.error(ToolErrorCode.UNSUPPORTED, "unknown tool"))
             }

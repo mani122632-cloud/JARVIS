@@ -61,6 +61,7 @@ class CommandIntentParser(
         this::matchVolume,
         this::matchScheduling,
         this::matchSettings,
+        this::matchMaps,
         this::matchApp,
         this::matchAppByName
     )
@@ -294,6 +295,22 @@ class CommandIntentParser(
         return Candidate(JarvisAction.OpenSettings, confidence, NluIntent.OPEN_SETTINGS)
     }
 
+    // ---- google maps --------------------------------------------------------------------------------
+
+    /** "نقشه رو باز کن" / "گوگل مپ" / "مپس" -> opens Google Maps (a plain OpenApp, executed for real by the executor). */
+    private fun matchMaps(inp: Input): Candidate? {
+        val t = inp.tokens
+        if (t.any { it in NEGATIONS || it in CLOSE_WORDS }) return null
+        val named = t.any { it in MAPS_WORDS } ||
+            inp.compact.contains(fold("گوگلمپ")) || inp.compact.contains(fold("گوگلمیپ")) || inp.compact.contains("googlemaps")
+        if (!named) return null
+        val rest = t.filter { it !in NOISE && it !in MAPS_WORDS && it !in MAPS_FILLER && !isPartOf(it, "گوگلمپس", "googlemaps") }
+        if (rest.isNotEmpty()) return null
+        val verb = t.any { it in OPEN_VERBS || it in MAPS_FILLER - setOf("گوگل", "google") }
+        val action = JarvisAction.OpenApp(MAPS_ID, "گوگل مپ", listOf(MAPS_PACKAGE))
+        return Candidate(action, if (verb) 0.97f else 0.88f, NluIntent.OPEN_APP, mapOf(NluSlot.APP_ID to MAPS_ID, NluSlot.APP_NAME to "گوگل مپ"))
+    }
+
     // ---- apps ---------------------------------------------------------------------------------------
 
     private fun matchApp(inp: Input): Candidate? {
@@ -437,6 +454,11 @@ class CommandIntentParser(
         val ALARM_WORDS = setOf("آلارم", "الارم", "آلارام", "الارام", "alarm", "بیدارم")
 
         val SETTINGS_WORDS = setOf("تنظیمات", "settings", "setting")
+
+        const val MAPS_ID = "maps"
+        const val MAPS_PACKAGE = "com.google.android.apps.maps"
+        val MAPS_WORDS = setOf("مپ", "مپس", "مپز", "مپی", "maps", "map", "نقشه", "مسیریاب")
+        val MAPS_FILLER = setOf("گوگل", "google", "نشون", "نشان", "بده", "نمایش", "بیار", "بیاور")
 
         /** Every keyword the rules compare against; the canonical spellings of the folded lexicon. */
         val KNOWN_WORDS: Set<String> = LinkedHashSet<String>().also { all ->
