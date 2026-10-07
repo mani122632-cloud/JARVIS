@@ -54,7 +54,7 @@ class JarvisActionExecutor(
 
     private val appResolver = InstalledAppResolver(app)
 
-    private val registry = ToolRegistry(tools ?: listOf(AlarmTool(app), TimerTool(app), CallTool(app), SmsTool(app)))
+    private val registry = ToolRegistry(tools ?: listOf(AlarmTool(app), TimerTool(app), CallTool(app), SmsTool(app), MediaTool(app)))
 
     /** Adds (or replaces, by name) a tool, e.g. a future call / SMS / contacts / search tool. */
     fun register(tool: JarvisTool) = registry.register(tool)

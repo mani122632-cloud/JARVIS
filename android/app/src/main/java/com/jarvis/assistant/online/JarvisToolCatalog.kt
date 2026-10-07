@@ -106,6 +106,12 @@ class JarvisToolCatalog(
         spec("open_maps", "Open the Google Maps app.", obj()),
         spec("web_answer", "Search the live internet for up-to-date facts you cannot know (today's gold / coin / currency / crypto prices, news, weather, sports results, current events) and get real result snippets. Answer in Persian only from the returned results. Not for phone actions.",
             obj("query" to strProp("Short search query, Persian or English, e.g. \"قیمت طلا امروز\"", maxLen = 200), required = listOf("query"))),
+        spec("play_media", "Really play music or open a video / YouTube on the phone through the installed apps. kind=music: play a song by name; kind=video: open a video by name on YouTube; kind=youtube: just open YouTube (no query).",
+            obj(
+                "kind" to enumProp("music, video or youtube", listOf("music", "video", "youtube")),
+                "query" to strProp("Song or video name as spoken; omit for kind=youtube", maxLen = 200),
+                required = listOf("kind")
+            )),
         spec("browser_search", "Open Chrome on a real Google search page. Only when the user explicitly asks to search / google something (سرچ کن، جستجو کن). Shows results in the browser; it does NOT return an answer to you.",
             obj("query" to strProp("What to search for, Persian or English", maxLen = 200), required = listOf("query")))
     )
@@ -192,6 +198,14 @@ class JarvisToolCatalog(
                     allowOnly(args, "query")
                     val q = str(args, "query", 200, required = true)!!
                     ready(name, JarvisAction.ToolCall(WEB_ANSWER, mapOf("query" to q)), "q=${q.lowercase()}", WEB_TIMEOUT_MS)
+                }
+                "play_media" -> {
+                    allowOnly(args, "kind", "query")
+                    val kind = str(args, "kind", 10, required = true)!!
+                    if (kind != "music" && kind != "video" && kind != "youtube") return bad("kind must be music, video or youtube")
+                    val q = str(args, "query", 200)
+                    if (kind != "youtube" && q == null) return bad("query is required for music and video")
+                    ready(name, JarvisAction.ToolCall("play_media", mapOf("kind" to kind, "query" to (q ?: ""))), "k=$kind|q=${q?.lowercase().orEmpty()}", DEFAULT_TIMEOUT_MS)
                 }
                 "browser_search" -> {
                     allowOnly(args, "query")
