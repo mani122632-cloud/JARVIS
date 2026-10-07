@@ -13,6 +13,9 @@ sealed interface VolumeChange {
 /** Part of the day a spoken hour belongs to ("هفت صبح", "ده شب"). */
 enum class DayPeriod { AM, NOON, AFTERNOON, NIGHT }
 
+/** Management of the alarms JARVIS itself created: show, switch off (kept) or delete (removed). */
+enum class AlarmOp { LIST, DISABLE, DELETE }
+
 /** What JARVIS still has to ask the user before an Alarm / Timer can be created. */
 enum class SlotTarget { ALARM, TIMER }
 
@@ -48,6 +51,22 @@ sealed class JarvisAction {
      * has already passed), 1 = explicitly tomorrow ("فردا ساعت ۷").
      */
     data class CreateAlarm(val hour: Int, val minute: Int, val dayOffset: Int = 0) : JarvisAction() {
+        override val speaksOwnResult: Boolean get() = true
+    }
+
+    /**
+     * Show / switch off / delete the alarms JARVIS created ("آلارم ساعت ۷ رو خاموش کن"). [all] = every alarm.
+     * Otherwise [hour] 0..23 + [minute]; [exact] false means the hour was spoken without a part of the day
+     * ("ساعت ۷"), so 07:xx and 19:xx both match and an ambiguity is reported instead of guessing.
+     * [hour] null (and not [all]) = the user did not say which alarm.
+     */
+    data class ManageAlarm(
+        val op: AlarmOp,
+        val hour: Int? = null,
+        val minute: Int = 0,
+        val exact: Boolean = true,
+        val all: Boolean = false
+    ) : JarvisAction() {
         override val speaksOwnResult: Boolean get() = true
     }
 

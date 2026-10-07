@@ -117,7 +117,7 @@ class JarvisActionExecutor(
         JarvisAction.OpenBluetoothSettings -> startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS), "نتوانستم تنظیمات بلوتوث را باز کنم.")
         is JarvisAction.ToggleFlashlight -> flashlight(action.mode)
         is JarvisAction.SetVolume -> setVolume(action.change)
-        is JarvisAction.CreateAlarm, is JarvisAction.CreateTimer, is JarvisAction.ToolCall ->
+        is JarvisAction.CreateAlarm, is JarvisAction.ManageAlarm, is JarvisAction.CreateTimer, is JarvisAction.ToolCall ->
             registry.execute(action) ?: Outcome(false, "این کار هنوز پشتیبانی نمی‌شود.")
         // Never executed: the Brain turns it into a question first. Safe fallback if it ever arrives here.
         is JarvisAction.NeedsInfo -> Outcome(

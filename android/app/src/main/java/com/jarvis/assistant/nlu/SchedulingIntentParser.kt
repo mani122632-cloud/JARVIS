@@ -1,5 +1,6 @@
 package com.jarvis.assistant.nlu
 
+import com.jarvis.assistant.command.AlarmOp
 import com.jarvis.assistant.command.JarvisAction
 import com.jarvis.assistant.command.SlotTarget
 
@@ -33,6 +34,8 @@ class SchedulingIntentParser(private val time: PersianTimeParser) {
         val t = time.prepare(rawTokens)
         if (t.isEmpty()) return null
         val joined = t.joinToString(" ")
+
+        matchManage(t)?.let { return it }
 
         val timerNoun = t.any { it in TIMER_NOUNS } || joined.contains("زمان سنج") || joined.contains("شمارش معکوس")
         val alarmNoun = t.any { it in ALARM_NOUNS } || (t.contains("زنگ") && t.any { it in RING_SET_VERBS })
@@ -86,6 +89,41 @@ class SchedulingIntentParser(private val time: PersianTimeParser) {
         return Match(JarvisAction.NeedsInfo(SlotTarget.ALARM, dayOffset ?: 0, period, preferMorning), 0.9f)
     }
 
+    /**
+     * Managing the alarms JARVIS created: "آلارم‌هام رو نشون بده" (LIST), "آلارم ساعت ۷ رو خاموش کن" (DISABLE),
+     * "آلارم ساعت ۷ رو حذف کن" (DELETE), "تمام آلارم‌ها رو خاموش کن" / "همه آلارم‌ها رو حذف کن" (all).
+     * Needs the alarm noun (also in plural: آلارم‌ها / آلارمهام) plus exactly one manage verb, so creating an alarm
+     * and "آلارم باز کن" (open the clock) are unchanged.
+     */
+    private fun matchManage(t: List<String>): Match? {
+        if (t.any { it in TIMER_NOUNS }) return null
+        val noun = t.any { tok ->
+            tok in ALARM_NOUNS || ALARM_NOUNS.any { n -> tok.startsWith(n) && tok.length <= n.length + 3 }
+        }
+        if (!noun) return null
+        val delete = t.any { it in DELETE_VERBS }
+        val disable = t.any { it in DISABLE_VERBS }
+        val list = t.any { it in LIST_VERBS }
+        if (listOf(delete, disable, list).count { it } != 1) return null
+        val op = when {
+            delete -> AlarmOp.DELETE
+            disable -> AlarmOp.DISABLE
+            else -> AlarmOp.LIST
+        }
+        if (op == AlarmOp.LIST) return Match(JarvisAction.ManageAlarm(AlarmOp.LIST, all = true), 0.95f)
+
+        if (t.any { it in ALL_WORDS }) return Match(JarvisAction.ManageAlarm(op, all = true), 0.95f)
+
+        val clock = time.parseClock(t, bare = false, defaultPeriod = null, preferMorning = false)
+            ?: time.parseClock(t, bare = true, defaultPeriod = null, preferMorning = false)
+            ?: return Match(JarvisAction.ManageAlarm(op), 0.9f)          // "آلارم رو خاموش کن": which one?
+        // "ساعت ۷" alone could be 07:00 or 19:00; with a part of the day, 24h digits or "7:30" it is exact.
+        val exact = time.period(t) != null || t.any { tok ->
+            COLON_TIME.matches(tok) || (tok.length <= 2 && tok.toIntOrNull()?.let { it == 0 || it in 13..24 } == true)
+        }
+        return Match(JarvisAction.ManageAlarm(op, clock.hour, clock.minute, exact), 0.95f)
+    }
+
     private fun isWakeWord(tok: String): Boolean =
         tok.startsWith("بیدار") && tok != "بیداری" && tok != "بیدارید" && tok != "بیدارین"
 
@@ -97,6 +135,11 @@ class SchedulingIntentParser(private val time: PersianTimeParser) {
         val RING_SET_VERBS = setOf("بذار", "بزار", "بگذار", "تنظیم")
         /** The request part of "بیدارم کن / بیدار شم / بیدارم کنی". */
         val WAKE_MARKERS = setOf("کن", "کنی", "بکن", "کنید", "شم", "بشم", "بشیم", "بشو", "بنداز", "بده", "میخوام", "میخواهم")
+        val DELETE_VERBS = setOf("حذف", "پاک", "دیلیت", "delete", "کنسل", "لغو", "cancel")
+        val DISABLE_VERBS = setOf("خاموش", "غیرفعال", "off")
+        val LIST_VERBS = setOf("نشون", "نشان", "لیست", "ببینم", "بگو", "بخون")
+        val ALL_WORDS = setOf("همه", "تمام", "تمامی", "کل", "همهی")
+        val COLON_TIME = Regex("\\d{1,2}:\\d{2}")
         val REMIND_WORDS = setOf("یادم", "یادآوری", "یادآور")
         val NOTIFY_WORDS = setOf("خبرم", "صدام", "اطلاعم", "هشدار")
         val GIVE_VERBS = setOf("بده", "بدی", "بزن")
