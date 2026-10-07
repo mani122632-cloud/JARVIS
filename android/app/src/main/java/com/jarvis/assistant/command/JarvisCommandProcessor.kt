@@ -18,13 +18,17 @@ class JarvisCommandProcessor(private val parser: CommandIntentParser = CommandIn
         val action: JarvisAction?,
         /** Said before the action runs ("حتماً.") or instead of it ("متوجه نشدم."). Empty: the action speaks for itself. */
         val responseText: String,
-        val confidence: Float
+        val confidence: Float,
+        /** True: only a FINAL recognition result may run it (SMS text must be complete). */
+        val deferToFinal: Boolean = false
     ) {
         /** Sure enough to run from a partial result, before the recognizer has finished. */
-        val isHighConfidence: Boolean get() = handled && confidence >= CommandConfidence.FAST_PATH
+        val isHighConfidence: Boolean get() = handled && !deferToFinal && confidence >= CommandConfidence.FAST_PATH
     }
 
     fun process(text: String): Result {
+        // SMS first (fast path, no LLM). Never from a partial result: a half-heard message must not be sent.
+        SmsCommandParser.parse(text)?.let { return Result(true, it, "", 1f, deferToFinal = true) }
         val parsed = parser.parse(text)
         val ok = parsed.action !is JarvisAction.Unknown && parsed.confidence >= CommandConfidence.THRESHOLD
         // Alarm / Timer / "needs info" speak their own result or question, so no "حتماً." in front of them.

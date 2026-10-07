@@ -77,6 +77,12 @@ class JarvisToolCatalog(
             obj("seconds" to intProp("Duration in seconds, 1-86400", 1, 86_400), required = listOf("seconds"))),
         spec("call_contact", "Call a saved contact by name.",
             obj("name" to strProp("Contact name as spoken", maxLen = 60), required = listOf("name"))),
+        spec("send_sms", "Send a real SMS to a saved contact by name. Only call when the message text is known.",
+            obj(
+                "name" to strProp("Contact name as spoken", maxLen = 60),
+                "text" to strProp("Exact message text to send", maxLen = 500),
+                required = listOf("name", "text")
+            )),
         spec("open_app", "Open ANY app installed on the phone by its name, Persian or English (e.g. تلگرام, Telegram, گالری).",
             obj("app" to strProp("App name as spoken, Persian or English", maxLen = 60), required = listOf("app"))),
         spec("flashlight", "Turn the flashlight on, off or toggle it.",
@@ -117,6 +123,12 @@ class JarvisToolCatalog(
                     allowOnly(args, "name")
                     val n = str(args, "name", 60, required = true)!!
                     ready(name, JarvisAction.ToolCall("call_contact", mapOf("name" to n)), "n=$n", CALL_TIMEOUT_MS)
+                }
+                "send_sms" -> {
+                    allowOnly(args, "name", "text")
+                    val n = str(args, "name", 60, required = true)!!
+                    val t = str(args, "text", 500, required = true)!!
+                    ready(name, JarvisAction.ToolCall("send_sms", mapOf("name" to n, "text" to t)), "n=$n|t=$t", SMS_TIMEOUT_MS)
                 }
                 "open_app" -> {
                     allowOnly(args, "app")
@@ -233,6 +245,7 @@ class JarvisToolCatalog(
             "چند برنامه" in m -> ToolErrorCode.AMBIGUOUS
             "اجازه" in m -> ToolErrorCode.PERMISSION_DENIED
             "چند مخاطب" in m -> ToolErrorCode.AMBIGUOUS
+            "متن پیام" in m -> ToolErrorCode.INVALID_ARGS
             "مخاطبی" in m || "پیدا نشد" in m || "پیدا نکردم" in m -> ToolErrorCode.NOT_FOUND
             "درست متوجه نشدم" in m || "۲۴ ساعت" in m || "نام مخاطب را متوجه" in m -> ToolErrorCode.INVALID_ARGS
             else -> ToolErrorCode.UNSUPPORTED
@@ -303,6 +316,8 @@ class JarvisToolCatalog(
         const val DEFAULT_TIMEOUT_MS = 4_000L
         /** Mandatory timeout of call_contact (contact lookup is blocking work on a background thread). */
         const val CALL_TIMEOUT_MS = 8_000L
+        /** send_sms: contact lookup + radio confirmation (SmsTool itself gives up after 15 s). */
+        const val SMS_TIMEOUT_MS = 20_000L
         private const val TIMEOUT_MESSAGE = "نتیجه‌ی این کار به‌موقع مشخص نشد؛ نمی‌دانم انجام شد یا نه."
     }
 }
