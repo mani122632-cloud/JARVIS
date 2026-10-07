@@ -12,6 +12,7 @@ import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
 import java.util.concurrent.Executor
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
@@ -49,7 +50,7 @@ sealed class PreparedTool {
 
 /**
  * The tools the online model may call: alarm, timer, call_contact, open_app, flashlight, set_volume,
- * open_settings, go_home, open_maps. Each has a name, a description, a JSON Schema, argument validation, a conversion to a
+ * open_settings, go_home, open_maps, web_answer (real internet lookup, Stage 3B-1). Each has a name, a description, a JSON Schema, argument validation, a conversion to a
  * [JarvisAction] and a REAL execution through the existing [JarvisActionExecutor] (no executor of its own).
  *
  * Threading: [prepare] is pure (any thread). [execute] is called from a background thread; the executor runs on
@@ -64,6 +65,12 @@ class JarvisToolCatalog(
     private val timer: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { r ->
         Thread(r, "jarvis-tool-timeout").apply { isDaemon = true }
     }
+
+    /** Web Answer downloads run here (never on the main thread, never through the phone executor). */
+    private val webPool: ExecutorService = Executors.newFixedThreadPool(2) { r ->
+        Thread(r, "jarvis-web-answer").apply { isDaemon = true }
+    }
+    private val webClient = WebAnswerClient()
 
     val specs: List<ToolSpec> = listOf(
         spec("alarm", "Set a real alarm at a clock time (next occurrence, within 24 hours).",
@@ -96,7 +103,9 @@ class JarvisToolCatalog(
         spec("open_settings", "Open the system settings screen (general, wifi or bluetooth).",
             obj("section" to enumProp("general (default), wifi or bluetooth", listOf("general", "wifi", "bluetooth")))),
         spec("go_home", "Go to the phone's home screen.", obj()),
-        spec("open_maps", "Open the Google Maps app.", obj())
+        spec("open_maps", "Open the Google Maps app.", obj()),
+        spec("web_answer", "Search the live internet for up-to-date facts you cannot know (today's gold / coin / currency / crypto prices, news, weather, sports results, current events) and get real result snippets. Answer in Persian only from the returned results. Not for phone actions.",
+            obj("query" to strProp("Short search query, Persian or English, e.g. \"قیمت طلا امروز\"", maxLen = 200), required = listOf("query")))
     )
 
     /** Validates [argumentsJson] for tool [name]; nothing is executed here. */
@@ -177,6 +186,11 @@ class JarvisToolCatalog(
                     allowOnly(args)
                     ready(name, JarvisAction.OpenApp("maps", "گوگل مپ", listOf("com.google.android.apps.maps")), "maps", DEFAULT_TIMEOUT_MS)
                 }
+                WEB_ANSWER -> {
+                    allowOnly(args, "query")
+                    val q = str(args, "query", 200, required = true)!!
+                    ready(name, JarvisAction.ToolCall(WEB_ANSWER, mapOf("query" to q)), "q=${q.lowercase()}", WEB_TIMEOUT_MS)
+                }
                 else -> PreparedTool.Rejected(ToolResult.error(ToolErrorCode.UNSUPPORTED, "unknown tool"))
             }
         } catch (e: ArgException) {
@@ -195,6 +209,21 @@ class JarvisToolCatalog(
             handle.timeout = timer.schedule({
                 handle.deliver(ToolResult.error(ToolErrorCode.TIMEOUT, TIMEOUT_MESSAGE))
             }, tool.timeoutMs, TimeUnit.MILLISECONDS)
+            if (tool.name == WEB_ANSWER) {
+                val query = (tool.action as? JarvisAction.ToolCall)?.args?.get("query").orEmpty()
+                val webCall = WebAnswerClient.Call()
+                handle.webCall = webCall
+                webPool.execute {
+                    val result = try {
+                        webClient.answer(query, webCall)
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "Web answer failed")
+                        ToolResult.error(ToolErrorCode.UNSUPPORTED, "دریافت اطلاعات از اینترنت با خطا روبه‌رو شد.")
+                    }
+                    handle.deliver(result)
+                }
+                return handle
+            }
             val posted = main.post { handle.runOnMain(tool.action) }
             if (!posted) handle.deliver(ToolResult.error(ToolErrorCode.UNSUPPORTED, "main thread unavailable"))
         } catch (e: RuntimeException) {
@@ -203,7 +232,7 @@ class JarvisToolCatalog(
         return handle
     }
 
-    fun release() { timer.shutdownNow() }
+    fun release() { timer.shutdownNow(); webPool.shutdownNow() }
 
     private inner class Execution(
         private val deliverOn: Executor,
@@ -212,9 +241,10 @@ class JarvisToolCatalog(
         private val cancelled = AtomicBoolean(false)
         private val done = AtomicBoolean(false)
         @Volatile var timeout: java.util.concurrent.ScheduledFuture<*>? = null
+        @Volatile var webCall: Cancellable? = null
 
         override val isCancelled: Boolean get() = cancelled.get()
-        override fun cancel() { cancelled.set(true); timeout?.cancel(false) }
+        override fun cancel() { cancelled.set(true); timeout?.cancel(false); webCall?.cancel() }
 
         /** Main thread. */
         fun runOnMain(action: JarvisAction) {
@@ -234,6 +264,7 @@ class JarvisToolCatalog(
         fun deliver(result: ToolResult) {
             if (cancelled.get() || !done.compareAndSet(false, true)) return
             timeout?.cancel(false)
+            webCall?.cancel()                                   // a timed-out download must not keep running
             try {
                 deliverOn.execute { if (!cancelled.get()) onResult(result) }
             } catch (e: RuntimeException) { /* executor shut down */ }
@@ -323,6 +354,9 @@ class JarvisToolCatalog(
         const val CALL_TIMEOUT_MS = 8_000L
         /** send_sms: contact lookup + radio confirmation (SmsTool itself gives up after 15 s). */
         const val SMS_TIMEOUT_MS = 20_000L
+        const val WEB_ANSWER = "web_answer"
+        /** web_answer: two real downloads (search + news), each with its own connect / read timeout. */
+        const val WEB_TIMEOUT_MS = 25_000L
         private const val TIMEOUT_MESSAGE = "نتیجه‌ی این کار به‌موقع مشخص نشد؛ نمی‌دانم انجام شد یا نه."
     }
 }

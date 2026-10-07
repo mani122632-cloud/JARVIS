@@ -248,7 +248,8 @@ class OnlineBrain(
 
     private fun record(turn: Turn, call: ToolCallRequest, result: ToolResult) {
         turn.messages += ChatMessage(ChatRole.TOOL, result.toJson(), toolCallId = call.id)
-        turn.lastToolMessage = result.message
+        // Raw web snippets are model input, never something to speak if a later round fails; a web ERROR is spoken.
+        if (!(call.name == "web_answer" && result.ok)) turn.lastToolMessage = result.message
     }
 
     // ---- end of a turn -------------------------------------------------------------------------
@@ -359,6 +360,8 @@ class OnlineBrain(
             "پاسخ‌ها کوتاه و محاوره‌ای باشند (۱ تا ۲ جمله) و فقط متن ساده، بدون مارک‌داون، فهرست و ایموجی، چون با صدا خوانده می‌شوند. " +
             "برای کارهای روی گوشی (آلارم، تایمر، تماس، باز کردن برنامه، چراغ‌قوه، صدا، تنظیمات، صفحه اصلی) فقط از ابزارها استفاده کن. " +
             "فقط اگر نتیجه‌ی ابزار ok:true بود بگو کار انجام شد؛ اگر ok:false بود دلیلش را کوتاه بگو و هرگز ادعای موفقیت نکن. " +
+            "برای اطلاعات روز و آنلاین (قیمت طلا، سکه، دلار و ارز، رمزارز، خبر، آب‌وهوا، نتیجه‌ی ورزشی، رویدادهای جاری) حتماً ابزار web_answer را صدا بزن و فقط بر پایه‌ی نتیجه‌اش به فارسی کوتاه پاسخ بده؛ عدد را از خودت نساز و در صورت لزوم منبع یا زمان را بگو؛ اگر نتیجه کافی یا هم‌خوان نبود صادقانه بگو. " +
+            "اگر web_answer خطا داد، صریح بگو اطلاعات آنلاین دریافت نشد و پاسخ حدسی نده. " +
             "اگر پارامتر لازم ابزار را نمی‌دانی از کاربر بپرس. چیزی را از خودت نساز؛ اگر نمی‌دانی، صادقانه بگو."
     }
 }
