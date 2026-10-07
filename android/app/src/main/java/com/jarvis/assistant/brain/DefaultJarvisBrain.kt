@@ -4,7 +4,10 @@ import android.util.Log
 import com.jarvis.assistant.command.JarvisAction
 import com.jarvis.assistant.command.JarvisCommandProcessor
 import com.jarvis.assistant.command.SlotTarget
+import com.jarvis.assistant.command.MediaCommandParser
+import com.jarvis.assistant.command.MediaTool
 import com.jarvis.assistant.conversation.ConversationContext
+import com.jarvis.assistant.conversation.MediaStage
 import com.jarvis.assistant.conversation.PendingIntent
 import com.jarvis.assistant.memory.JarvisMemory
 import com.jarvis.assistant.memory.MemoryException
@@ -70,6 +73,9 @@ class DefaultJarvisBrain(
             }
         }
 
+        // 0b. The song dialog is open: the utterance answers it (or cancels it).
+        if (ctx != null && ctx.mediaStage != null) handleMediaAnswer(text, ctx)?.let { return it }
+
         // 1. Explicit memory commands.
         MemoryCommandParser.parse(text)?.let { return handleMemory(it) }
 
@@ -95,6 +101,14 @@ class DefaultJarvisBrain(
         val action = result.action
         val command: JarvisAction? =
             if (result.handled && action != null && action !is JarvisAction.Unknown) action else null
+        // "آهنگ رو پخش کن" without a name: ask the language first, then the name (needs a session).
+        if (ctx != null && MediaCommandParser.isNamelessMusic(command)) {
+            ctx.pending = null
+            ctx.mediaStage = MediaStage.ASK_LANGUAGE
+            ctx.mediaLanguage = null
+            ctx.mediaAttempts = 0
+            return BrainResult.Clarify(ASK_SONG_LANGUAGE)
+        }
         if (command != null && command !is JarvisAction.DismissAssistant && command !is JarvisAction.NeedsInfo) {
             return BrainResult.Command(command, result.responseText, result.confidence)
         }
@@ -119,6 +133,67 @@ class DefaultJarvisBrain(
 
         // 6.
         return BrainResult.Unknown()
+    }
+
+    private fun clearMedia(ctx: ConversationContext) {
+        ctx.mediaStage = null
+        ctx.mediaLanguage = null
+        ctx.mediaAttempts = 0
+    }
+
+    /**
+     * Answer to the open song question. Returns null only when the utterance is a different, complete request
+     * (the dialog is then dropped and the normal order continues).
+     */
+    private fun handleMediaAnswer(text: String, ctx: ConversationContext): BrainResult? {
+        val stage = ctx.mediaStage ?: return null
+        val ending = EndConversationDetector.detect(text)
+        if (isCancel(text) && ending == null) {
+            clearMedia(ctx)
+            return BrainResult.Conversation(JarvisPhrases.CANCELLED)
+        }
+        if (ending != null) { clearMedia(ctx); return null }
+        return when (stage) {
+            MediaStage.ASK_LANGUAGE -> {
+                val lang = songLanguage(text)
+                if (lang != null) {
+                    ctx.mediaLanguage = lang
+                    ctx.mediaStage = MediaStage.ASK_NAME
+                    ctx.mediaAttempts = 0
+                    return BrainResult.Clarify(ASK_SONG_NAME)
+                }
+                if (isNewRequest(text)) { clearMedia(ctx); return null }
+                if (ctx.mediaAttempts >= MAX_RETRIES) {
+                    clearMedia(ctx)
+                    return BrainResult.Conversation(JarvisPhrases.NOT_UNDERSTOOD)
+                }
+                ctx.mediaAttempts++
+                BrainResult.Clarify(ASK_SONG_LANGUAGE)
+            }
+            MediaStage.ASK_NAME -> {
+                val name = PersianNormalizer.tokens(text)
+                    .filter { it !in SONG_FILLERS }.joinToString(" ").trim()
+                if (name.isEmpty()) {
+                    if (ctx.mediaAttempts >= MAX_RETRIES) {
+                        clearMedia(ctx)
+                        return BrainResult.Conversation(JarvisPhrases.NOT_UNDERSTOOD)
+                    }
+                    ctx.mediaAttempts++
+                    return BrainResult.Clarify(ASK_SONG_NAME)
+                }
+                clearMedia(ctx)
+                val action = JarvisAction.ToolCall(MediaTool.NAME, mapOf("kind" to MediaTool.KIND_MUSIC, "query" to name))
+                BrainResult.Command(action, "", ANSWER_CONFIDENCE)
+            }
+        }
+    }
+
+    /** "fa" / "en" / null. */
+    private fun songLanguage(text: String): String? {
+        val t = PersianNormalizer.tokens(text)
+        val fa = t.any { it.startsWith("فارسی") || it.startsWith("پارسی") || it == "farsi" || it == "persian" }
+        val en = t.any { it.startsWith("انگلیسی") || it.startsWith("اینگلیسی") || it.startsWith("انگلیش") || it == "english" }
+        return when { fa && !en -> "fa"; en && !fa -> "en"; else -> null }
     }
 
     private fun question(target: SlotTarget): String =
@@ -261,6 +336,9 @@ class DefaultJarvisBrain(
         )
         const val MEMORY_ERROR = "نتوانستم حافظه را به‌روزرسانی کنم."
         const val MAX_RETRIES = 1
+        const val ASK_SONG_LANGUAGE = "اسم آهنگ رو فارسی می‌گی یا انگلیسی؟"
+        const val ASK_SONG_NAME = "اسم آهنگ رو بگو"
+        val SONG_FILLERS = setOf("آهنگ", "اهنگ", "موزیک", "اسمش", "اسم", "رو", "را", "پخش", "کن")
         const val ANSWER_CONFIDENCE = 0.95f
         val CANCEL_WORDS = setOf("لغو", "کنسل", "ولش", "بیخیال", "نمیخوام", "هیچی", "فراموشش", "منصرف")
     }

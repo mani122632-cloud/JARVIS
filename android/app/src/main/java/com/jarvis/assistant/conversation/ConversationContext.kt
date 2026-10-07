@@ -21,6 +21,13 @@ class ConversationContext(private val maxEntries: Int = MAX_ENTRIES) {
      */
     var pending: PendingIntent? = null
 
+    /** Open multi-step "play a song" question (null = none). Same lifetime as [pending]. */
+    var mediaStage: MediaStage? = null
+    /** Language answered in the media question ("fa" / "en"), or null. */
+    var mediaLanguage: String? = null
+    /** Failed answers to the current media question. */
+    var mediaAttempts: Int = 0
+
     /** Number of user utterances in this session. */
     var turnCount: Int = 0
         private set
@@ -40,6 +47,9 @@ class ConversationContext(private val maxEntries: Int = MAX_ENTRIES) {
         users.clear()
         responses.clear()
         pending = null
+        mediaStage = null
+        mediaLanguage = null
+        mediaAttempts = 0
         turnCount = 0
     }
 
@@ -53,3 +63,6 @@ class ConversationContext(private val maxEntries: Int = MAX_ENTRIES) {
         const val MAX_ENTRIES = 6
     }
 }
+
+/** Where the "آهنگ رو پخش کن" dialog is: waiting for the language, then for the song name. */
+enum class MediaStage { ASK_LANGUAGE, ASK_NAME }

@@ -57,12 +57,9 @@ class MediaTool(private val app: Context) : JarvisTool {
                 kind !in KINDS -> JarvisActionExecutor.Outcome(false, "نوع رسانه را متوجه نشدم.")
                 query.isEmpty() -> JarvisActionExecutor.Outcome(false, if (kind == KIND_MUSIC) "کدام آهنگ را پخش کنم؟" else if (kind == KIND_MOVIE) "کدام فیلم را پخش کنم؟" else "کدام ویدیو را باز کنم؟")
                 kind == KIND_MUSIC || kind == KIND_MOVIE -> {
-                    if (!hasPermission(kind)) {
-                        requestPermission()
-                        permissionOutcome()
-                    } else {
-                        finishLocal(kind, query, try { findLocal(kind, query) } catch (e: RuntimeException) { Log.w(TAG, "Local search failed"); null })
-                    }
+                    // Local playback is confirmed only by the player itself, so it needs [executeAsync].
+                    if (!hasPermission(kind)) { requestPermission(); permissionOutcome() }
+                    else JarvisActionExecutor.Outcome(false, FAILURE)
                 }
                 else -> playYoutube(query, null)
             }
@@ -99,13 +96,14 @@ class MediaTool(private val app: Context) : JarvisTool {
                     try { YoutubeLookup.firstVideoId(query) } catch (e: Exception) { Log.w(TAG, "YouTube lookup failed"); null }
                 } else null
                 main.post {
-                    val outcome = try {
-                        if (wantsLocal) finishLocal(kind, query, local) else playYoutube(query, videoId)
+                    val deliver: (JarvisActionExecutor.Outcome) -> Unit = { o -> busy.set(false); onResult(o) }
+                    try {
+                        if (wantsLocal) finishLocal(kind, query, local, deliver)
+                        else deliver(playYoutube(query, videoId))
                     } catch (e: RuntimeException) {
                         Log.w(TAG, "Media action failed", e)
-                        JarvisActionExecutor.Outcome(false, FAILURE)
-                    } finally { busy.set(false) }
-                    onResult(outcome)
+                        deliver(JarvisActionExecutor.Outcome(false, FAILURE))
+                    }
                 }
             }
         } catch (e: RuntimeException) {
@@ -142,18 +140,22 @@ class MediaTool(private val app: Context) : JarvisTool {
         }
     }
 
-    /** Main thread. Plays the local file; if there is none (or no app can open it) says so — NEVER opens anything online. */
-    private fun finishLocal(kind: String, query: String, f: LocalFile?): JarvisActionExecutor.Outcome {
+    /** Main thread. Plays the local file inside JARVIS; if there is none says so — NEVER opens anything online. */
+    private fun finishLocal(kind: String, query: String, f: LocalFile?, onResult: (JarvisActionExecutor.Outcome) -> Unit) {
         val isMusic = kind == KIND_MUSIC
         if (f == null) {
-            return if (isMusic) {
-                JarvisActionExecutor.Outcome(false, "آهنگ «$query» را در فایل‌های گوشی پیدا نکردم. اگر می‌خواهید از یوتیوب پخش شود، بگویید «توی یوتیوب ویدیوی ... را پخش کن».")
-            } else {
-                JarvisActionExecutor.Outcome(false, "فیلم «$query» را در فایل‌های گوشی پیدا نکردم. اگر می‌خواهید از یوتیوب پخش شود، بگویید «توی یوتیوب ویدیوی ... را پخش کن».")
-            }
+            val what = if (isMusic) "آهنگ" else "فیلم"
+            onResult(JarvisActionExecutor.Outcome(false, "$what «$query» را در فایل‌های گوشی پیدا نکردم. اگر می‌خواهید از یوتیوب پخش شود، بگویید «توی یوتیوب ویدیوی ... را پخش کن»."))
+            return
         }
-        return playLocal(f, kind)
-            ?: JarvisActionExecutor.Outcome(false, "«${f.title}» را در گوشی پیدا کردم، اما برنامه‌ای برای پخش این فایل پیدا نشد.")
+        val done: (Boolean) -> Unit = { ok ->
+            onResult(
+                if (ok) JarvisActionExecutor.Outcome(true, "پخش «${f.title}» شروع شد.")
+                else JarvisActionExecutor.Outcome(false, "«${f.title}» را در گوشی پیدا کردم، اما پخش آن شروع نشد.")
+            )
+        }
+        if (isMusic) InternalMediaPlayer.playAudio(app, f.uri, done)
+        else InternalMediaPlayer.playVideo(app, f.uri, f.title, done)
     }
 
     /** Background thread. Best matching audio / video file, or null. */
@@ -196,15 +198,6 @@ class MediaTool(private val app: Context) : JarvisTool {
             }
             best
         }
-    }
-
-    /** Main thread. Null = no app could open the file. */
-    private fun playLocal(f: LocalFile, kind: String): JarvisActionExecutor.Outcome? {
-        val fallback = if (kind == KIND_MUSIC) "audio/*" else "video/*"
-        val intent = Intent(Intent.ACTION_VIEW)
-            .setDataAndType(f.uri, f.mime?.takeIf { it.isNotBlank() } ?: fallback)
-            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        return if (start(intent)) JarvisActionExecutor.Outcome(true, "پخش «${f.title}» را از فایل‌های گوشی شروع کردم.") else null
     }
 
     // ---- YouTube (only for "توی یوتیوب ویدئوی X رو پخش کن") ----------------------------------------
@@ -471,6 +464,9 @@ object MediaCommandParser {
     private val inYoutube = Regex("^(?:لطفا\\s+)?(?:تو|توی|در|داخل|on|in)\\s+(?:یوتیوب|یوتوب|youtube)\\s+(.+?)$OBJ\\s+(?:پخش کن|باز کن|play|open)$")
     private val openYoutube = Regex("^(?:لطفا\\s+)?(?:برنامه\\s+)?(?:یوتیوب|یوتوب|یوتیوپ|یو تیوب|youtube)$OBJ\\s+(?:رو\\s+)?(?:باز کن|باز کنید|اجرا کن|open)$")
 
+    /** "آهنگ رو پخش کن" / "یه آهنگ پخش کن" / "پخش کن آهنگ": a song request without a name. */
+    private val musicNoName = Regex("^(?:لطفا\\s+)?(?:(?:یه|یک)\\s+)?(?:آهنگ|اهنگ|موزیک|music|song)ی?$OBJ\\s+$VERB_PLAY$|^(?:لطفا\\s+)?$VERB_PLAY\\s+(?:(?:یه|یک)\\s+)?(?:آهنگ|اهنگ|موزیک|music|song)$")
+
     private fun norm(s: String): String = s.lowercase()
         .replace('ي', 'ی').replace('ك', 'ک')
         .replace("\u200c", " ").replace(Regex("[\\p{Punct}،؟؛.!]"), " ")
@@ -480,6 +476,7 @@ object MediaCommandParser {
         val t = norm(text)
         if (t.isEmpty()) return null
         if (openYoutube.matches(t)) return call(MediaTool.KIND_YOUTUBE, "")
+        if (musicNoName.matches(t)) return call(MediaTool.KIND_MUSIC, "")
         for (r in listOf(musicA, musicB)) r.matchEntire(t)?.let { return query(MediaTool.KIND_MUSIC, it.groupValues[1]) }
         inYoutube.matchEntire(t)?.let { return query(MediaTool.KIND_VIDEO, it.groupValues[1]) }
         for (r in listOf(videoA, videoB)) r.matchEntire(t)?.let { return query(MediaTool.KIND_VIDEO, it.groupValues[1]) }
@@ -489,8 +486,12 @@ object MediaCommandParser {
 
     private fun query(kind: String, q: String): JarvisAction? {
         val clean = q.trim().removeSuffix(" رو").removeSuffix(" را").trim()
-        return if (clean.isEmpty()) null else call(kind, clean)
+        return if (clean.isEmpty() || clean == "رو" || clean == "را") null else call(kind, clean)
     }
+
+    /** True for a song request that has no name yet (starts the language / name questions). */
+    fun isNamelessMusic(a: JarvisAction?): Boolean =
+        a is JarvisAction.ToolCall && a.tool == MediaTool.NAME && a.args["kind"] == MediaTool.KIND_MUSIC && a.args["query"].orEmpty().isBlank()
 
     private fun call(kind: String, q: String): JarvisAction =
         JarvisAction.ToolCall(MediaTool.NAME, mapOf("kind" to kind, "query" to q))

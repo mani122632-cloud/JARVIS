@@ -76,6 +76,12 @@
         android:excludeFromRecents="true"
         android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
+    <activity
+        android:name="com.jarvis.assistant.command.InternalVideoActivity"
+        android:exported="false"
+        android:configChanges="orientation|screenSize|keyboardHidden"
+        android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
+
     <service
         android:name="com.jarvis.assistant.overlay.JarvisOverlayService"
         android:exported="false"
