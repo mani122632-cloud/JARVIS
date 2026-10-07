@@ -25,36 +25,46 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * Real media playback (no new dependency).
  *
- *  - music   : audio files on the phone (MediaStore) -> YouTube video found and opened -> music app search -> YouTube search page
- *  - movie   : video files on the phone (MediaStore, with "قسمت N" episode matching) -> YouTube video found and opened -> search page
- *  - video   : YouTube video found by name and opened in the YouTube app (it starts playing) -> search page only as a last resort
+ *  - music   : ONLY audio files on the phone (MediaStore). Nothing online (no YouTube / Spotify / music-app search) is
+ *              ever opened for "آهنگ X رو پخش کن"; if the file is not found the user is told so.
+ *  - movie   : ONLY video files on the phone (MediaStore, with "قسمت N" / "فصل N" / S01E02 matching in name and folder).
+ *              YouTube is never opened for "فیلم X رو پخش کن".
+ *  - video   : ("توی یوتیوب ویدئوی X رو پخش کن") the best matching YouTube video is found and ITS OWN page is opened in the
+ *              YouTube app. Android has no API to force playback, so the message says "opened", never "playing".
+ *              Only if the video page cannot be found, the search page is opened as a fallback and that is said honestly.
  *  - youtube : (no query) launches the YouTube app, else youtube.com
  *
  * The lookup (MediaStore scan, YouTube result page) runs on a background thread ([executeAsync]); every Intent is
- * started on the main thread. Success is reported only when Android accepted an Intent, and the message says what was
- * really done (a local file opened / a video opened in YouTube / only a search opened).
+ * started on the main thread. Permission for media files is requested through the existing [MediaPermissionActivity].
  */
 class MediaTool(private val app: Context) : JarvisTool {
 
     private val main = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor { r -> Thread(r, "jarvis-media").apply { isDaemon = true } }
     private val busy = AtomicBoolean(false)
-    private val prefs by lazy { app.getSharedPreferences(PREFS, Context.MODE_PRIVATE) }
 
     override val name: String = NAME
 
     override fun canHandle(action: JarvisAction): Boolean =
         action is JarvisAction.ToolCall && action.tool == NAME
 
-    /** Synchronous fallback (no scan, no network): used for questions and the plain "open YouTube". Prefer [executeAsync]. */
+    /** Synchronous fallback. Music/movie still search the phone only (never online). Prefer [executeAsync]. */
     override fun execute(action: JarvisAction): JarvisActionExecutor.Outcome {
         val (kind, query) = argsOf(action) ?: return JarvisActionExecutor.Outcome(false, "این کار هنوز پشتیبانی نمی‌شود.")
         return try {
             when {
                 kind == KIND_YOUTUBE && query.isEmpty() -> openYoutube()
                 kind !in KINDS -> JarvisActionExecutor.Outcome(false, "نوع رسانه را متوجه نشدم.")
-                query.isEmpty() -> JarvisActionExecutor.Outcome(false, if (kind == KIND_MUSIC) "کدام آهنگ را پخش کنم؟" else "کدام ویدیو را باز کنم؟")
-                else -> playOnline(kind, query, null)
+                query.isEmpty() -> JarvisActionExecutor.Outcome(false, if (kind == KIND_MUSIC) "کدام آهنگ را پخش کنم؟" else if (kind == KIND_MOVIE) "کدام فیلم را پخش کنم؟" else "کدام ویدیو را باز کنم؟")
+                kind == KIND_MUSIC || kind == KIND_MOVIE -> {
+                    if (!hasPermission(kind)) {
+                        requestPermission()
+                        permissionOutcome()
+                    } else {
+                        finishLocal(kind, query, try { findLocal(kind, query) } catch (e: RuntimeException) { Log.w(TAG, "Local search failed"); null })
+                    }
+                }
+                else -> playYoutube(query, null)
             }
         } catch (e: RuntimeException) {
             Log.w(TAG, "Media action failed", e)
@@ -72,26 +82,25 @@ class MediaTool(private val app: Context) : JarvisTool {
         if (!busy.compareAndSet(false, true)) { Log.w(TAG, "Media already in progress; duplicate ignored"); return }
 
         val wantsLocal = kind == KIND_MUSIC || kind == KIND_MOVIE
-        if (wantsLocal && !hasPermission(kind) && !prefs.getBoolean(KEY_ASKED, false)) {
-            // First time only: ask for access to the phone's media files, then the user repeats the command.
-            prefs.edit().putBoolean(KEY_ASKED, true).apply()
+        if (wantsLocal && !hasPermission(kind)) {
+            // No access to the phone's media files yet: ask via MediaPermissionActivity, the user then repeats the command.
             busy.set(false)
             requestPermission()
-            onResult(JarvisActionExecutor.Outcome(false, "برای پیدا کردن آهنگ و فیلم‌های گوشی اجازه‌ی دسترسی به فایل‌ها لازم است. اجازه را بدهید و دوباره بگویید."))
+            onResult(permissionOutcome())
             return
         }
 
         try {
             worker.execute {
-                val local = if (wantsLocal && hasPermission(kind)) {
+                val local = if (wantsLocal) {
                     try { findLocal(kind, query) } catch (e: RuntimeException) { Log.w(TAG, "Local search failed"); null }
                 } else null
-                val videoId = if (local == null) {
+                val videoId = if (!wantsLocal) {
                     try { YoutubeLookup.firstVideoId(query) } catch (e: Exception) { Log.w(TAG, "YouTube lookup failed"); null }
                 } else null
                 main.post {
                     val outcome = try {
-                        (if (local != null) playLocal(local, kind) else null) ?: playOnline(kind, query, videoId)
+                        if (wantsLocal) finishLocal(kind, query, local) else playYoutube(query, videoId)
                     } catch (e: RuntimeException) {
                         Log.w(TAG, "Media action failed", e)
                         JarvisActionExecutor.Outcome(false, FAILURE)
@@ -114,6 +123,10 @@ class MediaTool(private val app: Context) : JarvisTool {
 
     private class LocalFile(val uri: Uri, val mime: String?, val title: String)
 
+    private fun permissionOutcome() = JarvisActionExecutor.Outcome(
+        false, "برای پیدا کردن آهنگ و فیلم‌های گوشی اجازه‌ی دسترسی به فایل‌ها لازم است. اجازه را بدهید و دوباره بگویید."
+    )
+
     private fun hasPermission(kind: String): Boolean {
         val perm = if (Build.VERSION.SDK_INT >= 33) {
             if (kind == KIND_MUSIC) "android.permission.READ_MEDIA_AUDIO" else "android.permission.READ_MEDIA_VIDEO"
@@ -129,18 +142,33 @@ class MediaTool(private val app: Context) : JarvisTool {
         }
     }
 
+    /** Main thread. Plays the local file; if there is none (or no app can open it) says so — NEVER opens anything online. */
+    private fun finishLocal(kind: String, query: String, f: LocalFile?): JarvisActionExecutor.Outcome {
+        val isMusic = kind == KIND_MUSIC
+        if (f == null) {
+            return if (isMusic) {
+                JarvisActionExecutor.Outcome(false, "آهنگ «$query» را در فایل‌های گوشی پیدا نکردم. اگر می‌خواهید از یوتیوب پخش شود، بگویید «توی یوتیوب ویدیوی ... را پخش کن».")
+            } else {
+                JarvisActionExecutor.Outcome(false, "فیلم «$query» را در فایل‌های گوشی پیدا نکردم. اگر می‌خواهید از یوتیوب پخش شود، بگویید «توی یوتیوب ویدیوی ... را پخش کن».")
+            }
+        }
+        return playLocal(f, kind)
+            ?: JarvisActionExecutor.Outcome(false, "«${f.title}» را در گوشی پیدا کردم، اما برنامه‌ای برای پخش این فایل پیدا نشد.")
+    }
+
     /** Background thread. Best matching audio / video file, or null. */
     private fun findLocal(kind: String, query: String): LocalFile? {
         val audio = kind == KIND_MUSIC
         val q = MediaMatcher.parse(query, allowEpisode = !audio)
         if (q.tokens.isEmpty()) return null
         val base = if (audio) MediaStore.Audio.Media.EXTERNAL_CONTENT_URI else MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+        val pathCol = if (Build.VERSION.SDK_INT >= 29) MediaStore.MediaColumns.RELATIVE_PATH else MediaStore.MediaColumns.DATA
         val projection = if (audio) {
             arrayOf(BaseColumns._ID, MediaStore.MediaColumns.TITLE, MediaStore.MediaColumns.DISPLAY_NAME,
-                MediaStore.MediaColumns.MIME_TYPE, MediaStore.Audio.AudioColumns.ARTIST)
+                MediaStore.MediaColumns.MIME_TYPE, MediaStore.Audio.AudioColumns.ARTIST, pathCol)
         } else {
             arrayOf(BaseColumns._ID, MediaStore.MediaColumns.TITLE, MediaStore.MediaColumns.DISPLAY_NAME,
-                MediaStore.MediaColumns.MIME_TYPE)
+                MediaStore.MediaColumns.MIME_TYPE, pathCol)
         }
         val cursor = app.contentResolver.query(base, projection, null, null, null) ?: return null
         return cursor.use { c ->
@@ -149,6 +177,7 @@ class MediaTool(private val app: Context) : JarvisTool {
             val iName = c.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
             val iMime = c.getColumnIndexOrThrow(MediaStore.MediaColumns.MIME_TYPE)
             val iArtist = if (audio) c.getColumnIndex(MediaStore.Audio.AudioColumns.ARTIST) else -1
+            val iPath = c.getColumnIndex(pathCol)
             var best: LocalFile? = null
             var bestLen = Int.MAX_VALUE
             var rows = 0
@@ -156,9 +185,12 @@ class MediaTool(private val app: Context) : JarvisTool {
                 val title = c.getString(iTitle).orEmpty()
                 val name = c.getString(iName).orEmpty().substringBeforeLast('.')
                 val artist = if (iArtist >= 0) c.getString(iArtist).orEmpty() else ""
-                val hay = MediaMatcher.normalize("$title $name $artist")
-                if (!q.matches(hay) || hay.length >= bestLen) continue
-                bestLen = hay.length
+                // Folder names ("Series/S01/") help episode/season matching, but are not used to rank.
+                val folder = if (!audio && iPath >= 0) c.getString(iPath).orEmpty() else ""
+                val own = MediaMatcher.normalize("$title $name")
+                val hay = MediaMatcher.normalize("$title $name $artist $folder")
+                if (!q.matches(hay) || own.length >= bestLen) continue
+                bestLen = own.length
                 best = LocalFile(ContentUris.withAppendedId(base, c.getLong(iId)), c.getString(iMime),
                     title.ifBlank { name })
             }
@@ -166,7 +198,7 @@ class MediaTool(private val app: Context) : JarvisTool {
         }
     }
 
-    /** Main thread. Null = no app could open the file (the caller falls back to the online source). */
+    /** Main thread. Null = no app could open the file. */
     private fun playLocal(f: LocalFile, kind: String): JarvisActionExecutor.Outcome? {
         val fallback = if (kind == KIND_MUSIC) "audio/*" else "video/*"
         val intent = Intent(Intent.ACTION_VIEW)
@@ -175,33 +207,28 @@ class MediaTool(private val app: Context) : JarvisTool {
         return if (start(intent)) JarvisActionExecutor.Outcome(true, "پخش «${f.title}» را از فایل‌های گوشی شروع کردم.") else null
     }
 
-    // ---- online ------------------------------------------------------------------------------------
+    // ---- YouTube (only for "توی یوتیوب ویدئوی X رو پخش کن") ----------------------------------------
 
-    /** Main thread. [videoId]: a video already found on YouTube (opened in the app, which starts playing it). */
-    private fun playOnline(kind: String, query: String, videoId: String?): JarvisActionExecutor.Outcome {
-        val noun = when (kind) { KIND_MUSIC -> "آهنگ"; KIND_MOVIE -> "فیلم"; else -> "ویدیو" }
-        if (videoId != null && openYoutubeVideo(videoId)) {
-            return JarvisActionExecutor.Outcome(true, "$noun «$query» را در یوتیوب باز کردم تا پخش شود.")
-        }
-        if (kind == KIND_MUSIC) {
-            val play = Intent(MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH).apply {
-                putExtra(MediaStore.EXTRA_MEDIA_FOCUS, "vnd.android.cursor.item/*")
-                putExtra(SearchManager.QUERY, query)
+    /**
+     * Main thread. [videoId]: the best matching video found on YouTube. Its own page is opened in the YouTube app.
+     * Android cannot force playback from outside, so this reports "opened", never "playing".
+     */
+    private fun playYoutube(query: String, videoId: String?): JarvisActionExecutor.Outcome {
+        if (videoId != null) {
+            val uri = Uri.parse("https://www.youtube.com/watch?v=$videoId")
+            if (start(Intent(Intent.ACTION_VIEW, uri).setPackage(YOUTUBE_PKG))) {
+                return JarvisActionExecutor.Outcome(true, "صفحه‌ی ویدیوی «$query» را در برنامه‌ی یوتیوب باز کردم. اگر خودکار پخش نشد، دکمه‌ی پخش را بزنید.")
             }
-            if (start(play)) return JarvisActionExecutor.Outcome(true, "درخواست پخش «$query» را به برنامه‌ی موسیقی دادم.")
+            if (start(Intent(Intent.ACTION_VIEW, uri))) {
+                return JarvisActionExecutor.Outcome(true, "برنامه‌ی یوتیوب پیدا نشد؛ صفحه‌ی ویدیوی «$query» را با برنامه‌ی پیش‌فرض باز کردم. پخش خودکار تضمین نیست.")
+            }
         }
-        return searchYoutube(query, noun)
+        return searchYoutube(query)
     }
 
-    private fun openYoutubeVideo(id: String): Boolean {
-        val uri = Uri.parse("https://www.youtube.com/watch?v=$id")
-        if (start(Intent(Intent.ACTION_VIEW, uri).setPackage(YOUTUBE_PKG))) return true
-        return start(Intent(Intent.ACTION_VIEW, uri))
-    }
-
-    /** Last resort: the video itself could not be found, so only the search results are opened (and said so). */
-    private fun searchYoutube(query: String, noun: String): JarvisActionExecutor.Outcome {
-        val msg = "نتوانستم $noun را مستقیم پیدا کنم؛ نتیجه‌ی جستجوی «$query» را در یوتیوب باز کردم."
+    /** Fallback: the video page could not be found/opened, so only the search results are opened (and it says so). */
+    private fun searchYoutube(query: String): JarvisActionExecutor.Outcome {
+        val msg = "پخش مستقیم ویدیو ممکن نشد و صفحه‌ی خود ویدیو را پیدا نکردم؛ فقط نتیجه‌ی جستجوی «$query» را در یوتیوب باز کردم. چیزی پخش نشده است."
         val inApp = Intent(Intent.ACTION_SEARCH).apply {
             setPackage(YOUTUBE_PKG)
             putExtra(SearchManager.QUERY, query)
@@ -209,7 +236,7 @@ class MediaTool(private val app: Context) : JarvisTool {
         if (start(inApp)) return JarvisActionExecutor.Outcome(true, msg)
         val web = Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com/results?search_query=" + Uri.encode(query)))
         if (start(web)) return JarvisActionExecutor.Outcome(true, msg)
-        return JarvisActionExecutor.Outcome(false, "برنامه‌ای برای پخش $noun پیدا نشد.")
+        return JarvisActionExecutor.Outcome(false, "برنامه‌ای برای باز کردن یوتیوب پیدا نشد.")
     }
 
     private fun openYoutube(): JarvisActionExecutor.Outcome {
@@ -238,19 +265,23 @@ class MediaTool(private val app: Context) : JarvisTool {
         private val KINDS = setOf(KIND_MUSIC, KIND_VIDEO, KIND_MOVIE, KIND_YOUTUBE)
         private const val YOUTUBE_PKG = "com.google.android.youtube"
         private const val TAG = "MediaTool"
-        private const val PREFS = "jarvis_media"
-        private const val KEY_ASKED = "media_permission_asked"
         private const val MAX_ROWS = 50_000
         private const val FAILURE = "نتوانستم رسانه را اجرا کنم."
     }
 }
 
-/** Finds the first video of a YouTube search (videos only) so it can be opened directly. Background thread only. */
+/** Finds the best matching video of a YouTube search (videos only) so its own page can be opened. Background thread only. */
 internal object YoutubeLookup {
-    private val VIDEO_ID = Regex("\"videoRenderer\":\\{\"videoId\":\"([A-Za-z0-9_-]{11})\"")
+    private val FIRST_ID = Regex("\"videoRenderer\":\\{\"videoId\":\"([A-Za-z0-9_-]{11})\"")
+    private val RENDERER = Regex(
+        "\"videoRenderer\":\\{\"videoId\":\"([A-Za-z0-9_-]{11})\"(?:(?!\"videoRenderer\").){0,2500}?\"title\":\\{\"runs\":\\[\\{\"text\":\"((?:[^\"\\\\]|\\\\.)*)\"",
+        RegexOption.DOT_MATCHES_ALL
+    )
     private const val UA = "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
     private const val MAX_BYTES = 2_000_000
+    private const val MAX_CANDIDATES = 12
 
+    /** Id of the result whose title matches the query best (earliest wins ties); null if nothing was found. */
     fun firstVideoId(query: String): String? {
         val url = URL("https://www.youtube.com/results?search_query=" + URLEncoder.encode(query, "UTF-8") + "&sp=EgIQAQ%3D%3D")
         val conn = url.openConnection() as HttpURLConnection
@@ -263,10 +294,49 @@ internal object YoutubeLookup {
             conn.setRequestProperty("Cookie", "CONSENT=YES+1; SOCS=CAI")
             if (conn.responseCode != 200) return null
             val text = conn.inputStream.use { readLimited(it) }
-            return VIDEO_ID.find(text)?.groupValues?.get(1)
+            return pickBest(text, query)
         } finally {
             conn.disconnect()
         }
+    }
+
+    internal fun pickBest(page: String, query: String): String? {
+        val tokens = MediaMatcher.parse(query, allowEpisode = false).tokens
+        var bestId: String? = null
+        var bestScore = -1
+        val seen = HashSet<String>()
+        for (m in RENDERER.findAll(page)) {
+            val id = m.groupValues[1]
+            if (!seen.add(id)) continue
+            val title = MediaMatcher.normalize(unescape(m.groupValues[2]))
+            val score = tokens.count { title.contains(it) }
+            if (score > bestScore) { bestScore = score; bestId = id }
+            if (seen.size >= MAX_CANDIDATES) break
+        }
+        return bestId ?: FIRST_ID.find(page)?.groupValues?.get(1)
+    }
+
+    private fun unescape(s: String): String {
+        val sb = StringBuilder(s.length)
+        var i = 0
+        while (i < s.length) {
+            val ch = s[i]
+            if (ch == '\\' && i + 1 < s.length) {
+                val n = s[i + 1]
+                when {
+                    n == 'u' && i + 5 < s.length -> {
+                        val code = s.substring(i + 2, i + 6).toIntOrNull(16)
+                        if (code != null) { sb.append(code.toChar()); i += 6; continue }
+                        sb.append(n); i += 2; continue
+                    }
+                    n == 'n' || n == 't' -> { sb.append(' '); i += 2; continue }
+                    else -> { sb.append(n); i += 2; continue }
+                }
+            }
+            sb.append(ch)
+            i++
+        }
+        return sb.toString()
     }
 
     private fun readLimited(input: InputStream): String {
@@ -284,7 +354,7 @@ internal object YoutubeLookup {
     }
 }
 
-/** Matches a spoken "name [قسمت N]" against file names / titles. Pure (no Android). */
+/** Matches a spoken "name [فصل M] [قسمت N]" against file names / titles / folders. Pure (no Android). */
 internal object MediaMatcher {
 
     class Query(val tokens: List<String>, val episode: Int?, val season: Int?) {
@@ -294,17 +364,27 @@ internal object MediaMatcher {
             if (tokens.isEmpty()) return false
             val missing = tokens.count { !hay.contains(it) }
             if (missing > (if (tokens.size >= 4) 1 else 0)) return false
-            return episode == null || episodeMatches(hay, episode)
+            if (episode == null && season == null) return true
+            return episodeMatches(hay)
         }
 
-        private fun episodeMatches(hay: String, ep: Int): Boolean {
-            val se = SE.findAll(hay).toList()
-            if (se.isNotEmpty()) {
-                return se.any { it.groupValues[2].toIntOrNull() == ep && (season == null || it.groupValues[1].toIntOrNull() == season) }
+        private fun episodeMatches(hay: String): Boolean {
+            // 1) explicit season+episode pairs: S01E02, 1x02
+            val pairs = ArrayList<Pair<Int?, Int?>>()
+            SE.findAll(hay).forEach { pairs.add(Pair(it.groupValues[1].toIntOrNull(), it.groupValues[2].toIntOrNull())) }
+            SX.findAll(hay).forEach { pairs.add(Pair(it.groupValues[1].toIntOrNull(), it.groupValues[2].toIntOrNull())) }
+            if (pairs.isNotEmpty()) {
+                return pairs.any { (s, e) -> (episode == null || e == episode) && (season == null || s == season) }
             }
+            // 2) separate season tag (فصل 2 / season 2 / S02) and episode tag (قسمت 5 / E05 / episode 5)
+            if (season != null) {
+                val seasons = SEASON_TAG.findAll(hay).mapNotNull { (it.groupValues[1].ifEmpty { it.groupValues[2] }).toIntOrNull() }.toList()
+                if (seasons.isNotEmpty() && season !in seasons) return false
+            }
+            if (episode == null) return true
             val tagged = TAGGED.findAll(hay).toList()
-            if (tagged.isNotEmpty()) return tagged.any { it.groupValues[1].toIntOrNull() == ep }
-            return Regex("(?<![0-9])0*$ep(?![0-9])").containsMatchIn(hay)
+            if (tagged.isNotEmpty()) return tagged.any { it.groupValues[1].toIntOrNull() == episode }
+            return Regex("(?<![0-9])0*$episode(?![0-9])").containsMatchIn(hay)
         }
     }
 
@@ -314,9 +394,11 @@ internal object MediaMatcher {
         "ششم" to 6, "هفتم" to 7, "هشتم" to 8, "نهم" to 9, "دهم" to 10
     )
     private val SE = Regex("(?<![a-z0-9])s0*(\\d{1,2}) ?e0*(\\d{1,3})(?![0-9])")
+    private val SX = Regex("(?<![a-z0-9])0*(\\d{1,2})x0*(\\d{1,3})(?![0-9a-z])")
     private val TAGGED = Regex("(?:(?<![a-z0-9])(?:e|ep|episode)|قسمت) ?0*(\\d{1,3})(?![0-9])")
     private val EPISODE = Regex("(?:قسمت|episode|ep) ?0*(\\d{1,3}|$ORD)")
     private val SEASON = Regex("(?:فصل|season) ?0*(\\d{1,2})")
+    private val SEASON_TAG = Regex("(?:(?:فصل|season) ?0*(\\d{1,2})|(?<![a-z0-9])s0*(\\d{1,2})(?![0-9a-z]))")
     private val STOP = setOf(
         "از", "رو", "را", "آهنگ", "اهنگ", "موزیک", "فیلم", "سریال", "ویدیو", "ویدئو", "کلیپ",
         "song", "music", "movie", "film", "video"
