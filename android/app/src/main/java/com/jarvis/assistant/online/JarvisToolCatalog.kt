@@ -77,8 +77,8 @@ class JarvisToolCatalog(
             obj("seconds" to intProp("Duration in seconds, 1-86400", 1, 86_400), required = listOf("seconds"))),
         spec("call_contact", "Call a saved contact by name.",
             obj("name" to strProp("Contact name as spoken", maxLen = 60), required = listOf("name"))),
-        spec("open_app", "Open an installed app.",
-            obj("app" to enumProp("App id", apps.entries.map { it.id }), required = listOf("app"))),
+        spec("open_app", "Open ANY app installed on the phone by its name, Persian or English (e.g. تلگرام, Telegram, گالری).",
+            obj("app" to strProp("App name as spoken, Persian or English", maxLen = 60), required = listOf("app"))),
         spec("flashlight", "Turn the flashlight on, off or toggle it.",
             obj("mode" to enumProp("on, off or toggle", listOf("on", "off", "toggle")), required = listOf("mode"))),
         spec("set_volume", "Change the media volume: up, down, or set to an absolute percent.",
@@ -120,9 +120,10 @@ class JarvisToolCatalog(
                 }
                 "open_app" -> {
                     allowOnly(args, "app")
-                    val id = str(args, "app", 40, required = true)!!
-                    val entry = apps.findById(id) ?: return bad("unknown app id")
-                    ready(name, JarvisAction.OpenApp(entry.id, entry.label, entry.packageNames), "a=${entry.id}", DEFAULT_TIMEOUT_MS)
+                    val id = str(args, "app", 60, required = true)!!
+                    val entry = apps.findById(id)
+                    if (entry != null) ready(name, JarvisAction.OpenApp(entry.id, entry.label, entry.packageNames), "a=${entry.id}", DEFAULT_TIMEOUT_MS)
+                    else ready(name, JarvisAction.OpenAppByName(id), "n=$id", DEFAULT_TIMEOUT_MS)
                 }
                 "flashlight" -> {
                     allowOnly(args, "mode")
@@ -229,6 +230,7 @@ class JarvisToolCatalog(
         if (o.success) return ToolResult.ok(o.message)
         val m = o.message ?: "نتوانستم این کار را انجام بدهم."
         val code = when {
+            "چند برنامه" in m -> ToolErrorCode.AMBIGUOUS
             "اجازه" in m -> ToolErrorCode.PERMISSION_DENIED
             "چند مخاطب" in m -> ToolErrorCode.AMBIGUOUS
             "مخاطبی" in m || "پیدا نشد" in m || "پیدا نکردم" in m -> ToolErrorCode.NOT_FOUND

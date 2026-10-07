@@ -40,6 +40,11 @@ sealed class JarvisAction {
 
     /** [packageNames]: candidate package ids, the first installed one is launched. */
     data class OpenApp(val appId: String, val label: String, val packageNames: List<String>) : JarvisAction()
+    /**
+     * Open ANY installed app by the (Persian or English) name the user said; resolved against the apps
+     * actually installed on the phone by [InstalledAppResolver] when executed.
+     */
+    data class OpenAppByName(val query: String) : JarvisAction()
     object OpenSettings : JarvisAction()
     object OpenWifiSettings : JarvisAction()
     object OpenBluetoothSettings : JarvisAction()

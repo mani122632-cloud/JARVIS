@@ -52,6 +52,8 @@ class JarvisActionExecutor(
      */
     data class Outcome(val success: Boolean, val message: String? = null)
 
+    private val appResolver = InstalledAppResolver(app)
+
     private val registry = ToolRegistry(tools ?: listOf(AlarmTool(app), TimerTool(app), CallTool(app)))
 
     /** Adds (or replaces, by name) a tool, e.g. a future call / SMS / contacts / search tool. */
@@ -66,6 +68,7 @@ class JarvisActionExecutor(
     private var torchCallbackRegistered = false
 
     init {
+        appResolver.warmUp()
         // Lets TOGGLE know the real torch state ("چراغ قوه" without روشن/خاموش).
         try {
             cameraManager?.registerTorchCallback(torchCallback, Handler(Looper.getMainLooper()))
@@ -112,6 +115,7 @@ class JarvisActionExecutor(
 
     private fun dispatch(action: JarvisAction): Outcome = when (action) {
         is JarvisAction.OpenApp -> openApp(action)
+        is JarvisAction.OpenAppByName -> openAppByName(action)
         JarvisAction.OpenSettings -> startActivity(Intent(Settings.ACTION_SETTINGS), "نتوانستم تنظیمات را باز کنم.")
         JarvisAction.OpenWifiSettings -> startActivity(Intent(Settings.ACTION_WIFI_SETTINGS), "نتوانستم تنظیمات وای‌فای را باز کنم.")
         JarvisAction.OpenBluetoothSettings -> startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS), "نتوانستم تنظیمات بلوتوث را باز کنم.")
@@ -155,6 +159,22 @@ class JarvisActionExecutor(
         // Not installed (or not visible: add it to <queries>): report, never crash.
         return Outcome(false, "برنامه ${action.label} پیدا نشد.")
     }
+
+    /** Any installed app by spoken name: one match opens, several are reported (never guessed), none is said honestly. */
+    private fun openAppByName(action: JarvisAction.OpenAppByName): Outcome =
+        when (val m = appResolver.resolve(action.query)) {
+            is InstalledAppResolver.Match.Found -> try {
+                app.startActivity(m.app.launchIntent())
+                Outcome(true)
+            } catch (e: ActivityNotFoundException) {
+                Log.w(TAG, "No launchable activity in ${m.app.packageName}", e)
+                Outcome(false, "نتوانستم برنامه ${m.app.label} را باز کنم.")
+            }
+            is InstalledAppResolver.Match.Ambiguous ->
+                Outcome(false, "چند برنامه مشابه پیدا کردم: ${m.apps.joinToString("، ") { it.label }}. کدام را باز کنم؟ نام دقیق‌تر را بگو.")
+            InstalledAppResolver.Match.NotFound ->
+                Outcome(false, "برنامه‌ای با نام ${action.query} روی گوشی پیدا نکردم.")
+        }
 
     /**
      * Android gives a normal app no way to press another app's Back button (it would need an

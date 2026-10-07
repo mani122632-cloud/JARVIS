@@ -61,7 +61,8 @@ class CommandIntentParser(
         this::matchVolume,
         this::matchScheduling,
         this::matchSettings,
-        this::matchApp
+        this::matchApp,
+        this::matchAppByName
     )
 
     fun parse(raw: String): Parsed {
@@ -315,6 +316,21 @@ class CommandIntentParser(
     }
 
     /**
+     * Any other installed app: only with an explicit opening verb ("باز کن", "اجرا کن", open) and 1..4 name tokens.
+     * Confidence stays below the fast path (a partial result may cut the name); the executor resolves the name
+     * against the real installed apps and answers honestly when it is not found or ambiguous.
+     */
+    private fun matchAppByName(inp: Input): Candidate? {
+        val t = inp.tokens
+        if (t.any { it in NEGATIONS || it in CLOSE_WORDS }) return null
+        if (t.none { it in STRONG_OPEN_VERBS }) return null
+        val name = t.filter { it !in NOISE && it !in APP_WORDS }
+        if (name.isEmpty() || name.size > 4) return null
+        val query = name.joinToString(" ")
+        return Candidate(JarvisAction.OpenAppByName(query), 0.95f, NluIntent.OPEN_APP, mapOf(NluSlot.APP_NAME to query))
+    }
+
+    /**
      * Token range that spells [key] (1..3 tokens glued together, optionally with a colloquial "رو/را/و" clitic,
      * or one typo for names of 5+ letters): handles "اینستاگرام", "اینستا گرام", "اینستاگرامو", "یو توب".
      */
@@ -393,6 +409,8 @@ class CommandIntentParser(
         val OPEN_VERBS = setOf("باز", "برو", "بیا", "اجرا", "بزن", "بیار", "بیاور", "ببر", "برید", "بروید", "بازکن", "بازش", "بازشو", "open", "run", "start", "launch")
         val NOISE = FILLER + OPEN_VERBS + CLITICS +
             setOf("کن", "کنید", "بکن", "بذار", "بزار", "اون", "این", "یه", "میشه", "می", "شه", "میتونی", "تونی", "ممکنه", "جان", "عزیزم", "بده", "بدی")
+        val STRONG_OPEN_VERBS = setOf("باز", "بازکن", "بازش", "بازشو", "اجرا", "open", "run", "start", "launch")
+        val APP_WORDS = setOf("نرم", "افزار", "app", "application", "apps")
         val NEGATIONS = setOf("نکن", "نه", "نمیخوام")
         val CLOSE_WORDS = setOf("ببند", "ببندش", "حذف", "پاک", "نصب", "آپدیت")
 
