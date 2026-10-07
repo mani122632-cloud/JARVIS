@@ -16,6 +16,10 @@ class InternalVideoActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Only one JARVIS video screen at a time: a new command replaces the previous video.
+        val old = current?.get()
+        if (old != null && old !== this) try { old.finish() } catch (e: RuntimeException) { /* ignore */ }
+        current = java.lang.ref.WeakReference(this)
         val uri = intent?.data
         if (uri == null) { fail(); finish(); return }
         val root = FrameLayout(this).apply { setBackgroundColor(0xFF000000.toInt()) }
@@ -41,10 +45,21 @@ class InternalVideoActivity : Activity() {
     private fun fail() { if (!reported) { reported = true; InternalMediaPlayer.videoFailed() } }
 
     override fun onDestroy() {
+        if (current?.get() === this) current = null
         try { video?.stopPlayback() } catch (e: RuntimeException) { /* ignore */ }
         fail()      // no-op when already reported
         super.onDestroy()
     }
 
-    companion object { const val EXTRA_TITLE = "title" }
+    companion object {
+        const val EXTRA_TITLE = "title"
+        private var current: java.lang.ref.WeakReference<InternalVideoActivity>? = null
+
+        /** Closes the video screen if one is open (main thread). */
+        fun closeCurrent() {
+            val a = current?.get() ?: return
+            current = null
+            try { a.finish() } catch (e: RuntimeException) { /* ignore */ }
+        }
+    }
 }

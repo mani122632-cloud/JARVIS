@@ -20,7 +20,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Real media playback (no new dependency).
@@ -41,7 +41,9 @@ class MediaTool(private val app: Context) : JarvisTool {
 
     private val main = Handler(Looper.getMainLooper())
     private val worker = Executors.newSingleThreadExecutor { r -> Thread(r, "jarvis-media").apply { isDaemon = true } }
-    private val busy = AtomicBoolean(false)
+
+    /** Newest request wins: an older lookup that finishes late is dropped (it never plays or opens anything). */
+    private val ticket = AtomicInteger(0)
 
     override val name: String = NAME
 
@@ -53,6 +55,7 @@ class MediaTool(private val app: Context) : JarvisTool {
         val (kind, query) = argsOf(action) ?: return JarvisActionExecutor.Outcome(false, "این کار هنوز پشتیبانی نمی‌شود.")
         return try {
             when {
+                kind == KIND_STOP -> stopMedia()
                 kind == KIND_YOUTUBE && query.isEmpty() -> openYoutube()
                 kind !in KINDS -> JarvisActionExecutor.Outcome(false, "نوع رسانه را متوجه نشدم.")
                 query.isEmpty() -> JarvisActionExecutor.Outcome(false, if (kind == KIND_MUSIC) "کدام آهنگ را پخش کنم؟" else if (kind == KIND_MOVIE) "کدام فیلم را پخش کنم؟" else "کدام ویدیو را باز کنم؟")
@@ -69,45 +72,41 @@ class MediaTool(private val app: Context) : JarvisTool {
         }
     }
 
-    /** Lookup on a background thread; [onResult] is invoked on the main thread, exactly once (except an ignored duplicate). */
+    /** Lookup on a background thread; [onResult] is invoked on the main thread, exactly once. */
     fun executeAsync(action: JarvisAction, onResult: (JarvisActionExecutor.Outcome) -> Unit) {
         val (kind, query) = argsOf(action) ?: run {
             onResult(JarvisActionExecutor.Outcome(false, "این کار هنوز پشتیبانی نمی‌شود."))
             return
         }
-        if (query.isEmpty() || kind !in KINDS) { onResult(execute(action)); return }
-        if (!busy.compareAndSet(false, true)) { Log.w(TAG, "Media already in progress; duplicate ignored"); return }
+        if (kind == KIND_STOP || query.isEmpty() || kind !in KINDS) { onResult(execute(action)); return }
 
         val wantsLocal = kind == KIND_MUSIC || kind == KIND_MOVIE
         if (wantsLocal && !hasPermission(kind)) {
-            // No access to the phone's media files yet: ask via MediaPermissionActivity, the user then repeats the command.
-            busy.set(false)
-            requestPermission()
-            onResult(permissionOutcome())
+            askPermissionThenRetry(kind, action, onResult)
             return
         }
 
+        val mine = ticket.incrementAndGet()
         try {
             worker.execute {
                 val local = if (wantsLocal) {
-                    try { findLocal(kind, query) } catch (e: RuntimeException) { Log.w(TAG, "Local search failed"); null }
+                    try { findLocal(kind, query) } catch (e: RuntimeException) { Log.w(TAG, "Local search failed", e); null }
                 } else null
                 val videoId = if (!wantsLocal) {
                     try { YoutubeLookup.firstVideoId(query) } catch (e: Exception) { Log.w(TAG, "YouTube lookup failed"); null }
                 } else null
                 main.post {
-                    val deliver: (JarvisActionExecutor.Outcome) -> Unit = { o -> busy.set(false); onResult(o) }
+                    if (mine != ticket.get()) { onResult(JarvisActionExecutor.Outcome(false, null)); return@post }   // superseded
                     try {
-                        if (wantsLocal) finishLocal(kind, query, local, deliver)
-                        else deliver(playYoutube(query, videoId))
+                        if (wantsLocal) finishLocal(kind, query, local, onResult)
+                        else onResult(playYoutube(query, videoId))
                     } catch (e: RuntimeException) {
                         Log.w(TAG, "Media action failed", e)
-                        deliver(JarvisActionExecutor.Outcome(false, FAILURE))
+                        onResult(JarvisActionExecutor.Outcome(false, FAILURE))
                     }
                 }
             }
         } catch (e: RuntimeException) {
-            busy.set(false)
             onResult(JarvisActionExecutor.Outcome(false, FAILURE))
         }
     }
@@ -117,12 +116,20 @@ class MediaTool(private val app: Context) : JarvisTool {
         return Pair(call.args["kind"].orEmpty(), call.args["query"].orEmpty().trim())
     }
 
+    private fun stopMedia(): JarvisActionExecutor.Outcome {
+        ticket.incrementAndGet()
+        InternalMediaPlayer.stopAll(app)
+        return JarvisActionExecutor.Outcome(true, "پخش متوقف شد.")
+    }
+
     // ---- files on the phone -----------------------------------------------------------------------
 
     private class LocalFile(val uri: Uri, val mime: String?, val title: String)
 
+    private class Row(val file: LocalFile, val own: String, val hay: String)
+
     private fun permissionOutcome() = JarvisActionExecutor.Outcome(
-        false, "برای پیدا کردن آهنگ و فیلم‌های گوشی اجازه‌ی دسترسی به فایل‌ها لازم است. اجازه را بدهید و دوباره بگویید."
+        false, "برای پیدا کردن آهنگ و فیلم‌های گوشی اجازه‌ی دسترسی به فایل‌ها لازم است. اجازه داده نشد."
     )
 
     private fun hasPermission(kind: String): Boolean {
@@ -132,12 +139,32 @@ class MediaTool(private val app: Context) : JarvisTool {
         return app.checkSelfPermission(perm) == PackageManager.PERMISSION_GRANTED
     }
 
-    private fun requestPermission() {
-        try {
-            app.startActivity(Intent(app, MediaPermissionActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-        } catch (e: RuntimeException) {
-            Log.w(TAG, "Cannot open permission screen", e)
+    private fun requestPermission(): Boolean = try {
+        app.startActivity(Intent(app, MediaPermissionActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        true
+    } catch (e: RuntimeException) {
+        Log.w(TAG, "Cannot open permission screen", e)
+        false
+    }
+
+    /**
+     * No access to the phone's media files yet: show the permission screen and, as soon as the user answers, RUN THE
+     * SAME COMMAND (the user does not have to say it again). If nothing comes back within a minute, it is reported.
+     */
+    private fun askPermissionThenRetry(kind: String, action: JarvisAction, onResult: (JarvisActionExecutor.Outcome) -> Unit) {
+        if (!requestPermission()) { onResult(permissionOutcome()); return }
+        var delivered = false
+        val timeoutRun = Runnable {
+            if (!delivered) { delivered = true; resume = null; onResult(permissionOutcome()) }
         }
+        resume = { granted ->
+            if (!delivered) {
+                delivered = true
+                main.removeCallbacks(timeoutRun)
+                if (granted && hasPermission(kind)) executeAsync(action, onResult) else onResult(permissionOutcome())
+            }
+        }
+        main.postDelayed(timeoutRun, PERMISSION_WAIT_MS)
     }
 
     /** Main thread. Plays the local file inside JARVIS; if there is none says so — NEVER opens anything online. */
@@ -158,7 +185,12 @@ class MediaTool(private val app: Context) : JarvisTool {
         else InternalMediaPlayer.playVideo(app, f.uri, f.title, done)
     }
 
-    /** Background thread. Best matching audio / video file, or null. */
+    /**
+     * Background thread. Best matching audio / video file, or null.
+     * Pass 1: the words of the query are found in the title / file name / artist / folder.
+     * Pass 2 (only if pass 1 found nothing): the speech recognizer writes a foreign (English) name in Persian letters
+     * ("شیپ آف یو"), the file is named in Latin letters ("Shape of You"): both are compared by sound ([Phonetic]).
+     */
     private fun findLocal(kind: String, query: String): LocalFile? {
         val audio = kind == KIND_MUSIC
         val q = MediaMatcher.parse(query, allowEpisode = !audio)
@@ -173,17 +205,16 @@ class MediaTool(private val app: Context) : JarvisTool {
                 MediaStore.MediaColumns.MIME_TYPE, pathCol)
         }
         val cursor = app.contentResolver.query(base, projection, null, null, null) ?: return null
-        return cursor.use { c ->
+        val rows = ArrayList<Row>()
+        cursor.use { c ->
             val iId = c.getColumnIndexOrThrow(BaseColumns._ID)
             val iTitle = c.getColumnIndexOrThrow(MediaStore.MediaColumns.TITLE)
             val iName = c.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
             val iMime = c.getColumnIndexOrThrow(MediaStore.MediaColumns.MIME_TYPE)
             val iArtist = if (audio) c.getColumnIndex(MediaStore.Audio.AudioColumns.ARTIST) else -1
             val iPath = c.getColumnIndex(pathCol)
-            var best: LocalFile? = null
-            var bestLen = Int.MAX_VALUE
-            var rows = 0
-            while (c.moveToNext() && rows++ < MAX_ROWS) {
+            var n = 0
+            while (c.moveToNext() && n++ < MAX_ROWS) {
                 val title = c.getString(iTitle).orEmpty()
                 val name = c.getString(iName).orEmpty().substringBeforeLast('.')
                 val artist = if (iArtist >= 0) c.getString(iArtist).orEmpty() else ""
@@ -191,13 +222,29 @@ class MediaTool(private val app: Context) : JarvisTool {
                 val folder = if (!audio && iPath >= 0) c.getString(iPath).orEmpty() else ""
                 val own = MediaMatcher.normalize("$title $name")
                 val hay = MediaMatcher.normalize("$title $name $artist $folder")
-                if (!q.matches(hay) || own.length >= bestLen) continue
-                bestLen = own.length
-                best = LocalFile(ContentUris.withAppendedId(base, c.getLong(iId)), c.getString(iMime),
-                    title.ifBlank { name })
+                rows.add(Row(LocalFile(ContentUris.withAppendedId(base, c.getLong(iId)), c.getString(iMime), title.ifBlank { name }), own, hay))
             }
-            best
         }
+        // Pass 1: exact words.
+        var best: Row? = null
+        for (r in rows) {
+            if (!q.matches(r.hay)) continue
+            if (best == null || r.own.length < best.own.length) best = r
+        }
+        if (best != null) return best.file
+        // Pass 2: by sound.
+        val qKey = Phonetic.key(q.tokens.joinToString(" "))
+        if (qKey.length < Phonetic.MIN_KEY) return null
+        var bestKey = Int.MAX_VALUE
+        var bestRow: Row? = null
+        for (r in rows) {
+            if (!q.episodeOk(r.hay)) continue
+            val k = Phonetic.key(r.own)
+            if (!k.contains(qKey) || k.length >= bestKey) continue
+            bestKey = k.length
+            bestRow = r
+        }
+        return bestRow?.file
     }
 
     // ---- YouTube (only for "توی یوتیوب ویدئوی X رو پخش کن") ----------------------------------------
@@ -255,6 +302,18 @@ class MediaTool(private val app: Context) : JarvisTool {
         const val KIND_VIDEO = "video"
         const val KIND_MOVIE = "movie"
         const val KIND_YOUTUBE = "youtube"
+        /** "آهنگ رو قطع کن": stops the internal player / closes the internal video screen. */
+        const val KIND_STOP = "stop"
+        private const val PERMISSION_WAIT_MS = 60_000L
+
+        /** Set while the permission screen is open; [MediaPermissionActivity] answers it (main thread). */
+        @Volatile private var resume: ((Boolean) -> Unit)? = null
+
+        fun onPermissionResult(granted: Boolean) {
+            val r = resume
+            resume = null
+            r?.invoke(granted)
+        }
         private val KINDS = setOf(KIND_MUSIC, KIND_VIDEO, KIND_MOVIE, KIND_YOUTUBE)
         private const val YOUTUBE_PKG = "com.google.android.youtube"
         private const val TAG = "MediaTool"
@@ -347,6 +406,54 @@ internal object YoutubeLookup {
     }
 }
 
+/**
+ * Rough sound key shared by Persian and Latin spelling, so "شیپ آف یو" (what a Persian recognizer writes) finds the
+ * file "Shape of You". Vowels, و/v/w and ی/y are dropped; similar consonants share one letter. Pure (no Android).
+ */
+internal object Phonetic {
+    const val MIN_KEY = 3
+
+    fun key(raw: String): String {
+        val s = MediaMatcher.normalize(raw).replace(" ", "")
+        val sb = StringBuilder()
+        fun add(c: Char) { if (sb.isEmpty() || sb[sb.length - 1] != c) sb.append(c) }
+        var i = 0
+        while (i < s.length) {
+            val ch = s[i]
+            val nx = if (i + 1 < s.length) s[i + 1] else ' '
+            when (ch) {
+                's' -> { add('S'); if (nx == 'h') i++ }
+                'c' -> if (nx == 'h') { add('C'); i++ } else if (nx == 'e' || nx == 'i' || nx == 'y') add('S') else add('K')
+                'k', 'g' -> { add('K'); if (nx == 'h') i++ }
+                't' -> { add('T'); if (nx == 'h') i++ }
+                'p' -> if (nx == 'h') { add('F'); i++ } else add('P')
+                'z' -> if (nx == 'h') { add('J'); i++ } else add('Z')
+                'q' -> add('K')
+                'x' -> { add('K'); add('S') }
+                'b', 'ب' -> add('B')
+                'd', 'د' -> add('D')
+                'f', 'ف' -> add('F')
+                'h', 'ح', 'ه' -> add('H')
+                'j', 'ج', 'ژ' -> add('J')
+                'l', 'ل' -> add('L')
+                'm', 'م' -> add('M')
+                'n', 'ن' -> add('N')
+                'r', 'ر' -> add('R')
+                'پ' -> add('P')
+                'ت', 'ط' -> add('T')
+                'ث', 'س', 'ص', 'ش' -> add('S')
+                'چ' -> add('C')
+                'خ', 'ق', 'غ', 'ک', 'گ' -> add('K')
+                'ذ', 'ز', 'ض', 'ظ' -> add('Z')
+                in '0'..'9' -> add(ch)
+                else -> { /* vowels, و v w, ی y, ا, ع ... */ }
+            }
+            i++
+        }
+        return sb.toString()
+    }
+}
+
 /** Matches a spoken "name [فصل M] [قسمت N]" against file names / titles / folders. Pure (no Android). */
 internal object MediaMatcher {
 
@@ -360,6 +467,9 @@ internal object MediaMatcher {
             if (episode == null && season == null) return true
             return episodeMatches(hay)
         }
+
+        /** Season / episode part only (no name check). */
+        fun episodeOk(hay: String): Boolean = (episode == null && season == null) || episodeMatches(hay)
 
         private fun episodeMatches(hay: String): Boolean {
             // 1) explicit season+episode pairs: S01E02, 1x02
@@ -461,7 +571,11 @@ object MediaCommandParser {
     private val videoB = Regex("^(?:لطفا\\s+)?(?:$VERB_OPEN)\\s+$VIDEO_WORDS" + "ی?\\s+(.+)$")
     private val movieA = Regex("^(?:لطفا\\s+)?$MOVIE_WORDS" + "ی?\\s+(.+?)$OBJ\\s+$VERB_OPEN$")
     private val movieB = Regex("^(?:لطفا\\s+)?(?:$VERB_OPEN)\\s+$MOVIE_WORDS" + "ی?\\s+(.+)$")
-    private val inYoutube = Regex("^(?:لطفا\\s+)?(?:تو|توی|در|داخل|on|in)\\s+(?:یوتیوب|یوتوب|youtube)\\s+(.+?)$OBJ\\s+(?:پخش کن|باز کن|play|open)$")
+    private val inYoutube = Regex("^(?:لطفا\\s+)?(?:تو|توی|در|داخل|از|on|in)\\s+(?:یوتیوب|یوتوب|youtube)\\s+(.+?)$OBJ\\s+(?:پخش کن|باز کن|play|open)$")
+    /** "ویدیوی X رو توی یوتیوب پخش کن" / "X رو از یوتیوب پخش کن": the YouTube word comes after the name. */
+    private val youtubeAfter = Regex("^(?:لطفا\\s+)?(.+?)$OBJ\\s+(?:تو|توی|در|داخل|از|on|in)\\s+(?:یوتیوب|یوتوب|youtube)\\s+(?:رو\\s+)?(?:پخش کن|باز کن|بذار|بزن|play|open)$")
+    private val videoLead = Regex("^(?:یه\\s+|یک\\s+)?" + VIDEO_WORDS + "ی?\\s+")
+    private val stopMedia = Regex("^(?:لطفا\\s+)?(?:آهنگ|اهنگ|موزیک|فیلم|سریال|ویدیو|ویدئو|پخش|music|video)(?:\\s+(?:رو|را))?\\s+(?:قطع کن|متوقف کن|استپ کن|استاپ کن|خاموش کن|بسته کن|ببند|stop)$|^(?:لطفا\\s+)?(?:قطع کن|متوقف کن|خاموش کن|استپ کن|استاپ کن)\\s+(?:آهنگ|اهنگ|موزیک|فیلم|سریال|ویدیو|ویدئو|پخش)$|^(?:استپ|استاپ|stop)$")
     private val openYoutube = Regex("^(?:لطفا\\s+)?(?:برنامه\\s+)?(?:یوتیوب|یوتوب|یوتیوپ|یو تیوب|youtube)$OBJ\\s+(?:رو\\s+)?(?:باز کن|باز کنید|اجرا کن|open)$")
 
     /** "آهنگ رو پخش کن" / "یه آهنگ پخش کن" / "پخش کن آهنگ": a song request without a name. */
@@ -476,13 +590,18 @@ object MediaCommandParser {
         val t = norm(text)
         if (t.isEmpty()) return null
         if (openYoutube.matches(t)) return call(MediaTool.KIND_YOUTUBE, "")
+        if (stopMedia.matches(t)) return call(MediaTool.KIND_STOP, "")
         if (musicNoName.matches(t)) return call(MediaTool.KIND_MUSIC, "")
+        // YouTube is only used when the user says "یوتیوب"; it is checked before the phone-only music / movie rules.
+        inYoutube.matchEntire(t)?.let { return query(MediaTool.KIND_VIDEO, stripVideoWord(it.groupValues[1])) }
+        youtubeAfter.matchEntire(t)?.let { return query(MediaTool.KIND_VIDEO, stripVideoWord(it.groupValues[1])) }
         for (r in listOf(musicA, musicB)) r.matchEntire(t)?.let { return query(MediaTool.KIND_MUSIC, it.groupValues[1]) }
-        inYoutube.matchEntire(t)?.let { return query(MediaTool.KIND_VIDEO, it.groupValues[1]) }
         for (r in listOf(videoA, videoB)) r.matchEntire(t)?.let { return query(MediaTool.KIND_VIDEO, it.groupValues[1]) }
         for (r in listOf(movieA, movieB)) r.matchEntire(t)?.let { return query(MediaTool.KIND_MOVIE, it.groupValues[1]) }
         return null
     }
+
+    private fun stripVideoWord(q: String): String = q.trim().replace(videoLead, "")
 
     private fun query(kind: String, q: String): JarvisAction? {
         val clean = q.trim().removeSuffix(" رو").removeSuffix(" را").trim()

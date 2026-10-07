@@ -20,13 +20,21 @@ class MediaPermissionActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val missing = REQUIRED().filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
-        if (missing.isEmpty()) { finish(); return }
+        if (missing.isEmpty()) { MediaTool.onPermissionResult(true); finish(); return }
         requestPermissions(missing.toTypedArray(), REQUEST_CODE)
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        // MediaTool re-runs the waiting command itself (it re-checks the permission it needs: audio or video).
+        MediaTool.onPermissionResult(grantResults.isNotEmpty() && grantResults.any { it == PackageManager.PERMISSION_GRANTED })
         finish()
+    }
+
+    override fun onDestroy() {
+        // Closed without an answer (e.g. the user left the screen): do not leave the command waiting.
+        MediaTool.onPermissionResult(false)
+        super.onDestroy()
     }
 
     private companion object {

@@ -3,8 +3,11 @@ package com.jarvis.assistant.command
 import android.content.Context
 import android.content.Intent
 import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.media.MediaPlayer
 import android.net.Uri
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -25,10 +28,13 @@ object InternalMediaPlayer {
     private var player: MediaPlayer? = null
     private var pending: ((Boolean) -> Unit)? = null
     private var timeout: Runnable? = null
+    private var focusRequest: AudioFocusRequest? = null
+    private var audioManager: AudioManager? = null
 
     /** Plays an audio file. [onResult](true) only when playback has really started. */
     fun playAudio(app: Context, uri: Uri, onResult: (Boolean) -> Unit) {
         stop()
+        InternalVideoActivity.closeCurrent()
         pending = onResult
         val mp = MediaPlayer()
         player = mp
@@ -39,10 +45,12 @@ object InternalMediaPlayer {
                     .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                     .build()
             )
+            mp.setWakeMode(app.applicationContext, android.os.PowerManager.PARTIAL_WAKE_LOCK)
             mp.setDataSource(app.applicationContext, uri)
             mp.setOnPreparedListener { p ->
                 if (player !== p) return@setOnPreparedListener
                 try {
+                    requestFocus(app)
                     p.start()
                     report(p.isPlaying)
                 } catch (e: RuntimeException) {
@@ -85,7 +93,39 @@ object InternalMediaPlayer {
     internal fun videoStarted() = report(true)
     internal fun videoFailed() = report(false)
 
+    /** Stops the audio player AND closes the video screen (the "قطع کن" command). */
+    fun stopAll(app: Context) {
+        stop()
+        InternalVideoActivity.closeCurrent()
+    }
+
+    private fun requestFocus(app: Context) {
+        try {
+            val am = app.applicationContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+            audioManager = am
+            if (Build.VERSION.SDK_INT >= 26) {
+                val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                    .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
+                    .setOnAudioFocusChangeListener { }
+                    .build()
+                focusRequest = req
+                am.requestAudioFocus(req)
+            }
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "audio focus failed", e)
+        }
+    }
+
+    private fun abandonFocus() {
+        try {
+            val req = focusRequest
+            focusRequest = null
+            if (req != null && Build.VERSION.SDK_INT >= 26) audioManager?.abandonAudioFocusRequest(req)
+        } catch (e: RuntimeException) { /* ignore */ }
+    }
+
     fun stop() {
+        abandonFocus()
         timeout?.let { main.removeCallbacks(it) }
         timeout = null
         val mp = player

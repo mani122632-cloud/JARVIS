@@ -55,6 +55,9 @@ class DefaultJarvisBrain(
     /** Key of the last fact remembered or recalled, so "این رو فراموش کن" knows what "این" is. */
     private var lastKey: String? = null
 
+    /** The session context of the last multi-turn [think]; lets [pickBest] know that a media question is open. */
+    private var activeContext: ConversationContext? = null
+
     override fun think(text: String): BrainResult = try {
         decide(text, null)
     } catch (e: Exception) {
@@ -147,11 +150,12 @@ class DefaultJarvisBrain(
      */
     private fun handleMediaAnswer(text: String, ctx: ConversationContext): BrainResult? {
         val stage = ctx.mediaStage ?: return null
-        val ending = EndConversationDetector.detect(text)
-        if (isCancel(text) && ending == null) {
+        // "لغو" ends the whole media dialog (stage, language, attempts) before anything else is looked at.
+        if (isMediaCancel(text)) {
             clearMedia(ctx)
             return BrainResult.Conversation(JarvisPhrases.CANCELLED)
         }
+        val ending = EndConversationDetector.detect(text)
         if (ending != null) { clearMedia(ctx); return null }
         return when (stage) {
             MediaStage.ASK_LANGUAGE -> {
@@ -171,7 +175,7 @@ class DefaultJarvisBrain(
                 BrainResult.Clarify(ASK_SONG_LANGUAGE)
             }
             MediaStage.ASK_NAME -> {
-                val name = PersianNormalizer.tokens(text)
+                val name = mediaTokens(text)
                     .filter { it !in SONG_FILLERS }.joinToString(" ").trim()
                 if (name.isEmpty()) {
                     if (ctx.mediaAttempts >= MAX_RETRIES) {
@@ -181,19 +185,46 @@ class DefaultJarvisBrain(
                     ctx.mediaAttempts++
                     return BrainResult.Clarify(ASK_SONG_NAME)
                 }
+                val lang = ctx.mediaLanguage ?: "fa"
                 clearMedia(ctx)
-                val action = JarvisAction.ToolCall(MediaTool.NAME, mapOf("kind" to MediaTool.KIND_MUSIC, "query" to name))
+                val action = JarvisAction.ToolCall(MediaTool.NAME, mapOf("kind" to MediaTool.KIND_MUSIC, "query" to name, "lang" to lang))
                 BrainResult.Command(action, "", ANSWER_CONFIDENCE)
             }
         }
     }
 
-    /** "fa" / "en" / null. */
+    /** "fa" / "en" / null. Own tokenizer: Latin letters must survive ("english"). */
     private fun songLanguage(text: String): String? {
-        val t = PersianNormalizer.tokens(text)
-        val fa = t.any { it.startsWith("فارسی") || it.startsWith("پارسی") || it == "farsi" || it == "persian" }
-        val en = t.any { it.startsWith("انگلیسی") || it.startsWith("اینگلیسی") || it.startsWith("انگلیش") || it == "english" }
+        val t = mediaTokens(text)
+        val fa = t.any { it.startsWith("فارسی") || it.startsWith("پارسی") || it == "farsi" || it == "persian" || it == "fa" }
+        val en = t.any {
+            it.startsWith("انگلیسی") || it.startsWith("اینگلیسی") || it.startsWith("انگلیش") || it.startsWith("اینگلیش") ||
+                it == "english" || it == "en"
+        }
         return when { fa && !en -> "fa"; en && !fa -> "en"; else -> null }
+    }
+
+    /** Lower-case words; ZWNJ / punctuation are separators; Arabic ي ك -> ی ک; Latin and digits are kept. */
+    private fun mediaTokens(text: String): List<String> {
+        val sb = StringBuilder(text.length)
+        for (ch in text.lowercase()) {
+            when {
+                ch == 'ي' -> sb.append('ی')
+                ch == 'ك' -> sb.append('ک')
+                ch in '\u064B'..'\u065F' || ch == '\u0670' -> { }
+                ch.isLetterOrDigit() -> sb.append(ch)
+                else -> sb.append(' ')
+            }
+        }
+        return sb.toString().split(' ').filter { it.isNotEmpty() }
+    }
+
+    /** "لغو" / "ولش کن" / "بیخیال" ... while the media question is open. */
+    private fun isMediaCancel(text: String): Boolean {
+        val t = mediaTokens(text)
+        if (t.isEmpty() || t.size > 4) return false
+        if (t.any { it in MEDIA_CANCEL_WORDS }) return true
+        return "ول" in t && "کن" in t
     }
 
     private fun question(target: SlotTarget): String =
@@ -222,6 +253,7 @@ class DefaultJarvisBrain(
      * not touched and no second parser exists.
      */
     override fun think(text: String, context: ConversationContext): BrainResult = try {
+        activeContext = context
         val cleaned = stripLeadIns(text)
         val result = decide(cleaned, context)
         if (result is BrainResult.Unknown && cleaned.isNotBlank()) {
@@ -275,6 +307,16 @@ class DefaultJarvisBrain(
     override fun pickBest(candidates: List<String>): String {
         val usable = candidates.filter { it.isNotBlank() }
         if (usable.isEmpty()) return candidates.firstOrNull().orEmpty()
+        // A media question is open: the right alternative is the one that answers it, not one that happens to be a command.
+        when (activeContext?.mediaStage) {
+            MediaStage.ASK_LANGUAGE ->
+                usable.firstOrNull { songLanguage(it) != null || isMediaCancel(it) }?.let { return it }
+            MediaStage.ASK_NAME -> {
+                usable.firstOrNull { isMediaCancel(it) }?.let { return it }
+                return usable.first()
+            }
+            null -> { }
+        }
         for (c in usable) {
             val handled = try {
                 MemoryCommandParser.parse(c) != null || processor.process(c).handled ||
@@ -338,7 +380,11 @@ class DefaultJarvisBrain(
         const val MAX_RETRIES = 1
         const val ASK_SONG_LANGUAGE = "اسم آهنگ رو فارسی می‌گی یا انگلیسی؟"
         const val ASK_SONG_NAME = "اسم آهنگ رو بگو"
-        val SONG_FILLERS = setOf("آهنگ", "اهنگ", "موزیک", "اسمش", "اسم", "رو", "را", "پخش", "کن")
+        val SONG_FILLERS = setOf(
+            "آهنگ", "اهنگ", "موزیک", "اسمش", "اسم", "رو", "را", "پخش", "کن", "بذار", "بزن", "لطفا", "یه", "یک", "اسمشو", "اینه", "هست", "است",
+            "song", "music", "play"
+        )
+        val MEDIA_CANCEL_WORDS = setOf("لغو", "کنسل", "ولش", "بیخیال", "نمیخوام", "منصرف", "cancel", "stop", "فراموشش", "هیچی", "بیخیالش")
         const val ANSWER_CONFIDENCE = 0.95f
         val CANCEL_WORDS = setOf("لغو", "کنسل", "ولش", "بیخیال", "نمیخوام", "هیچی", "فراموشش", "منصرف")
     }

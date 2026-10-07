@@ -460,6 +460,12 @@ class JarvisConversationController(
         when {
             // Back's only real effect is closing the assistant, so the session ends with it.
             action == JarvisAction.GoBack -> finish()
+            // Media really started (song / movie / YouTube page): say it, then END the session. The microphone must not
+            // keep listening to the music, and the player / video screen keeps running without the assistant.
+            message != null && outcome.success && isMediaAction(action) -> {
+                conversationContext.addResponse(message)
+                speak(message) { finish() }
+            }
             // The executor's sentence: the reason for a failure, or the confirmation of a real alarm / timer.
             message != null -> {
                 conversationContext.addResponse(message)
@@ -469,6 +475,9 @@ class JarvisConversationController(
             else -> listen(AFTER_COMMAND_DELAY_MS, newTurn = true)
         }
     }
+
+    private fun isMediaAction(action: JarvisAction): Boolean =
+        action is JarvisAction.ToolCall && action.tool == com.jarvis.assistant.command.MediaTool.NAME
 
     // ---- speaking -------------------------------------------------------------------------------
 
