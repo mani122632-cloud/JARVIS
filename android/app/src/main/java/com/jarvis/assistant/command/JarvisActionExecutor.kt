@@ -54,7 +54,7 @@ class JarvisActionExecutor(
 
     private val appResolver = InstalledAppResolver(app)
 
-    private val registry = ToolRegistry(tools ?: listOf(AlarmTool(app), TimerTool(app), CallTool(app), SmsTool(app), MediaTool(app)))
+    private val registry = ToolRegistry(tools ?: listOf(AlarmTool(app), TimerTool(app), CallTool(app), SmsTool(app), MediaTool(app), BrowserSearchTool(app)))
 
     /** Adds (or replaces, by name) a tool, e.g. a future call / SMS / contacts / search tool. */
     fun register(tool: JarvisTool) = registry.register(tool)
@@ -93,7 +93,7 @@ class JarvisActionExecutor(
     }
 
     /** True when [action] must run through [executeAsync] (its tool does blocking work, e.g. a contact lookup). */
-    fun runsAsync(action: JarvisAction): Boolean = registry.find(action).let { it is CallTool || it is SmsTool }
+    fun runsAsync(action: JarvisAction): Boolean = registry.find(action).let { it is CallTool || it is SmsTool || it is MediaTool }
 
     /**
      * Runs [action] without blocking the main thread; [onResult] is invoked on the main thread, once. Tools that
@@ -101,9 +101,13 @@ class JarvisActionExecutor(
      */
     fun executeAsync(action: JarvisAction, onResult: (Outcome) -> Unit) {
         val tool = try { registry.find(action) } catch (e: RuntimeException) { null }
-        if (tool is CallTool || tool is SmsTool) {
+        if (tool is CallTool || tool is SmsTool || tool is MediaTool) {
             try {
-                if (tool is SmsTool) tool.executeAsync(action, onResult) else (tool as CallTool).executeAsync(action, onResult)
+                when (tool) {
+                    is SmsTool -> tool.executeAsync(action, onResult)
+                    is MediaTool -> tool.executeAsync(action, onResult)
+                    else -> (tool as CallTool).executeAsync(action, onResult)
+                }
             } catch (e: RuntimeException) {
                 Log.e(TAG, "Async action failed: $action", e)
                 onResult(Outcome(false, GENERIC_FAILURE))
