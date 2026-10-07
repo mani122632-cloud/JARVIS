@@ -23,6 +23,7 @@ import com.jarvis.assistant.command.JarvisActionExecutor
 import com.jarvis.assistant.command.JarvisCommandProcessor
 import com.jarvis.assistant.conversation.JarvisConversationController
 import com.jarvis.assistant.memory.SharedPreferencesJarvisMemory
+import com.jarvis.assistant.online.GeminiProvider
 import com.jarvis.assistant.online.JarvisToolCatalog
 import com.jarvis.assistant.online.OnlineBrain
 import com.jarvis.assistant.online.OnlineNetwork
@@ -89,8 +90,12 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
         })
         wake.preload()      // load the Vosk model in the background now (no microphone); start() reuses it
         executor = JarvisActionExecutor(this)
-        // Online Brain Stage 1: no provider is registered, so Online stays off (isAvailable() == false) and the
-        // Brain never escalates; behaviour is exactly the offline one.
+        // Online Brain Stage 2: the Gemini provider (API key encrypted in the Android Keystore, entered in
+        // GeminiSetupActivity). Without a saved key isAvailable() is false, the Brain never escalates and the
+        // behaviour is exactly the offline one. Simple local commands never reach this provider.
+        if (OnlineProviderRegistry.provider == null) {
+            OnlineProviderRegistry.provider = GeminiProvider(applicationContext)
+        }
         online = OnlineBrain(
             provider = OnlineProviderRegistry.provider,
             tools = JarvisToolCatalog(executor),
