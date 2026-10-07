@@ -49,6 +49,13 @@ class JarvisActivationController(
     private var coreRef: WeakReference<JarvisCoreView>? = null
     private var generation = 0
 
+    /** True only for a session started by a valid WAKE_WORD, and only until that session ends. */
+    private var wakeSession = false
+
+    /** Command input is allowed only while a wake-word session is in READY_FOR_COMMAND. */
+    val commandAuthorized: Boolean
+        get() = wakeSession && phase == Phase.READY_FOR_COMMAND
+
     /** TTS never even started (engine dead / no Persian voice): don't make the user wait. */
     private val startTimeoutRunnable = Runnable {
         if (phase != Phase.ACTIVATING) return@Runnable
@@ -76,11 +83,16 @@ class JarvisActivationController(
     /**
      * @return true if an activation started; false if ignored (already activating/active, or no core available).
      */
-    fun activate(@Suppress("UNUSED_PARAMETER") source: Source = Source.MANUAL): Boolean {
+    fun activate(source: Source = Source.MANUAL): Boolean {
+        if (source != Source.WAKE_WORD) {
+            Log.w(TAG, "Activation rejected: source $source is not WAKE_WORD")
+            return false
+        }
         if (phase != Phase.IDLE) return false
         val core = (if (presenter != null) presenter.showOverlay() else coreRef?.get()) ?: return false
         coreRef = WeakReference(core)
         phase = Phase.ACTIVATING
+        wakeSession = true
         val gen = ++generation
 
         if (useCinematic) core.showCinematic()
@@ -116,19 +128,21 @@ class JarvisActivationController(
         if (gen != generation || phase != Phase.ACTIVATING) return
         main.removeCallbacks(timeoutRunnable)
         main.removeCallbacks(startTimeoutRunnable)
+        if (!wakeSession) return
         phase = Phase.READY_FOR_COMMAND
         coreRef?.get()?.let {
             it.setVoiceAmplitude(0f)
             it.setState(JarvisState.LISTENING)
         }
         try {
-            listener?.onReadyForCommand()
+            if (commandAuthorized) listener?.onReadyForCommand()
         } catch (t: Throwable) {            // the command stage must never crash the activation
             Log.e(TAG, "onReadyForCommand threw", t)
         }
     }
 
     private fun cancelPending() {
+        wakeSession = false                // command permission is revoked the moment a session ends
         generation++                       // invalidates in-flight speech callbacks
         main.removeCallbacks(timeoutRunnable)
         main.removeCallbacks(startTimeoutRunnable)

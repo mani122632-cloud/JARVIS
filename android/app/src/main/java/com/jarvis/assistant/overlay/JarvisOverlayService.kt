@@ -135,6 +135,11 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
             override fun onReadyForCommand() {
                 // "بله ارباب." is done. Vosk is suspended (runActivation), so the command recognizer
                 // is the only microphone user from here until the overlay hides.
+                if (!activation.commandAuthorized) {
+                    Log.w(TAG, "Command stage refused: no valid wake-word session")
+                    endInteraction()
+                    return
+                }
                 try {
                     conversation.begin()
                 } catch (t: Throwable) {
@@ -182,16 +187,10 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
                     Log.w(TAG, "Overlay permission missing; ignoring activation")
                     finishIfIdle()
                 } else {
-                    val source = parseSource(intent.getStringExtra(EXTRA_SOURCE))
-                    val delay = intent.getLongExtra(EXTRA_DELAY_MS, 0L)
-                    cancelPendingActivate()
-                    if (delay > 0L) {
-                        val r = Runnable { pendingActivate = null; runActivation(source) }
-                        pendingActivate = r
-                        main.postDelayed(r, delay)
-                    } else {
-                        runActivation(source)
-                    }
+                    // Only the Vosk wake word («هی جارویس») may activate JARVIS. Intent-based
+                    // triggers (manual / assistant / overlay / headset / button) are never accepted.
+                    Log.w(TAG, "Activation intent ignored: only the wake word can activate JARVIS")
+                    finishIfIdle()
                 }
             }
             ACTION_HIDE -> endInteraction()
@@ -233,6 +232,10 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
     }
 
     private fun runActivation(source: JarvisActivationController.Source) {
+        if (source != JarvisActivationController.Source.WAKE_WORD) {
+            Log.w(TAG, "Activation rejected: source $source is not WAKE_WORD")
+            return
+        }
         if (activation.phase != JarvisActivationController.Phase.IDLE || conversation.state != JarvisConversationController.State.IDLE) {
             Log.w(TAG, "Activation ignored: an interaction is already running")   // never restart a live session
             return
