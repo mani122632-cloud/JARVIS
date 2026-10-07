@@ -29,6 +29,9 @@ class JarvisCommandProcessor(private val parser: CommandIntentParser = CommandIn
     fun process(text: String): Result {
         // SMS first (fast path, no LLM). Never from a partial result: a half-heard message must not be sent.
         SmsCommandParser.parse(text)?.let { return Result(true, it, "", 1f, deferToFinal = true) }
+        // Call contact (fast path, no LLM). CallTool refuses a missing / unknown / ambiguous name with a question.
+        // Final result only: a half-heard name must not dial the wrong contact.
+        CallCommandParser.parse(text)?.let { return Result(true, it, "", 1f, deferToFinal = true) }
         val parsed = parser.parse(text)
         val ok = parsed.action !is JarvisAction.Unknown && parsed.confidence >= CommandConfidence.THRESHOLD
         // Alarm / Timer / "needs info" speak their own result or question, so no "حتماً." in front of them.
