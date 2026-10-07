@@ -167,12 +167,31 @@ class MediaTool(private val app: Context) : JarvisTool {
         main.postDelayed(timeoutRun, PERMISSION_WAIT_MS)
     }
 
-    /** Main thread. Plays the local file inside JARVIS; if there is none says so — NEVER opens anything online. */
+    private fun openInPlayer(f: LocalFile): Boolean {
+        val type = f.mime?.takeIf { it.startsWith("audio") } ?: "audio/*"
+        val intent = Intent(Intent.ACTION_VIEW)
+            .setDataAndType(f.uri, type)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        return start(intent)
+    }
+
+    /** Main thread. Songs go to the phone's player, movies play inside JARVIS; if there is none says so — NEVER opens anything online. */
     private fun finishLocal(kind: String, query: String, f: LocalFile?, onResult: (JarvisActionExecutor.Outcome) -> Unit) {
         val isMusic = kind == KIND_MUSIC
         if (f == null) {
             val what = if (isMusic) "آهنگ" else "فیلم"
-            onResult(JarvisActionExecutor.Outcome(false, "$what «$query» را در فایل‌های گوشی پیدا نکردم. اگر می‌خواهید از یوتیوب پخش شود، بگویید «توی یوتیوب ویدیوی ... را پخش کن»."))
+            onResult(JarvisActionExecutor.Outcome(false,
+                if (isMusic) "این آهنگ رو پیدا نکردم."
+                else "$what «$query» را در فایل‌های گوشی پیدا نکردم. اگر می‌خواهید از یوتیوب پخش شود، بگویید «توی یوتیوب ویدیوی ... را پخش کن».")) 
+            return
+        }
+        if (isMusic) {
+            // Songs: hand the file to the phone's own Music / media player with a standard Intent. No internal player.
+            val ok = try { openInPlayer(f) } catch (e: RuntimeException) { Log.w(TAG, "Player launch failed", e); false }
+            onResult(
+                if (ok) JarvisActionExecutor.Outcome(true, "«${f.title}» را در پخش‌کننده‌ی گوشی باز کردم.")
+                else JarvisActionExecutor.Outcome(false, "آهنگ را پیدا کردم، اما برنامه‌ای برای پخش آن روی گوشی پیدا نشد.")
+            )
             return
         }
         val done: (Boolean) -> Unit = { ok ->
@@ -181,8 +200,7 @@ class MediaTool(private val app: Context) : JarvisTool {
                 else JarvisActionExecutor.Outcome(false, "«${f.title}» را در گوشی پیدا کردم، اما پخش آن شروع نشد.")
             )
         }
-        if (isMusic) InternalMediaPlayer.playAudio(app, f.uri, done)
-        else InternalMediaPlayer.playVideo(app, f.uri, f.title, done)
+        InternalMediaPlayer.playVideo(app, f.uri, f.title, done)
     }
 
     /**
@@ -412,9 +430,11 @@ internal object YoutubeLookup {
  */
 internal object Phonetic {
     const val MIN_KEY = 3
+    /** "the" in Latin / "دی" "د" "ذ" "ذه" in Persian spelling: ignored, because they are heard inconsistently. */
+    private val ARTICLES = setOf("the", "دی", "د", "ذ", "ذه", "ذی")
 
     fun key(raw: String): String {
-        val s = MediaMatcher.normalize(raw).replace(" ", "")
+        val s = MediaMatcher.normalize(raw).split(' ').filter { it !in ARTICLES }.joinToString("")
         val sb = StringBuilder()
         fun add(c: Char) { if (sb.isEmpty() || sb[sb.length - 1] != c) sb.append(c) }
         var i = 0

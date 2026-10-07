@@ -107,10 +107,10 @@ class DefaultJarvisBrain(
         // "آهنگ رو پخش کن" without a name: ask the language first, then the name (needs a session).
         if (ctx != null && MediaCommandParser.isNamelessMusic(command)) {
             ctx.pending = null
-            ctx.mediaStage = MediaStage.ASK_LANGUAGE
+            ctx.mediaStage = MediaStage.ASK_NAME     // no language question: only the song name
             ctx.mediaLanguage = null
             ctx.mediaAttempts = 0
-            return BrainResult.Clarify(ASK_SONG_LANGUAGE)
+            return BrainResult.Clarify(ASK_SONG_NAME)
         }
         if (command != null && command !is JarvisAction.DismissAssistant && command !is JarvisAction.NeedsInfo) {
             return BrainResult.Command(command, result.responseText, result.confidence)
@@ -379,7 +379,7 @@ class DefaultJarvisBrain(
         const val MEMORY_ERROR = "نتوانستم حافظه را به‌روزرسانی کنم."
         const val MAX_RETRIES = 1
         const val ASK_SONG_LANGUAGE = "اسم آهنگ رو فارسی می‌گی یا انگلیسی؟"
-        const val ASK_SONG_NAME = "اسم آهنگ رو بگو"
+        const val ASK_SONG_NAME = "چه آهنگی رو پخش کنم؟"
         val SONG_FILLERS = setOf(
             "آهنگ", "اهنگ", "موزیک", "اسمش", "اسم", "رو", "را", "پخش", "کن", "بذار", "بزن", "لطفا", "یه", "یک", "اسمشو", "اینه", "هست", "است",
             "song", "music", "play"
