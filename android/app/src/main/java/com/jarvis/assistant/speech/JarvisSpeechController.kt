@@ -19,6 +19,15 @@ interface JarvisSpeechController {
     /** Stops current/pending speech. The pending callback is dropped, not invoked. */
     fun stop()
 
+    /** True from the moment audio starts until it finishes or is stopped. Default false for engines that don't track it. */
+    val isSpeaking: Boolean get() = false
+
+    /**
+     * Barge-in: cuts the current speech immediately (callback dropped, like [stop]).
+     * @return true if something was speaking or pending.
+     */
+    fun interrupt(): Boolean { val was = isSpeaking; stop(); return was }
+
     /** Releases the engine. The controller must not be used afterwards. */
     fun shutdown()
 }

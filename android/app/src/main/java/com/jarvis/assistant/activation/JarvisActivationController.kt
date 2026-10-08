@@ -112,6 +112,18 @@ class JarvisActivationController(
         return true
     }
 
+    /**
+     * Barge-in during the wake acknowledgement: cuts the phrase and goes straight to command listening.
+     * Only valid inside a WAKE_WORD session (security unchanged); otherwise a no-op.
+     * @return true if the phrase was interrupted.
+     */
+    fun interruptSpeech(): Boolean {
+        if (!wakeSession || phase != Phase.ACTIVATING) return false
+        speech.stop()
+        completeActivation(generation)
+        return phase == Phase.READY_FOR_COMMAND
+    }
+
     /** End the interaction: READY, then the overlay hides. Safe to call repeatedly. */
     fun deactivate() {
         cancelPending()

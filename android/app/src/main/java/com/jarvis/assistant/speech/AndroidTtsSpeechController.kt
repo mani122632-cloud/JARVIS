@@ -33,6 +33,7 @@ class AndroidTtsSpeechController(context: Context) : JarvisSpeechController {
     private var callback: JarvisSpeechController.Callback? = null
     private var currentId: String? = null
     private var counter = 0
+    private var speaking = false
 
     init { createEngine(null) }
 
@@ -74,7 +75,7 @@ class AndroidTtsSpeechController(context: Context) : JarvisSpeechController {
         engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String) {
                 Log.i(TAG, "TTS speak started: $utteranceId")
-                main.post { if (utteranceId == currentId) callback?.onStart() }
+                main.post { if (utteranceId == currentId) { speaking = true; callback?.onStart() } }
             }
             override fun onDone(utteranceId: String) {
                 Log.i(TAG, "TTS speak completed: $utteranceId")
@@ -162,13 +163,23 @@ class AndroidTtsSpeechController(context: Context) : JarvisSpeechController {
         val cb = callback
         callback = null
         currentId = null
+        speaking = false
         cb?.onDone(success)
+    }
+
+    override val isSpeaking: Boolean get() = speaking && currentId != null
+
+    override fun interrupt(): Boolean {
+        val was = speaking || pendingText != null
+        stop()
+        return was
     }
 
     override fun stop() {
         callback = null
         currentId = null
         pendingText = null
+        speaking = false
         if (ready) tts?.stop()
     }
 

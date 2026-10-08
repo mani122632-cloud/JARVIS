@@ -129,7 +129,8 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
                 }
                 override fun onConversationFinished() = endInteraction()   // hides overlay, then Vosk resumes
             },
-            onlineBrain = online
+            onlineBrain = online,
+            isBargeInAllowed = { interactionActive && activation.commandAuthorized }   // Stage 5C: wake-word session only
         )
         activation.listener = object : JarvisActivationController.Listener {
             override fun onReadyForCommand() {

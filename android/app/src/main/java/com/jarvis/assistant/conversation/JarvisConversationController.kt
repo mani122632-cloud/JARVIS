@@ -17,6 +17,7 @@ import com.jarvis.assistant.online.OnlineFallbackPhrases
 import com.jarvis.assistant.speech.CommandSpeechError
 import com.jarvis.assistant.speech.JarvisPhrases
 import com.jarvis.assistant.speech.JarvisSpeechController
+import com.jarvis.assistant.speech.RequestGate
 import com.jarvis.assistant.speech.SpeechInput
 
 /**
@@ -53,7 +54,9 @@ class JarvisConversationController(
     /** Bounded in-RAM history of this session (cleared at start and end). */
     val conversationContext: ConversationContext = ConversationContext(),
     /** Online Brain Stage 1. Null (or unavailable) = a [BrainResult.Escalate] falls back to the offline answer. */
-    private val onlineBrain: OnlineBrain? = null
+    private val onlineBrain: OnlineBrain? = null,
+    /** Stage 5C: barge-in is only allowed inside a valid wake-word session (supplied by the service). */
+    private val isBargeInAllowed: () -> Boolean = { true }
 ) {
     enum class State { IDLE, COMMAND_LISTENING, COMMAND_PROCESSING, RESPONDING }
 
@@ -88,6 +91,16 @@ class JarvisConversationController(
 
     /** Stage 5B: identity of the current request; async results of older requests are dropped. */
     private var requestId = 0
+
+    /** Stage 5C: stale-request guard; cancelled by barge-in / cancel / finish. */
+    private val gate = RequestGate()
+    private var gateToken = 0
+
+    /** Stage 5C: the mic is open DURING a reply only to detect the user speaking (barge-in). */
+    private var bargeArmed = false
+    private var bargeHits = 0
+    private var bargeGen = 0
+    private val bargeArmRunnable = Runnable { armBargeNow() }
     private var lastUtterance = ""
     private var lastUtteranceAt = 0L
     /** True until the first utterance after the wake word has been received. */
@@ -138,9 +151,18 @@ class JarvisConversationController(
         commandSpeech.setListener(object : SpeechInput.Listener {
             override fun onListeningStarted() { core()?.setState(JarvisState.LISTENING) }
             override fun onFinalAlternatives(texts: List<String>) { alternatives = texts }
-            override fun onFinalResult(text: String) = guarded { onUtterance(text) }
+            override fun onFinalResult(text: String) = guarded {
+                if (state == State.RESPONDING) { alternatives = emptyList(); onBargeSessionEnded() }   // no barge-in was triggered: not a command
+                else onUtterance(text)
+            }
             override fun onError(error: CommandSpeechError) = guarded { onSpeechError(error) }
-            override fun onVoiceLevel(level: Float) { if (state == State.COMMAND_LISTENING) core()?.setVoiceAmplitude(level) }
+            override fun onVoiceLevel(level: Float) {
+                when (state) {
+                    State.COMMAND_LISTENING -> core()?.setVoiceAmplitude(level)
+                    State.RESPONDING -> guarded { onBargeLevel(level) }
+                    else -> Unit
+                }
+            }
         })
     }
 
@@ -157,6 +179,8 @@ class JarvisConversationController(
         failedAttempts = 0
         alternatives = emptyList()
         firstTurn = true
+        bargeArmed = false
+        bargeHits = 0
         lastUtterance = ""
         lastUtteranceAt = 0L
         turnTimeoutMs = FIRST_TURN_TIMEOUT_MS
@@ -169,6 +193,7 @@ class JarvisConversationController(
     /** Aborts everything silently (no finished callback). */
     fun cancel() {
         generation++
+        gate.cancel()
         invalidateOnline(resetHistory = true)
         main.removeCallbacksAndMessages(null)
         try { commandSpeech.stopListening() } catch (t: Throwable) { Log.w(TAG, "stopListening failed", t) }
@@ -233,6 +258,12 @@ class JarvisConversationController(
     }
 
     private fun onSpeechError(error: CommandSpeechError) {
+        if (state == State.RESPONDING) {                   // the barge-in listener ended (nothing heard / error)
+            val retry = error == CommandSpeechError.NO_SPEECH || error == CommandSpeechError.NO_MATCH
+            alternatives = emptyList()
+            onBargeSessionEnded(retry)
+            return
+        }
         if (state != State.COMMAND_LISTENING) return
         generation++
         when (error) {
@@ -296,6 +327,7 @@ class JarvisConversationController(
         lastUtterance = norm
         lastUtteranceAt = now
         requestId++
+        gateToken = gate.begin()
         firstTurn = false
         generation++
         invalidateOnline(resetHistory = false)             // a new utterance makes any older online turn stale
@@ -483,8 +515,9 @@ class JarvisConversationController(
         if (executor.runsAsync(action)) {
             val gen = ++generation
             val req = requestId
+            val tok = gateToken
             try {
-                executor.executeAsync(action) { o -> if (gen == generation && req == requestId && state != State.IDLE) guarded { next(o) } }
+                executor.executeAsync(action) { o -> if (gen == generation && req == requestId && gate.isCurrent(tok) && state != State.IDLE) guarded { next(o) } }
             } catch (e: RuntimeException) {
                 Log.e(TAG, "Executor threw", e)
                 next(JarvisActionExecutor.Outcome(false, null))
@@ -523,9 +556,10 @@ class JarvisConversationController(
         if (executor.runsAsync(action)) {
             val gen = ++generation
             val req = requestId
+            val tok = gateToken
             try {
                 executor.executeAsync(action) { outcome ->
-                    if (gen != generation || req != requestId || state == State.IDLE) return@executeAsync   // session cancelled / finished meanwhile
+                    if (gen != generation || req != requestId || !gate.isCurrent(tok) || state == State.IDLE) return@executeAsync   // session cancelled / finished meanwhile
                     guarded { handleOutcome(action, outcome) }
                 }
             } catch (e: RuntimeException) {
@@ -608,7 +642,10 @@ class JarvisConversationController(
             tts.speak(text, object : JarvisSpeechController.Callback {
                 override fun onStart() {
                     main.removeCallbacks(startTimeout)
-                    if (gen == generation) core()?.setState(JarvisState.SPEAKING)
+                    if (gen == generation) {
+                        core()?.setState(JarvisState.SPEAKING)
+                        armBargeIn(gen)
+                    }
                 }
                 override fun onDone(success: Boolean) { main.post(proceed) }
             })
@@ -618,9 +655,78 @@ class JarvisConversationController(
         }
     }
 
+    // ---- barge-in (Stage 5C) ------------------------------------------------------------------
+
+    /** Opens the recognizer shortly after the reply's audio started, to hear the user talk over JARVIS. */
+    private fun armBargeIn(gen: Int) {
+        if (!isBargeInAllowed()) return
+        bargeGen = gen
+        main.removeCallbacks(bargeArmRunnable)
+        main.postDelayed(bargeArmRunnable, BARGE_ARM_DELAY_MS)
+    }
+
+    private fun armBargeNow() {
+        if (state != State.RESPONDING || bargeGen != generation || !isBargeInAllowed()) return
+        bargeHits = 0
+        if (commandSpeech.isListening) { bargeArmed = true; return }
+        if (commandSpeech.isPreparing) return
+        bargeArmed = true
+        guarded { commandSpeech.startListening() }
+    }
+
+    /** The barge-in session ended without a trigger: re-open it while the same reply is still playing. */
+    private fun onBargeSessionEnded(retry: Boolean = true) {
+        if (!bargeArmed) return
+        bargeArmed = false
+        bargeHits = 0
+        if (retry && state == State.RESPONDING) {
+            main.removeCallbacks(bargeArmRunnable)
+            main.postDelayed(bargeArmRunnable, BARGE_REARM_DELAY_MS)
+        }
+    }
+
+    private fun onBargeLevel(level: Float) {
+        if (!bargeArmed || state != State.RESPONDING) return
+        if (level >= BARGE_LEVEL) { if (++bargeHits >= BARGE_HITS) bargeIn() } else bargeHits = 0
+    }
+
+    private fun disarmBargeIn() {
+        main.removeCallbacks(bargeArmRunnable)
+        if (!bargeArmed) return
+        bargeArmed = false
+        bargeHits = 0
+        try { if (commandSpeech.isListening) commandSpeech.stopListening() } catch (t: Throwable) { Log.w(TAG, "stopListening failed", t) }
+    }
+
+    /**
+     * The user started talking while JARVIS speaks: cut the voice, drop the old reply/task/online turn, and treat the
+     * (already open) recognizer session as a normal command. Wake-word security: only inside an authorized session.
+     */
+    private fun bargeIn() {
+        if (state != State.RESPONDING || !bargeArmed || !isBargeInAllowed()) return
+        Log.i(TAG, "Barge-in: user interrupted JARVIS")
+        bargeArmed = false                                  // keep the recognizer open: it is now the command listener
+        bargeHits = 0
+        main.removeCallbacks(bargeArmRunnable)
+        generation++                                        // old speak callbacks / timeouts / `then` become stale
+        main.removeCallbacksAndMessages(SPEAK_TOKEN)
+        requestId++
+        gate.cancel()                                       // old async tool results are dropped
+        invalidateOnline(resetHistory = false)              // stops the LLM request, drops queued chunks
+        try { tts.interrupt() } catch (t: Throwable) { Log.w(TAG, "tts.interrupt failed", t) }
+        core()?.setVoiceAmplitude(0f)
+        firstTurn = false
+        turnStartedAt = SystemClock.uptimeMillis()
+        turnTimeoutMs = FOLLOW_UP_TIMEOUT_MS
+        main.removeCallbacks(silenceWatchdog)
+        main.postDelayed(silenceWatchdog, turnTimeoutMs + WATCHDOG_SLACK_MS)
+        setState(State.COMMAND_LISTENING)                   // LISTENING; the final text goes through onUtterance()
+    }
+
     private fun finish() {
         if (state == State.IDLE) return                   // already finished: never report twice
         generation++
+        gate.cancel()
         invalidateOnline(resetHistory = true)
         main.removeCallbacksAndMessages(null)
         try { commandSpeech.stopListening() } catch (t: Throwable) { Log.w(TAG, "stopListening failed", t) }
@@ -640,6 +746,7 @@ class JarvisConversationController(
             State.RESPONDING -> SessionState.SPEAKING
         }
         if (state == s) return
+        if (state == State.RESPONDING) disarmBargeIn()      // leaving a reply: close the barge-in listener
         state = s
         // Keep the visual state in step with the session state (SPEAKING is set by the TTS onStart).
         when (s) {
@@ -681,6 +788,11 @@ class JarvisConversationController(
         const val SPEAK_BASE_MS = 14_000L
         const val SPEAK_PER_CHAR_MS = 90L
         const val SPEAK_MAX_MS = 40_000L
+
+        const val BARGE_ARM_DELAY_MS = 800L              // after audio starts: lets the first words play, avoids the start click
+        const val BARGE_REARM_DELAY_MS = 300L
+        const val BARGE_LEVEL = 0.45f                    // voice level (0..1) that counts as the user speaking; tune on device
+        const val BARGE_HITS = 3                         // consecutive level callbacks above BARGE_LEVEL
 
         const val MULTI_STOPPED = "بقیه دستورها اجرا نشد."
         const val ONLINE_MAX_MS = 80_000L                // safety net above the OnlineBrain's own turn timeout
