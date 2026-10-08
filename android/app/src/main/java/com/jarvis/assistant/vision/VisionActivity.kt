@@ -41,7 +41,7 @@ import android.widget.Toast
 import com.jarvis.assistant.online.Cancellable
 import com.jarvis.assistant.online.Failure
 import com.jarvis.assistant.online.FailureKind
-import com.jarvis.assistant.online.GeminiProvider
+import com.jarvis.assistant.online.GroqVisionProvider
 import com.jarvis.assistant.online.OnlineBrain
 import com.jarvis.assistant.online.OnlineNetwork
 import com.jarvis.assistant.speech.JarvisSpeechController
@@ -52,7 +52,7 @@ import java.util.concurrent.Executors
 /**
  * Vision screen: pick a photo from the gallery or watch the real live camera preview (Camera2 + TextureView),
  * ask a question (typed) about the photo / the current live frame, and get a Persian answer from the existing
- * Gemini provider through the existing [OnlineBrain] (no tools). The answer is spoken with the existing offline
+ * Groq Vision provider through the existing [OnlineBrain] (no tools). The answer is spoken with the existing offline
  * Persian TTS ([OfflinePersianTts]). Every question sends the CURRENT live frame, so the camera view is analysed.
  */
 class VisionActivity : Activity() {
@@ -97,7 +97,7 @@ class VisionActivity : Activity() {
         run { window.statusBarColor = BG; window.navigationBarColor = BG }
         setContentView(buildUi())
         brain = OnlineBrain(
-            provider = GeminiProvider(applicationContext),
+            provider = GroqVisionProvider(applicationContext),
             tools = null,
             isNetworkAvailable = { OnlineNetwork.isConnected(applicationContext) },
             systemPrompt = VISION_PROMPT
@@ -382,7 +382,7 @@ class VisionActivity : Activity() {
                 setBusy(false)
                 if (shown.isEmpty()) {
                     val msg = when (failure.kind) {
-                        FailureKind.UNAVAILABLE -> "هوش مصنوعی آنلاین در دسترس نیست. اینترنت و کلید Gemini را بررسی کن."
+                        FailureKind.UNAVAILABLE -> "هوش مصنوعی آنلاین در دسترس نیست. اینترنت و کلید Groq را بررسی کن."
                         FailureKind.TIMEOUT -> "پاسخ دیر رسید. دوباره امتحان کن."
                         FailureKind.NETWORK -> "اتصال اینترنت مشکل دارد."
                         FailureKind.LIMIT -> "محدودیت درخواست. کمی بعد دوباره امتحان کن."

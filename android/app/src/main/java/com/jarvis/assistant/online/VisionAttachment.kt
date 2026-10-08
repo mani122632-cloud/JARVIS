@@ -6,7 +6,7 @@ import java.util.concurrent.ConcurrentHashMap
 /**
  * Vision side channel: the image of ONE user turn travels next to the existing [ChatMessage] without changing
  * [ChatMessage] / [ChatRequest] / [OnlineProvider]. [attach] stores the image and appends an invisible tag to the
- * message text; [GeminiProvider] calls [extract] to get the clean text plus the image; [release] frees it when the
+ * message text; [GeminiProvider] / [GroqVisionProvider] call [extract] to get the clean text plus the image; [release] frees it when the
  * turn ends (afterwards the tag is simply stripped and no image is re-sent from history).
  */
 internal object VisionAttachment {
