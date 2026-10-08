@@ -422,9 +422,11 @@ class DefaultJarvisBrain(
             val offline =
                 if (looksLikeCommandAttempt(cleaned)) BrainResult.Conversation(JarvisPhrases.NOT_UNDERSTOOD)
                 else BrainResult.Conversation(conversation.chat(cleaned, context.recentResponses))
-            // Not a local command, not small talk: a complex / conversational request.
-            if (shouldEscalate()) BrainResult.Escalate(cleaned, offline) else offline
+            // Not a local command, not small talk: a complex / conversational request. Anything that looks like a
+            // phone command, or answers an open local question, never goes online (local / real tools first).
+            if (shouldEscalate() && !looksLikePhoneRequest(cleaned) && !hasOpenLocalQuestion(context)) BrainResult.Escalate(cleaned, offline) else offline
         } else if (result is BrainResult.Conversation && cleaned.isNotBlank() && shouldEscalate() &&
+            !hasOpenLocalQuestion(context) &&
             MemoryCommandParser.parse(cleaned) == null &&
             conversation.classify(cleaned) == OfflineConversationBrain.Topic.ONLINE_REQUIRED
         ) {
@@ -445,6 +447,15 @@ class DefaultJarvisBrain(
         while (i < tokens.size && tokens[i] in LEAD_INS) i++
         if (i == 0 || i >= tokens.size) return text
         return tokens.drop(i).joinToString(" ")
+    }
+
+    private fun hasOpenLocalQuestion(ctx: ConversationContext): Boolean =
+        ctx.pending != null || ctx.mediaStage != null || ctx.openQuestionAction != null
+
+    /** Short sentence about the phone itself (wifi, volume, alarm ...): the local system owns it, never the internet. */
+    private fun looksLikePhoneRequest(text: String): Boolean {
+        val tokens = PersianNormalizer.tokens(text)
+        return tokens.size <= 6 && tokens.any { it in COMMAND_VERBS || it in DEVICE_WORDS }
     }
 
     /** An unparsed sentence that starts like an order must not get a chatty answer. */
@@ -543,6 +554,10 @@ class DefaultJarvisBrain(
         val LEAD_INS = setOf("راستی", "خب", "خو", "حالا", "ببین", "راستش", "میگم", "آها", "اها", "اوه", "عه", "هی", "جارویس", "ارباب")
         val COMMAND_VERBS = setOf(
             "برو", "باز", "بازکن", "ببند", "روشن", "خاموش", "بزن", "بذار", "بزار", "بگذار", "زیاد", "کم", "بیار", "اجرا"
+        )
+        val DEVICE_WORDS = setOf(
+            "وایفای", "وای‌فای", "بلوتوث", "چراغ", "قوه", "صدا", "ولوم", "روشنایی", "آلارم", "الارم", "تایمر",
+            "پیامک", "زنگ", "تماس", "دوربین", "مخاطب", "گوشی", "برنامه", "اپ", "آهنگ", "اهنگ", "یوتیوب"
         )
         const val MEMORY_ERROR = "نتوانستم حافظه را به‌روزرسانی کنم."
         const val MAX_RETRIES = 1

@@ -35,7 +35,7 @@ import com.jarvis.assistant.speech.SpeechInput
  * The session ends (-> [Callback.onConversationFinished], the service then hides the overlay and resumes Vosk) when
  *  - the Brain recognizes the END_CONVERSATION intent (خداحافظ / فعلاً / من دیگه میرم / دیگه کاری ندارم / کافیه /
  *    بعداً صحبت می‌کنیم ... by sentence structure, not by a fixed list; see EndConversationDetector),
- *  - nothing was said for [SILENCE_TIMEOUT_MS],
+ *  - nothing was said for [FIRST_TURN_TIMEOUT_MS] (first wait) or [FOLLOW_UP_TIMEOUT_MS] (after a reply),
  *  - [MAX_SESSION_MS] have passed,
  *  - the STT is unusable (model missing, no permission, repeated audio failure),
  *  - the command was "dismiss" or "back" (their only effect is closing the assistant).
@@ -84,6 +84,20 @@ class JarvisConversationController(
         var failure: Failure? = null
         var spoke = false             // at least one chunk was handed to the TTS
         var fullText = ""
+    }
+
+    /** Stage 5B: identity of the current request; async results of older requests are dropped. */
+    private var requestId = 0
+    private var lastUtterance = ""
+    private var lastUtteranceAt = 0L
+    /** True until the first utterance after the wake word has been received. */
+    private var firstTurn = true
+    /** Idle timeout of the current wait: longer right after the wake word, shorter for follow-ups. */
+    private var turnTimeoutMs = FIRST_TURN_TIMEOUT_MS
+
+    private fun isFiller(text: String): Boolean {
+        val t = text.trim().trimEnd('.', '،', '!', '؟', '?')
+        return t.isEmpty() || t in FILLERS
     }
 
     /** Uptime when the current turn started waiting for the user (silent re-listens do not reset it). */
@@ -142,6 +156,10 @@ class JarvisConversationController(
         emptyStreak = 0
         failedAttempts = 0
         alternatives = emptyList()
+        firstTurn = true
+        lastUtterance = ""
+        lastUtteranceAt = 0L
+        turnTimeoutMs = FIRST_TURN_TIMEOUT_MS
         main.removeCallbacks(maxSession)
         main.postDelayed(maxSession, MAX_SESSION_MS)
         sessionStartedAt = SystemClock.uptimeMillis()
@@ -194,8 +212,9 @@ class JarvisConversationController(
         core()?.setState(JarvisState.LISTENING)
         if (newTurn) {
             turnStartedAt = SystemClock.uptimeMillis()
+            turnTimeoutMs = if (firstTurn) FIRST_TURN_TIMEOUT_MS else FOLLOW_UP_TIMEOUT_MS
             main.removeCallbacks(silenceWatchdog)
-            main.postDelayed(silenceWatchdog, SILENCE_TIMEOUT_MS + WATCHDOG_SLACK_MS)
+            main.postDelayed(silenceWatchdog, turnTimeoutMs + WATCHDOG_SLACK_MS)
         }
         // Short pause so the recognizer doesn't hear the tail of our own voice.
         main.postDelayed({
@@ -205,7 +224,7 @@ class JarvisConversationController(
 
     /** Nothing usable was heard: listen again silently, unless this turn has been silent for too long. */
     private fun relistenOrTimeout() {
-        if (SystemClock.uptimeMillis() - turnStartedAt >= SILENCE_TIMEOUT_MS) {
+        if (SystemClock.uptimeMillis() - turnStartedAt >= turnTimeoutMs) {
             Log.i(TAG, "Silence timeout: ending session")
             finish()
         } else {
@@ -261,6 +280,23 @@ class JarvisConversationController(
 
     private fun onUtterance(text: String) {
         if (state != State.COMMAND_LISTENING) return       // late duplicate
+        val now = SystemClock.uptimeMillis()
+        val norm = text.trim()
+        if (norm.isNotEmpty() && norm == lastUtterance && now - lastUtteranceAt < DUPLICATE_WINDOW_MS) {
+            Log.i(TAG, "Duplicate utterance ignored")
+            listen(RETRY_DELAY_MS, newTurn = false)
+            return
+        }
+        // In a follow-up (no wake word) a lone filler sound is noise, not a request.
+        if (!firstTurn && isFiller(norm)) {
+            alternatives = emptyList()
+            relistenOrTimeout()
+            return
+        }
+        lastUtterance = norm
+        lastUtteranceAt = now
+        requestId++
+        firstTurn = false
         generation++
         invalidateOnline(resetHistory = false)             // a new utterance makes any older online turn stale
         main.removeCallbacks(silenceWatchdog)
@@ -284,7 +320,7 @@ class JarvisConversationController(
             brain.think(best, conversationContext)
         } catch (e: Exception) {
             Log.e(TAG, "Brain threw", e)
-            BrainResult.Unknown()
+            BrainResult.Conversation(TOOL_FAILED)
         }
         Log.i(TAG, "Brain decided: ${result.kind}" +
             ((result as? BrainResult.Command)?.let { " ${it.action::class.simpleName} conf=${it.confidence}" } ?: ""))
@@ -379,7 +415,7 @@ class JarvisConversationController(
         val next = turn.queue.removeFirstOrNull()
         if (next == null) {
             turn.speaking = false
-            if (turn.streamEnded) completeOnline(turn) else core()?.setState(JarvisState.THINKING)
+            if (turn.streamEnded) completeOnline(turn) else setState(State.COMMAND_PROCESSING)
             return
         }
         turn.speaking = true
@@ -434,7 +470,7 @@ class JarvisConversationController(
         if (index >= result.commands.size) { finishMulti(result, said, media); return }
         val action = result.commands[index]
         val next = { outcome: JarvisActionExecutor.Outcome ->
-            outcome.message?.let { said.add(it) }
+            (outcome.message ?: if (!outcome.success) TOOL_FAILED else null)?.let { said.add(it) }
             if (outcome.success) {
                 if (action is JarvisAction.CreateAlarm || action is JarvisAction.CreateTimer) conversationContext.lastAction = action
                 runMultiStep(result, index + 1, said, media || (outcome.success && isMediaAction(action)))
@@ -446,8 +482,9 @@ class JarvisConversationController(
         }
         if (executor.runsAsync(action)) {
             val gen = ++generation
+            val req = requestId
             try {
-                executor.executeAsync(action) { o -> if (gen == generation && state != State.IDLE) guarded { next(o) } }
+                executor.executeAsync(action) { o -> if (gen == generation && req == requestId && state != State.IDLE) guarded { next(o) } }
             } catch (e: RuntimeException) {
                 Log.e(TAG, "Executor threw", e)
                 next(JarvisActionExecutor.Outcome(false, null))
@@ -485,9 +522,10 @@ class JarvisConversationController(
         // thread and goes through the same spoken-reply path below. Runs exactly once per command.
         if (executor.runsAsync(action)) {
             val gen = ++generation
+            val req = requestId
             try {
                 executor.executeAsync(action) { outcome ->
-                    if (gen != generation || state == State.IDLE) return@executeAsync   // session cancelled / finished meanwhile
+                    if (gen != generation || req != requestId || state == State.IDLE) return@executeAsync   // session cancelled / finished meanwhile
                     guarded { handleOutcome(action, outcome) }
                 }
             } catch (e: RuntimeException) {
@@ -507,7 +545,7 @@ class JarvisConversationController(
 
     /** Speaks the executor's result (or just listens again); shared by the sync and the async (call_contact) paths. */
     private fun handleOutcome(action: JarvisAction, outcome: JarvisActionExecutor.Outcome) {
-        val message = outcome.message
+        val message = outcome.message ?: if (!outcome.success) TOOL_FAILED else null
         if (outcome.success && (action is JarvisAction.CreateAlarm || action is JarvisAction.CreateTimer)) {
             conversationContext.lastAction = action
         }
@@ -603,6 +641,12 @@ class JarvisConversationController(
         }
         if (state == s) return
         state = s
+        // Keep the visual state in step with the session state (SPEAKING is set by the TTS onStart).
+        when (s) {
+            State.COMMAND_LISTENING -> core()?.setState(JarvisState.LISTENING)
+            State.COMMAND_PROCESSING -> core()?.setState(JarvisState.THINKING)
+            else -> Unit
+        }
         callback.onStateChanged(s)
     }
 
@@ -615,9 +659,13 @@ class JarvisConversationController(
         val SPEAK_TOKEN = Any()
         const val TAG = "JarvisConversation"
 
-        const val SILENCE_TIMEOUT_MS = 25_000L           // no speech for this long ends the session (quietly)
+        const val FIRST_TURN_TIMEOUT_MS = 25_000L        // right after the wake word
+        const val FOLLOW_UP_TIMEOUT_MS = 15_000L         // after JARVIS answered: short window to continue without the wake word
+        const val DUPLICATE_WINDOW_MS = 2_500L
+        const val TOOL_FAILED = "نتوانستم این کار را انجام بدهم."
+        val FILLERS = setOf("اوم", "هوم", "آها", "اها", "خب", "خو", "هان", "آهان", "اوهوم", "ام", "اِ", "عه")
         const val WATCHDOG_SLACK_MS = 20_000L            // covers one STT window (7 s wait + 12 s speech)
-        const val MAX_SESSION_MS = 10 * 60_000L
+        const val MAX_SESSION_MS = 5 * 60_000L
         const val MAX_FAILED_ATTEMPTS = 5
         const val MAX_EMPTY_STREAK = 4
         const val MAX_PREPARE_WAIT_MS = 150_000L         // a loading STT model may extend the silence watchdog this long
