@@ -125,6 +125,8 @@ class VisionActivity : Activity() {
             isNetworkAvailable = { OnlineNetwork.isConnected(applicationContext) },
             systemPrompt = VISION_PROMPT
         )
+        // Entry from the chat "+" menu: open straight into the live camera (same permission flow as the camera button).
+        if (savedInstanceState == null && intent?.getBooleanExtra(EXTRA_START_CAMERA, false) == true) onCameraClicked()
     }
 
     override fun onResume() {
@@ -682,7 +684,7 @@ class VisionActivity : Activity() {
         textureView.visibility = if (m == Mode.CAMERA) View.VISIBLE else View.GONE
         imageView.visibility = if (m == Mode.GALLERY) View.VISIBLE else View.GONE
         hint.visibility = if (m == Mode.NONE) View.VISIBLE else View.GONE
-        cameraButton.text = if (m == Mode.CAMERA) "⏹ بستن دوربین" else "📷 دوربین زنده"
+        cameraButton.text = if (m == Mode.CAMERA) "بستن دوربین" else "دوربین زنده"
     }
 
     private fun buildUi(): View {
@@ -721,8 +723,8 @@ class VisionActivity : Activity() {
         root.addView(input, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
-        val gallery = button("🖼️ گالری") { onGalleryClicked() }
-        cameraButton = button("📷 دوربین زنده") { onCameraClicked() }
+        val gallery = button("گالری") { onGalleryClicked() }
+        cameraButton = button("دوربین زنده") { onCameraClicked() }
         sendButton = button("ارسال") { onSendClicked() }
         for (b in listOf(gallery, cameraButton, sendButton)) {
             row.addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { setMargins(dp(4), dp(8), dp(4), 0) })
@@ -743,8 +745,9 @@ class VisionActivity : Activity() {
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density + 0.5f).toInt()
 
-    private companion object {
-        const val TAG = "VisionActivity"
+    companion object {
+        const val EXTRA_START_CAMERA = "com.jarvis.assistant.vision.START_CAMERA"
+        private const val TAG = "VisionActivity"
         const val REQ_GALLERY = 4501
         const val REQ_CAMERA = 4502
         const val MAX_SIDE = 1600
