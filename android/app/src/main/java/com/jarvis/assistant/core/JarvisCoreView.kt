@@ -13,7 +13,7 @@ import kotlin.math.min
  *  setVoiceAmplitude(0..1), setCoreVisible(visible, animated)
  * Default: HIDDEN (nothing drawn, no animation work). Call showCinematic() to enter.
  * Draws on a transparent background. showCinematic(): the reactor blooms in place from a faint point,
- * its light ignites, then a cyan/copper glow unfurls along the left and right edges of this view.
+ * its light ignites and a very soft cyan halo appears at the left and right edges, all on one shared timeline.
  * hideCinematic(): glow and light fade, then the reactor folds into its own centre and vanishes.
  * For the edge glow to reach the screen edges, the host should give this view the full screen width.
  */
@@ -134,7 +134,9 @@ class JarvisCoreView @JvmOverloads constructor(
 
     override fun onDraw(canvas: Canvas) {
         if (controller.isHidden) return
-        edge.draw(canvas, controller.edgeProgress, controller.lightLevel, height * renderer.anchorY)
+        renderer.energyPhase = controller.energyPhase
+        renderer.energyDepth = controller.energyDepth
+        edge.draw(canvas, controller.lightLevel, controller.energyPhase, height * renderer.anchorY)
         renderer.draw(canvas, width, height, anim)
     }
 }

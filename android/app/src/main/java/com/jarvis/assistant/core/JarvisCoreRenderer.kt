@@ -3,6 +3,8 @@ package com.jarvis.assistant.core
 import android.graphics.Canvas
 import android.graphics.LinearGradient
 import android.graphics.Paint
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffXfermode
 import android.graphics.Path
 import android.graphics.RadialGradient
 import android.graphics.RectF
@@ -50,6 +52,23 @@ class JarvisCoreRenderer {
         style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND; strokeJoin = Paint.Join.ROUND
     }
     private val shaderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val addPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL; xfermode = PorterDuffXfermode(PorterDuff.Mode.ADD)
+    }
+
+    /**
+     * Energy pulse (set by the host each frame). [energyPhase] 0..1 is one soft pulse cycle, [energyDepth] 0..1+
+     * how deep the pulse is. The pulse leaves the centre and reaches each outer layer a little later, so the
+     * reactor reads as a living energy source. Nothing rotates: geometry is static.
+     */
+    var energyPhase = 0f
+    var energyDepth = 0.7f
+    private var pCore = 0f
+    private var pRing = 0f
+    private var pArc = 0f
+    private var pSeg = 0f
+    private var pHouse = 0f
+    private fun lp(delay: Float): Float = 0.5f + 0.5f * cos(TWO_PI * (energyPhase - delay))
 
     private val sectorOuter = Path()
     private val sectorLit = Path()
@@ -72,6 +91,8 @@ class JarvisCoreRenderer {
     private var glowShader: Shader? = null
     private var coreShader: Shader? = null
     private var hlShader: Shader? = null
+    private var haloShader: Shader? = null
+    private var bloomShader: Shader? = null
 
     private fun al(v: Float): Int = (v * master * 255f).toInt().coerceIn(0, 255)
 
@@ -146,6 +167,12 @@ class JarvisCoreRenderer {
         hlShader = RadialGradient(0f, 0f, 0.085f * R,
             intArrayOf(0xFFFFFFFF.toInt(), 0xCCDFFFFF.toInt(), 0x00DFFFFF),
             floatArrayOf(0f, 0.5f, 1f), Shader.TileMode.CLAMP)
+        haloShader = RadialGradient(0f, 0f, 1.9f * R,
+            intArrayOf(0x4D00D9FF, 0x3D00D9FF, 0x1A00C8F0, 0x0600B8E0, 0x0000B8E0),
+            floatArrayOf(0f, 0.52f, 0.70f, 0.86f, 1f), Shader.TileMode.CLAMP)
+        bloomShader = RadialGradient(0f, 0f, 0.46f * R,
+            intArrayOf(0xF2DFFFFF.toInt(), 0x7338E8FF, 0x2400D9FF, 0x0000D9FF),
+            floatArrayOf(0f, 0.30f, 0.65f, 1f), Shader.TileMode.CLAMP)
     }
 
     private fun buildSector(p: Path, r0: Float, r1: Float, half: Float) {
@@ -162,8 +189,13 @@ class JarvisCoreRenderer {
         c.translate(w / 2f, h * anchorY + s.verticalEntryOffset)
         c.scale(s.entryScale, s.entryScale)
 
+        pCore = lp(0f); pRing = lp(0.08f); pArc = lp(0.16f); pSeg = lp(0.24f); pHouse = lp(0.32f)
+        val g = if (s.glow > 1f) 1f else s.glow
+
         // BACK PLANE
-        shaderPaint.shader = bgShader; shaderPaint.alpha = al(0.55f * s.glow)
+        addPaint.shader = haloShader; addPaint.alpha = al((0.45f + 0.30f * pCore) * g)
+        c.drawCircle(0f, 0f, 1.9f * R, addPaint)
+        shaderPaint.shader = bgShader; shaderPaint.alpha = al(0.55f * s.glow * (0.90f + 0.20f * pHouse))
         c.drawCircle(0f, 0f, 1.2f * R, shaderPaint)
         drawHousing(c, s)
         drawInnerRing(c, s)
@@ -194,7 +226,7 @@ class JarvisCoreRenderer {
         c.drawCircle(0f, 0f, R, fill)
         for (i in 0 until 12) {
             c.save()
-            c.rotate(-90f + i * 30f + s.outerRotation)
+            c.rotate(-90f + i * 30f)
             fill.color = 0xFF03090D.toInt(); fill.alpha = al(1f)
             c.drawPath(sectorOuter, fill)
             if (i % 2 == 0) {   // copper coil
@@ -207,7 +239,7 @@ class JarvisCoreRenderer {
             } else {            // lit cyan panel
                 stroke.color = C_DARK_CYAN; stroke.alpha = al(0.9f); stroke.strokeWidth = 0.016f * R
                 c.drawPath(sectorOuter, stroke)
-                shaderPaint.shader = panelShader; shaderPaint.alpha = al(0.68f)
+                shaderPaint.shader = panelShader; shaderPaint.alpha = al(0.68f * (0.90f + 0.14f * pHouse))
                 c.drawPath(sectorLit, shaderPaint)
                 stroke.color = C_BRIGHT; stroke.alpha = al(0.55f); stroke.strokeWidth = 0.006f * R
                 c.drawPath(sectorLit, stroke)
@@ -226,15 +258,13 @@ class JarvisCoreRenderer {
     private fun drawInnerRing(c: Canvas, s: CoreAnimationState) {
         stroke.color = 0xFF02080C.toInt(); stroke.alpha = al(1f); stroke.strokeWidth = 0.14f * R
         c.drawCircle(0f, 0f, 0.75f * R, stroke)
-        c.save(); c.rotate(-s.outerRotation * 2f)
-        stroke.color = C_CYAN; stroke.alpha = al(0.30f); stroke.strokeWidth = 0.004f * R
+        stroke.color = C_CYAN; stroke.alpha = al(0.30f * (0.80f + 0.40f * pRing)); stroke.strokeWidth = 0.004f * R
         c.drawPath(ringTicks, stroke)
-        c.restore()
         layeredCircle(c, 0.815f * R, 0.022f * R, 0.010f * R, 0.004f * R, 0.55f, 0.60f)
         fill.color = 0xFF02090E.toInt(); fill.alpha = al(1f)
         c.drawCircle(0f, 0f, 0.69f * R, fill)
         // main cyan rim
-        layeredCircle(c, 0.70f * R, 0.050f * R, 0.026f * R, 0.008f * R, 0.70f, 0.80f)
+        layeredCircle(c, 0.70f * R, 0.050f * R, 0.026f * R, 0.008f * R, 0.70f * (0.88f + 0.24f * pRing), 0.80f * (0.90f + 0.20f * pRing))
     }
 
     private fun angDist(a: Float, b: Float): Float = abs(((a - b + 540f) % 360f) - 180f)
@@ -243,17 +273,10 @@ class JarvisCoreRenderer {
         val cornerBack = 0.034f * R
         val corner = 0.026f * R
         for (i in 0 until SEGMENTS) {
-            val pos = i / SEGMENTS.toFloat()
             val ang = 7.5f + i * 15f
             var b = segBase[i]
-            val wv = 0.5f + 0.5f * sin(TWO_PI * (pos * 2f - s.segmentPhase))
-            b += s.waveWeight * (0.30f * wv * wv - 0.05f)
-            val pt = 0.5f + 0.5f * sin(TWO_PI * (pos * 3f - s.patternPhase))
-            b += s.patternWeight * (0.30f * pt * pt - 0.05f)
-            if (s.scannerAlpha > 0f) {
-                val d = angDist(ang, s.scannerAngle)
-                if (d < 30f) { val t = 1f - d / 30f; b += s.scannerAlpha * 0.35f * t * t }
-            }
+            b += 0.10f * s.waveWeight + 0.08f * s.patternWeight
+            b += energyDepth * 0.22f * (pSeg - 0.5f)
             b += s.smoothedVoiceAmplitude * s.voiceWeight * 0.22f
             if (b < 0.2f) b = 0.2f else if (b > 1f) b = 1f
 
@@ -275,9 +298,8 @@ class JarvisCoreRenderer {
         stroke.color = C_CYAN; stroke.alpha = al(0.22f); stroke.strokeWidth = 0.004f * R
         c.drawCircle(0f, 0f, 0.572f * R, stroke)
         val bright = (0.72f + 0.18f * (s.glow - 0.5f) + 0.08f * s.patternWeight).coerceIn(0.5f, 1f) +
-            0.06f * s.smoothedVoiceAmplitude * s.voiceWeight
+            0.06f * s.smoothedVoiceAmplitude * s.voiceWeight + 0.10f * energyDepth * (pArc - 0.5f)
         for (f in 0..2) {
-            c.save(); c.rotate(s.innerRotations[f])
             for (t in 0..1) {
                 val rect = arcRects[f * 2 + t]
                 val wMain = if (t == 0) 0.026f else 0.013f
@@ -294,7 +316,6 @@ class JarvisCoreRenderer {
                     c.drawArc(rect, st, sw, false, stroke)
                 }
             }
-            c.restore()
         }
     }
 
@@ -311,11 +332,7 @@ class JarvisCoreRenderer {
 
     private fun drawModules(c: Canvas, s: CoreAnimationState) {
         for (a in MODULE_ANGLES) {
-            var boost = 0f
-            if (s.scannerAlpha > 0f) {
-                val d = angDist(a, s.scannerAngle)
-                if (d < 25f) { val t = 1f - d / 25f; boost = s.scannerAlpha * t }
-            }
+            val boost = 0.55f * pArc * energyDepth
             c.save(); c.rotate(a); c.translate(0.545f * R, 0f)
             fill.color = C_BLACK; fill.alpha = al(1f)
             c.drawCircle(0f, 0f, 0.062f * R, fill)
@@ -336,11 +353,9 @@ class JarvisCoreRenderer {
     private fun drawCentralRing(c: Canvas, s: CoreAnimationState) {
         fill.color = 0xFF02090E.toInt(); fill.alpha = al(1f)
         c.drawCircle(0f, 0f, 0.345f * R, fill)
-        layeredCircle(c, 0.335f * R, 0.028f * R, 0.013f * R, 0.005f * R, 0.65f, 0.75f)
-        c.save(); c.rotate(s.innerRotations[2])
-        stroke.color = C_CYAN; stroke.alpha = al(0.45f); stroke.strokeWidth = 0.005f * R
+        layeredCircle(c, 0.335f * R, 0.028f * R, 0.013f * R, 0.005f * R, 0.65f * (0.90f + 0.20f * pRing), 0.75f * (0.92f + 0.16f * pRing))
+        stroke.color = C_CYAN; stroke.alpha = al(0.45f * (0.80f + 0.40f * pRing)); stroke.strokeWidth = 0.005f * R
         c.drawPath(coreTicks, stroke)
-        c.restore()
         stroke.color = C_DARK_CYAN; stroke.alpha = al(0.9f); stroke.strokeWidth = 0.008f * R
         c.drawCircle(0f, 0f, 0.235f * R, stroke)
     }
@@ -348,7 +363,7 @@ class JarvisCoreRenderer {
     private fun drawCore(c: Canvas, s: CoreAnimationState) {
         c.save()
         c.scale(s.coreScale, s.coreScale)
-        shaderPaint.shader = glowShader; shaderPaint.alpha = al(0.55f * s.glow)
+        shaderPaint.shader = glowShader; shaderPaint.alpha = al((0.50f + 0.24f * pCore) * s.glow)
         c.drawCircle(0f, 0f, 0.62f * R, shaderPaint)
 
         fill.color = 0xFF02080C.toInt(); fill.alpha = al(1f)
@@ -363,7 +378,7 @@ class JarvisCoreRenderer {
         fill.color = 0xFF04202A.toInt(); fill.alpha = al(1f)
         c.drawCircle(0f, 0f, 0.172f * R, fill)
 
-        shaderPaint.shader = coreShader; shaderPaint.alpha = al(s.coreBrightness)
+        shaderPaint.shader = coreShader; shaderPaint.alpha = al(s.coreBrightness * (0.92f + 0.08f * pCore))
         c.drawCircle(0f, 0f, 0.155f * R, shaderPaint)
 
         stroke.color = C_DARK_CYAN; stroke.alpha = al(0.45f); stroke.strokeWidth = 0.005f * R
@@ -371,6 +386,11 @@ class JarvisCoreRenderer {
 
         shaderPaint.shader = hlShader; shaderPaint.alpha = al(1f)
         c.drawCircle(0f, 0f, 0.085f * R, shaderPaint)
+
+        // Energy bloom: the centre is the brightest, most alive part of the reactor.
+        val g = if (s.glow > 1f) 1f else s.glow
+        addPaint.shader = bloomShader; addPaint.alpha = al((0.40f + 0.32f * pCore) * g)
+        c.drawCircle(0f, 0f, 0.46f * R, addPaint)
         c.restore()
     }
 }
