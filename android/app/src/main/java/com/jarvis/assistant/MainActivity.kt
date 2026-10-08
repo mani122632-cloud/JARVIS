@@ -2,10 +2,15 @@ package com.jarvis.assistant
 
 import android.Manifest
 import android.app.Activity
+import android.content.Context
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
@@ -18,6 +23,9 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.WindowInsets
 import android.view.WindowManager
+import android.view.animation.AccelerateInterpolator
+import android.view.animation.DecelerateInterpolator
+import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
@@ -25,6 +33,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import com.jarvis.assistant.online.GeminiSetupActivity
 import com.jarvis.assistant.overlay.JarvisOverlayService
 import com.jarvis.assistant.speech.tts.OfflinePersianTts
 import com.jarvis.assistant.speech.JarvisSpeechController
@@ -32,6 +41,8 @@ import com.jarvis.assistant.wakeword.TtsStatus
 import com.jarvis.assistant.wakeword.VoskWakeWordEngine
 import com.jarvis.assistant.wakeword.WakeStatus
 import com.jarvis.assistant.wakeword.WakeWordState
+import kotlin.math.cos
+import kotlin.math.sin
 
 /**
  * JARVIS main screen: a simple RTL chat base (header, message list, text input, send, "+" placeholder).
@@ -52,6 +63,12 @@ class MainActivity : Activity() {
     private lateinit var chatScroll: ScrollView
     private lateinit var messages: LinearLayout
     private lateinit var input: EditText
+
+    // Side drawer (Step 2): UI shell only, built in code like the rest of this screen.
+    private lateinit var drawerPanel: View
+    private lateinit var drawerScrim: View
+    private var drawerOpen = false
+    private var drawerWidthPx = 0
 
     /** DEBUG builds only: a separate engine instance used by the [DEV] voice test button. */
     private var devTts: OfflinePersianTts? = null
@@ -76,6 +93,7 @@ class MainActivity : Activity() {
     }
 
     override fun onStop() {
+        closeDrawer(animate = false)
         WakeWordState.listener = null
         super.onStop()
     }
@@ -84,6 +102,12 @@ class MainActivity : Activity() {
         devTts?.release()
         devTts = null
         super.onDestroy()
+    }
+
+    @Suppress("DEPRECATION")
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (drawerOpen) closeDrawer() else super.onBackPressed()
     }
 
     override fun onResume() {
@@ -180,8 +204,32 @@ class MainActivity : Activity() {
 
     // ---- UI (code-built) ------------------------------------------------------------------------
 
-    @Suppress("DEPRECATION")
+    /** Screen = chat content + (hidden) scrim + (hidden) side drawer, stacked in one RTL container. */
     private fun buildUi(): View {
+        val match = ViewGroup.LayoutParams.MATCH_PARENT
+        val container = FrameLayout(this).apply {
+            setBackgroundColor(BG)
+            layoutDirection = View.LAYOUT_DIRECTION_RTL
+        }
+        container.addView(buildChatContent(), FrameLayout.LayoutParams(match, match))
+
+        drawerScrim = View(this).apply {
+            setBackgroundColor(SCRIM)
+            alpha = 0f
+            visibility = View.GONE
+            setOnClickListener { closeDrawer() }
+        }
+        container.addView(drawerScrim, FrameLayout.LayoutParams(match, match))
+
+        drawerWidthPx = minOf(dp(300), (resources.displayMetrics.widthPixels * 0.84f).toInt())
+        drawerPanel = buildDrawer()
+        // Gravity.START in an RTL container = right edge.
+        container.addView(drawerPanel, FrameLayout.LayoutParams(drawerWidthPx, match, Gravity.START))
+        return container
+    }
+
+    @Suppress("DEPRECATION")
+    private fun buildChatContent(): View {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(BG)
@@ -214,6 +262,19 @@ class MainActivity : Activity() {
             layoutDirection = View.LAYOUT_DIRECTION_LTR
             textDirection = View.TEXT_DIRECTION_LTR
         }, FrameLayout.LayoutParams(wrap, wrap, Gravity.CENTER))
+        // Hamburger: start edge of the header (right side in RTL).
+        header.addView(MenuIconView(this, TEXT_PRIMARY).apply {
+            contentDescription = "منو"
+            isClickable = true
+            isFocusable = true
+            background = RippleDrawable(
+                ColorStateList.valueOf(RIPPLE), null,
+                GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.BLACK) }
+            )
+            setOnClickListener { openDrawer() }
+        }, FrameLayout.LayoutParams(dp(48), dp(48), Gravity.CENTER_VERTICAL or Gravity.START).apply {
+            marginStart = dp(8)
+        })
         root.addView(header, LinearLayout.LayoutParams(match, dp(56)))
         root.addView(View(this).apply { setBackgroundColor(ACCENT_DIM) }, LinearLayout.LayoutParams(match, dp(1)))
 
@@ -276,7 +337,7 @@ class MainActivity : Activity() {
             addView(messages, FrameLayout.LayoutParams(match, wrap))
         }
         root.addView(chatScroll, LinearLayout.LayoutParams(match, 0, 1f))
-        addMessage("سلام، من جارویس هستم. چطور می‌توانم کمکتان کنم؟", fromUser = false)
+        addMessage(GREETING, fromUser = false)
 
         // Input bar: "+" (no action yet) | text field | send
         val plus = TextView(this).apply {
@@ -324,6 +385,165 @@ class MainActivity : Activity() {
         bar.addView(send, LinearLayout.LayoutParams(dp(44), dp(44)))
         root.addView(bar, LinearLayout.LayoutParams(match, wrap))
         return root
+    }
+
+    // ---- Drawer (Step 2) --------------------------------------------------------------------------
+
+    @Suppress("DEPRECATION")
+    private fun buildDrawer(): View {
+        val match = ViewGroup.LayoutParams.MATCH_PARENT
+        val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
+
+        val column = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), 0, dp(12), dp(16))
+        }
+        val panel = FrameLayout(this).apply {
+            setBackgroundColor(DRAWER_BG)
+            elevation = dp(16).toFloat()
+            isClickable = true      // swallow touches so they never reach the chat underneath
+            visibility = View.GONE
+        }
+        panel.addView(column, FrameLayout.LayoutParams(match, match))
+        // Thin accent edge on the inner side (left in RTL).
+        panel.addView(View(this).apply { setBackgroundColor(ACCENT_DIM) },
+            FrameLayout.LayoutParams(dp(1), match, Gravity.END))
+        panel.setOnApplyWindowInsetsListener { _, insets ->
+            if (Build.VERSION.SDK_INT >= 30) {
+                val i = insets.getInsets(WindowInsets.Type.systemBars())
+                column.setPadding(dp(12), i.top, dp(12), i.bottom + dp(16))
+            } else {
+                column.setPadding(dp(12), insets.systemWindowInsetTop, dp(12), insets.systemWindowInsetBottom + dp(16))
+            }
+            insets
+        }
+
+        // Brand row (same height as the chat header so the two line up)
+        column.addView(TextView(this).apply {
+            text = "JARVIS"
+            setTextColor(TEXT_PRIMARY)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
+            typeface = Typeface.create("sans-serif-light", Typeface.NORMAL)
+            letterSpacing = 0.3f
+            gravity = Gravity.CENTER_VERTICAL or Gravity.START
+            textDirection = View.TEXT_DIRECTION_LTR
+            setPadding(dp(14), 0, dp(14), 0)
+        }, LinearLayout.LayoutParams(match, dp(56)))
+        column.addView(divider(), dividerLp())
+
+        column.addView(drawerItem(Glyph.NEW_CHAT, "گفتگوی جدید") { onNewChatClicked() }, itemLp())
+        column.addView(drawerItem(Glyph.HISTORY, "تاریخچه گفتگوها") { onChatHistoryClicked() }, itemLp())
+
+        column.addView(View(this), LinearLayout.LayoutParams(match, 0, 1f))   // flexible spacer
+
+        column.addView(divider(), dividerLp())
+        column.addView(drawerItem(Glyph.VOICE, "دستیار صوتی") { onVoiceAssistantClicked() }, itemLp())
+        column.addView(drawerItem(Glyph.SETTINGS, "تنظیمات") { onSettingsClicked() }, itemLp())
+        return panel
+    }
+
+    private fun divider(): View = View(this).apply { setBackgroundColor(ACCENT_DIM) }
+
+    private fun dividerLp() = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(1)).apply {
+        topMargin = dp(8); bottomMargin = dp(8)
+    }
+
+    private fun itemLp() = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+        topMargin = dp(2); bottomMargin = dp(2)
+    }
+
+    private fun drawerItem(glyph: Glyph, label: String, onClick: () -> Unit): View {
+        val mask = GradientDrawable().apply { cornerRadius = dp(14).toFloat(); setColor(Color.BLACK) }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            minimumHeight = dp(52)
+            setPadding(dp(14), dp(8), dp(14), dp(8))
+            background = RippleDrawable(ColorStateList.valueOf(RIPPLE), null, mask)
+            isClickable = true
+            isFocusable = true
+            setOnClickListener { onClick() }
+            // RTL: first child sits on the right.
+            addView(GlyphView(this@MainActivity, glyph, ACCENT), LinearLayout.LayoutParams(dp(24), dp(24)))
+            addView(TextView(this@MainActivity).apply {
+                text = label
+                setTextColor(TEXT_PRIMARY)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+                textDirection = View.TEXT_DIRECTION_RTL
+                gravity = Gravity.CENTER_VERTICAL or Gravity.START
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginStart = dp(16) })
+        }
+    }
+
+    private fun openDrawer() {
+        if (drawerOpen) return
+        drawerOpen = true
+        hideKeyboard()
+        drawerScrim.animate().cancel()
+        drawerPanel.animate().cancel()
+        if (drawerPanel.visibility != View.VISIBLE) {
+            drawerPanel.translationX = drawerWidthPx.toFloat()   // starts off-screen on the right (RTL start)
+            drawerScrim.alpha = 0f
+        }
+        drawerScrim.visibility = View.VISIBLE
+        drawerPanel.visibility = View.VISIBLE
+        drawerScrim.animate().alpha(1f).setDuration(220).start()
+        drawerPanel.animate().translationX(0f).setDuration(240).setInterpolator(DecelerateInterpolator()).start()
+    }
+
+    private fun closeDrawer(animate: Boolean = true) {
+        if (!::drawerPanel.isInitialized) return
+        if (!drawerOpen && drawerPanel.visibility != View.VISIBLE) return
+        drawerOpen = false
+        drawerScrim.animate().cancel()
+        drawerPanel.animate().cancel()
+        if (!animate) {
+            drawerScrim.alpha = 0f
+            drawerScrim.visibility = View.GONE
+            drawerPanel.visibility = View.GONE
+            return
+        }
+        drawerScrim.animate().alpha(0f).setDuration(200).start()
+        drawerPanel.animate().translationX(drawerWidthPx.toFloat()).setDuration(200)
+            .setInterpolator(AccelerateInterpolator())
+            .withEndAction {
+                if (!drawerOpen) {
+                    drawerScrim.visibility = View.GONE
+                    drawerPanel.visibility = View.GONE
+                }
+            }.start()
+    }
+
+    private fun hideKeyboard() {
+        val focus = currentFocus ?: return
+        (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager)
+            .hideSoftInputFromWindow(focus.windowToken, 0)
+    }
+
+    /** Resets only the visible message list; no conversation/brain state is touched. */
+    private fun onNewChatClicked() {
+        closeDrawer()
+        messages.removeAllViews()
+        addMessage(GREETING, fromUser = false)
+        input.text.clear()
+    }
+
+    /** Placeholder: history storage/UI comes in a later step. */
+    private fun onChatHistoryClicked() {
+        closeDrawer()
+        Toast.makeText(this, "تاریخچه گفتگوها به‌زودی اضافه می‌شود", Toast.LENGTH_SHORT).show()
+    }
+
+    /** Entry point only: reuses the existing voice (wake word) toggle, no new logic. */
+    private fun onVoiceAssistantClicked() {
+        closeDrawer()
+        onVoiceClicked()
+    }
+
+    /** Entry point only: opens the existing setup screen (online provider keys). */
+    private fun onSettingsClicked() {
+        closeDrawer()
+        startActivity(android.content.Intent(this, GeminiSetupActivity::class.java))
     }
 
     private fun onSendClicked() {
@@ -390,6 +610,7 @@ class MainActivity : Activity() {
 
     private companion object {
         const val REQ_MIC = 4401
+        const val GREETING = "سلام، من جارویس هستم. چطور می‌توانم کمکتان کنم؟"
         val BG = Color.parseColor("#05080C")
         val TEXT_PRIMARY = Color.parseColor("#E6F6FF")
         val TEXT_SECONDARY = Color.parseColor("#8FA3B0")
@@ -398,5 +619,93 @@ class MainActivity : Activity() {
         val RIPPLE = Color.parseColor("#225FD8FF")
         val SURFACE = Color.parseColor("#0E151C")
         val USER_BUBBLE = Color.parseColor("#14305A6B")
+        val DRAWER_BG = Color.parseColor("#0A1118")
+        val SCRIM = Color.parseColor("#99000000")
+    }
+}
+
+// ---- Drawer helper views (drawn in code: no drawable resources, no dependencies) -----------------
+
+private enum class Glyph { NEW_CHAT, HISTORY, VOICE, SETTINGS }
+
+/** Hamburger: three rounded lines aligned to the start edge (right in RTL), middle one shorter. */
+private class MenuIconView(ctx: Context, tint: Int) : View(ctx) {
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        color = tint
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        val d = resources.displayMetrics.density
+        paint.strokeWidth = 2f * d
+        val full = 20f * d
+        val gap = 6f * d
+        val left = (width - full) / 2f
+        val right = left + full
+        val cy = height / 2f
+        val rtl = layoutDirection == LAYOUT_DIRECTION_RTL
+        val lengths = floatArrayOf(full, full * 0.68f, full)
+        for (i in 0..2) {
+            val y = cy + (i - 1) * gap
+            if (rtl) canvas.drawLine(right - lengths[i], y, right, y, paint)
+            else canvas.drawLine(left, y, left + lengths[i], y, paint)
+        }
+    }
+}
+
+/** Simple line glyphs on a 24-unit grid. */
+private class GlyphView(ctx: Context, private val glyph: Glyph, tint: Int) : View(ctx) {
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+        color = tint
+    }
+    private val rect = RectF()
+    private val path = Path()
+
+    override fun onDraw(canvas: Canvas) {
+        val side = minOf(width, height).toFloat()
+        val u = side / 24f
+        val ox = (width - side) / 2f
+        val oy = (height - side) / 2f
+        paint.strokeWidth = 1.7f * u
+        fun x(v: Float) = ox + v * u
+        fun y(v: Float) = oy + v * u
+
+        when (glyph) {
+            Glyph.NEW_CHAT -> {
+                canvas.drawCircle(x(12f), y(12f), 9f * u, paint)
+                canvas.drawLine(x(12f), y(8f), x(12f), y(16f), paint)
+                canvas.drawLine(x(8f), y(12f), x(16f), y(12f), paint)
+            }
+            Glyph.HISTORY -> {
+                canvas.drawCircle(x(12f), y(12f), 9f * u, paint)
+                path.reset()
+                path.moveTo(x(12f), y(7f))
+                path.lineTo(x(12f), y(12f))
+                path.lineTo(x(15.5f), y(14f))
+                canvas.drawPath(path, paint)
+            }
+            Glyph.VOICE -> {
+                rect.set(x(9f), y(3f), x(15f), y(14f))
+                canvas.drawRoundRect(rect, 3f * u, 3f * u, paint)
+                rect.set(x(6f), y(7f), x(18f), y(19f))
+                canvas.drawArc(rect, 0f, 180f, false, paint)
+                canvas.drawLine(x(12f), y(19f), x(12f), y(21.5f), paint)
+                canvas.drawLine(x(9f), y(21.5f), x(15f), y(21.5f), paint)
+            }
+            Glyph.SETTINGS -> {
+                canvas.drawCircle(x(12f), y(12f), 3f * u, paint)
+                canvas.drawCircle(x(12f), y(12f), 7.2f * u, paint)
+                for (i in 0 until 8) {
+                    val a = Math.PI / 4.0 * i
+                    val c = cos(a).toFloat()
+                    val sn = sin(a).toFloat()
+                    canvas.drawLine(x(12f + 7.2f * c), y(12f + 7.2f * sn), x(12f + 9.8f * c), y(12f + 9.8f * sn), paint)
+                }
+            }
+        }
     }
 }
