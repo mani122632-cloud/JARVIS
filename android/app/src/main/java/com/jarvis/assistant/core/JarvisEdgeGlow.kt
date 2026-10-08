@@ -97,7 +97,7 @@ class JarvisEdgeGlow {
             val dir = if (side == 0) 1f else -1f           // +1 = towards screen centre
 
             // 1. recess behind the light
-            ellipse(well, x, cy, band * 2.0f, halfH, a * 0.75f, false)
+            ellipse(c, well, x, cy, band * 2.0f, halfH, a * 0.75f, false)
 
             // 2. depth layers, far -> near, each emerging after the one behind it
             for (k in 0..3) {
@@ -107,7 +107,7 @@ class JarvisEdgeGlow {
                 val breathK = 1f + 0.14f * sin(phase * 0.5f + k * 1.3f + side * 1.7f)
                 val lw = band * (2.1f - 0.48f * k) * breathK * (0.50f + 0.50f * lE)
                 val lx = x + dir * (3 - k) * 0.06f * band            // far layers sit deeper inside the screen
-                ellipse(layers[k], lx, cy, lw, halfH * (1f - 0.05f * k), a * lE * (0.34f + 0.17f * k), true)
+                ellipse(c, layers[k], lx, cy, lw, halfH * (1f - 0.05f * k), a * lE * (0.34f + 0.17f * k), true)
             }
 
             // 3. drifting colour volume
@@ -115,7 +115,7 @@ class JarvisEdgeGlow {
                 val ph = phase * (0.55f + 0.23f * i) + side * 2.4f + i * 2.1f
                 val y = cy + sin(ph) * h * 0.30f * e
                 val bw = band * (0.95f + 0.28f * sin(ph * 0.7f + i))
-                ellipse(blobs[i], x + dir * band * 0.10f * i, y, bw, h * (0.15f + 0.05f * i) * (0.4f + 0.6f * e), a * (0.55f - 0.08f * i), true)
+                ellipse(c, blobs[i], x + dir * band * 0.10f * i, y, bw, h * (0.15f + 0.05f * i) * (0.4f + 0.6f * e), a * (0.55f - 0.08f * i), true)
             }
 
             // 4. streaks: born at the edge, grow inward and brighten as they come "forward"
@@ -125,14 +125,14 @@ class JarvisEdgeGlow {
                 val y = cy + streakY[side * STREAKS + j] * halfH * 0.85f
                 val len = band * (0.6f + 2.4f * t * t)
                 val th = rimW * (0.25f + 1.1f * t)
-                ellipse(streak, x, y, len, th, a * fade * fade * 0.55f * (0.4f + 0.6f * light), true)
+                ellipse(c, streak, x, y, len, th, a * fade * fade * 0.55f * (0.4f + 0.6f * light), true)
             }
 
             // 5. hotspot at the core's height, pulsing with the reactor
-            ellipse(hot, x, cy, band * (1.0f + 0.25f * breath), h * 0.13f * (0.5f + 0.5f * e), a * (0.30f + 0.45f * light) * (0.8f + 0.4f * breath), true)
+            ellipse(c, hot, x, cy, band * (1.0f + 0.25f * breath), h * 0.13f * (0.5f + 0.5f * e), a * (0.30f + 0.45f * light) * (0.8f + 0.4f * breath), true)
 
             // 6. bright rim on the edge itself
-            ellipse(rim, x, cy, rimW, halfH * 0.96f, a * 0.80f, true)
+            ellipse(c, rim, x, cy, rimW, halfH * 0.96f, a * 0.80f, true)
         }
         paint.xfermode = null
     }
