@@ -827,10 +827,10 @@ class JarvisConversationController(
         const val SPEAK_PER_CHAR_MS = 90L
         const val SPEAK_MAX_MS = 40_000L
 
-        const val BARGE_ARM_DELAY_MS = 800L              // after audio starts: lets the first words play, avoids the start click
+        const val BARGE_ARM_DELAY_MS = 2500L              // after audio starts: lets the first words play, avoids the start click
         const val BARGE_REARM_DELAY_MS = 300L
-        const val BARGE_LEVEL = 0.45f                    // voice level (0..1) that counts as the user speaking; tune on device
-        const val BARGE_HITS = 3                         // consecutive level callbacks above BARGE_LEVEL
+        const val BARGE_LEVEL = 0.65f                    // voice level (0..1) that counts as the user speaking; tune on device
+        const val BARGE_HITS = 5                         // consecutive level callbacks above BARGE_LEVEL
 
         const val MULTI_STOPPED = "بقیه دستورها اجرا نشد."
         const val ONLINE_MAX_MS = 80_000L                // safety net above the OnlineBrain's own turn timeout
