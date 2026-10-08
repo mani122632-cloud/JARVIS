@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.ImageFormat
 import android.graphics.Matrix
 import android.graphics.SurfaceTexture
 import android.graphics.drawable.GradientDrawable
@@ -15,12 +16,16 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.TotalCaptureResult
 import android.media.ExifInterface
+import android.media.ImageReader
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.HandlerThread
+import android.os.SystemClock
 import android.text.InputType
 import android.util.Base64
 import android.util.Log
@@ -47,6 +52,7 @@ import com.jarvis.assistant.online.OnlineBrain
 import com.jarvis.assistant.online.OnlineNetwork
 import com.jarvis.assistant.speech.JarvisSpeechController
 import com.jarvis.assistant.speech.tts.OfflinePersianTts
+import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
 
@@ -96,6 +102,16 @@ class VisionActivity : Activity() {
     private var cameraDevice: CameraDevice? = null
     private var session: CameraCaptureSession? = null
     private var opening = false
+    private var reader: ImageReader? = null
+    private var previewBuilder: CaptureRequest.Builder? = null
+    private var sensorOrientation = 90
+    private var afMode = CaptureRequest.CONTROL_AF_MODE_OFF
+
+    // still capture state machine (real full-resolution JPEG, after AF + AE converge)
+    @Volatile private var stillState = STILL_IDLE
+    @Volatile private var stillCallback: ((ByteArray?) -> Unit)? = null
+    @Volatile private var stillStart = 0L
+    private val stillTimeout = Runnable { finishStill(null) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -214,13 +230,39 @@ class VisionActivity : Activity() {
     private fun toJpeg(b: Bitmap): ByteArray {
         val scaled = scaleDown(b)
         var bytes = ByteArray(0)
-        for (q in intArrayOf(85, 65, 45)) {
+        for (q in intArrayOf(92, 80, 65, 45)) {
             val out = ByteArrayOutputStream()
             if (!scaled.compress(Bitmap.CompressFormat.JPEG, q, out)) return ByteArray(0)
             bytes = out.toByteArray()
             if (bytes.size <= MAX_JPEG_BYTES) break
         }
         return bytes
+    }
+
+    /** Decodes a captured camera JPEG, applies its EXIF orientation (aspect preserved), scales down if needed. */
+    private fun decodeCapture(data: ByteArray): Bitmap? {
+        return try {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(data, 0, data.size, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+            var sample = 1
+            while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= MAX_SIDE) sample *= 2
+            val raw = BitmapFactory.decodeByteArray(data, 0, data.size, BitmapFactory.Options().apply { inSampleSize = sample })
+                ?: return null
+            val rotation = try {
+                when (ExifInterface(ByteArrayInputStream(data)).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)) {
+                    ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+                    ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+                    ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+                    else -> 0f
+                }
+            } catch (e: Exception) { 0f }
+            scaleDown(rotate(raw, rotation))
+        } catch (e: Exception) {
+            null
+        } catch (e: OutOfMemoryError) {
+            null
+        }
     }
 
     // ---- live camera (Camera2) -------------------------------------------------------------------
@@ -276,11 +318,26 @@ class VisionActivity : Activity() {
             } ?: mgr.cameraIdList.firstOrNull() ?: run { cameraError(); return }
             val chars = mgr.getCameraCharacteristics(id)
             val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: run { cameraError(); return }
-            val size = map.getOutputSizes(SurfaceTexture::class.java)
-                ?.filter { maxOf(it.width, it.height) <= 1600 }
-                ?.maxByOrNull { it.width.toLong() * it.height }
+            // Still size: largest JPEG (capped); preview size: same aspect ratio so preview/photo match, no stretching.
+            val jpegAll = map.getOutputSizes(ImageFormat.JPEG)
+            val jpegSize = jpegAll?.filter { maxOf(it.width, it.height) <= 4096 }?.maxByOrNull { it.width.toLong() * it.height }
+                ?: jpegAll?.minByOrNull { it.width.toLong() * it.height }
+                ?: run { cameraError(); return }
+            val ratio = jpegSize.width.toFloat() / jpegSize.height
+            val previews = (map.getOutputSizes(SurfaceTexture::class.java) ?: emptyArray())
+                .filter { maxOf(it.width, it.height) <= 1920 }
+            val size = previews.filter { Math.abs(it.width.toFloat() / it.height - ratio) < 0.02f }
+                .maxByOrNull { it.width.toLong() * it.height }
+                ?: previews.minByOrNull { Math.abs(it.width.toFloat() / it.height - ratio) }
                 ?: Size(1280, 720)
             val sensor = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+            sensorOrientation = sensor
+            val afModes = chars.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES) ?: IntArray(0)
+            afMode = when {
+                afModes.contains(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE) -> CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+                afModes.contains(CaptureRequest.CONTROL_AF_MODE_AUTO) -> CaptureRequest.CONTROL_AF_MODE_AUTO
+                else -> CaptureRequest.CONTROL_AF_MODE_OFF
+            }
             fitPreview(size, sensor)
             opening = true
             mgr.openCamera(id, object : CameraDevice.StateCallback() {
@@ -288,7 +345,7 @@ class VisionActivity : Activity() {
                     opening = false
                     if (mode != Mode.CAMERA) { camera.close(); return }
                     cameraDevice = camera
-                    createSession(camera, size)
+                    createSession(camera, size, jpegSize)
                 }
                 override fun onDisconnected(camera: CameraDevice) { opening = false; camera.close(); cameraDevice = null }
                 override fun onError(camera: CameraDevice, error: Int) {
@@ -304,12 +361,12 @@ class VisionActivity : Activity() {
 
     /** Portrait only: the buffer is landscape, the displayed picture is rotated by the sensor orientation. */
     private fun fitPreview(size: Size, sensor: Int) {
-        val rotated = sensor == 90 || sensor == 270
+        val rotated = (sensor - displayDegrees() + 360) % 180 == 90
         val dispW = if (rotated) size.height else size.width
         val dispH = if (rotated) size.width else size.height
         runOnUiThread {
-            val bw = previewBox.width.takeIf { it > 0 } ?: return@runOnUiThread
-            val bh = previewBox.height.takeIf { it > 0 } ?: return@runOnUiThread
+            val bw = previewBox.width.takeIf { it > 0 } ?: run { previewBox.post { fitPreview(size, sensor) }; return@runOnUiThread }
+            val bh = previewBox.height.takeIf { it > 0 } ?: run { previewBox.post { fitPreview(size, sensor) }; return@runOnUiThread }
             val scale = minOf(bw.toFloat() / dispW, bh.toFloat() / dispH)
             val lp = FrameLayout.LayoutParams((dispW * scale).toInt(), (dispH * scale).toInt(), Gravity.CENTER)
             textureView.layoutParams = lp
@@ -317,20 +374,34 @@ class VisionActivity : Activity() {
     }
 
     @Suppress("DEPRECATION")
-    private fun createSession(camera: CameraDevice, size: Size) {
+    private fun createSession(camera: CameraDevice, size: Size, jpegSize: Size) {
         try {
             val st = textureView.surfaceTexture ?: return
             st.setDefaultBufferSize(size.width, size.height)
             val surface = Surface(st)
+            val ir = ImageReader.newInstance(jpegSize.width, jpegSize.height, ImageFormat.JPEG, 2)
+            ir.setOnImageAvailableListener({ r ->
+                val img = try { r.acquireLatestImage() } catch (e: Exception) { null } ?: return@setOnImageAvailableListener
+                val bytes = try {
+                    val buf = img.planes[0].buffer
+                    ByteArray(buf.remaining()).also { buf.get(it) }
+                } catch (e: Exception) { null } finally { img.close() }
+                if (stillState == STILL_SHOOT) finishStill(bytes)
+            }, cameraHandler)
+            reader = ir
             val req = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
                 addTarget(surface)
-                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                set(CaptureRequest.CONTROL_AF_MODE, afMode)
+                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
             }
-            camera.createCaptureSession(listOf(surface), object : CameraCaptureSession.StateCallback() {
+            previewBuilder = req
+            camera.createCaptureSession(listOf(surface, ir.surface), object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) {
                     if (cameraDevice == null) { s.close(); return }
                     session = s
-                    try { s.setRepeatingRequest(req.build(), null, cameraHandler) } catch (e: Exception) { runOnUiThread { cameraError() } }
+                    try { s.setRepeatingRequest(req.build(), previewCallback, cameraHandler) } catch (e: Exception) { runOnUiThread { cameraError() } }
                 }
                 override fun onConfigureFailed(s: CameraCaptureSession) { runOnUiThread { cameraError() } }
             }, cameraHandler)
@@ -339,11 +410,112 @@ class VisionActivity : Activity() {
         }
     }
 
+    private val previewCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(s: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+            if (stillState != STILL_WAIT) return
+            val elapsed = SystemClock.uptimeMillis() - stillStart
+            if (elapsed < 350) return
+            val af = result.get(CaptureResult.CONTROL_AF_STATE)
+            val ae = result.get(CaptureResult.CONTROL_AE_STATE)
+            val afOk = afMode == CaptureRequest.CONTROL_AF_MODE_OFF || af == null ||
+                af == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED || af == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED
+            val aeOk = ae == null || ae == CaptureResult.CONTROL_AE_STATE_CONVERGED ||
+                ae == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED || ae == CaptureResult.CONTROL_AE_STATE_LOCKED
+            if ((afOk && aeOk) || elapsed > 2500) shoot()
+        }
+    }
+
+    /** Runs AF + AE metering, then takes a real full-resolution JPEG. [cb] gets the JPEG bytes or null. */
+    private fun captureStill(cb: (ByteArray?) -> Unit) {
+        val s = session
+        val b = previewBuilder
+        val h = cameraHandler
+        if (s == null || b == null || h == null) { cb(null); return }
+        stillCallback = cb
+        stillStart = SystemClock.uptimeMillis()
+        stillState = STILL_WAIT
+        mainHandler.removeCallbacks(stillTimeout)
+        mainHandler.postDelayed(stillTimeout, STILL_TIMEOUT_MS)
+        h.post {
+            try {
+                if (afMode != CaptureRequest.CONTROL_AF_MODE_OFF) b.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
+                b.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER_START)
+                s.capture(b.build(), previewCallback, h)
+                b.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
+                b.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER_IDLE)
+            } catch (e: Exception) {
+                finishStill(null)
+            }
+        }
+    }
+
+    private fun shoot() {
+        if (stillState != STILL_WAIT) return
+        stillState = STILL_SHOOT
+        val s = session
+        val cam = cameraDevice
+        val ir = reader
+        val h = cameraHandler
+        if (s == null || cam == null || ir == null || h == null) { finishStill(null); return }
+        try {
+            val still = cam.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                addTarget(ir.surface)
+                set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                set(CaptureRequest.CONTROL_AF_MODE, afMode)
+                set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+                set(CaptureRequest.JPEG_QUALITY, 95.toByte())
+                set(CaptureRequest.JPEG_ORIENTATION, (sensorOrientation - displayDegrees() + 360) % 360)
+            }
+            s.capture(still.build(), object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(ss: CameraCaptureSession, r: CaptureRequest, res: TotalCaptureResult) = resumePreview()
+                override fun onCaptureFailed(ss: CameraCaptureSession, r: CaptureRequest, f: android.hardware.camera2.CaptureFailure) {
+                    finishStill(null)
+                }
+            }, h)
+        } catch (e: Exception) {
+            finishStill(null)
+        }
+    }
+
+    /** Releases the AF lock after the shot and restarts the normal continuous preview. */
+    private fun resumePreview() {
+        val s = session ?: return
+        val b = previewBuilder ?: return
+        try {
+            b.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_CANCEL)
+            s.capture(b.build(), null, cameraHandler)
+            b.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
+            s.setRepeatingRequest(b.build(), previewCallback, cameraHandler)
+        } catch (e: Exception) { /* ignore */ }
+    }
+
+    private fun finishStill(bytes: ByteArray?) {
+        val cb = stillCallback
+        stillCallback = null
+        stillState = STILL_IDLE
+        mainHandler.removeCallbacks(stillTimeout)
+        if (bytes == null) resumePreview()
+        cb?.invoke(bytes)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun displayDegrees(): Int = when (windowManager.defaultDisplay.rotation) {
+        Surface.ROTATION_90 -> 90
+        Surface.ROTATION_180 -> 180
+        Surface.ROTATION_270 -> 270
+        else -> 0
+    }
+
     private fun stopCamera() {
+        if (stillCallback != null) finishStill(null)
         try { session?.close() } catch (e: Exception) { /* ignore */ }
         session = null
         try { cameraDevice?.close() } catch (e: Exception) { /* ignore */ }
         cameraDevice = null
+        try { reader?.close() } catch (e: Exception) { /* ignore */ }
+        reader = null
+        previewBuilder = null
         opening = false
         cameraThread?.quitSafely()
         cameraThread = null
@@ -365,19 +537,27 @@ class VisionActivity : Activity() {
             Mode.NONE -> { Toast.makeText(this, "اول یک عکس انتخاب کن یا دوربین را روشن کن", Toast.LENGTH_SHORT).show(); return }
             Mode.GALLERY -> { val j = galleryJpeg ?: return; ask(question, j) }
             Mode.CAMERA -> {
-                val frame = try { textureView.bitmap } catch (e: RuntimeException) { null }
-                if (frame == null) { Toast.makeText(this, "تصویر دوربین هنوز آماده نیست", Toast.LENGTH_SHORT).show(); return }
                 setBusy(true)
-                try {
-                    worker.execute {
-                        val jpeg = try { toJpeg(frame) } catch (t: Throwable) { ByteArray(0) }
-                        runOnUiThread {
-                            if (isDestroyed) return@runOnUiThread
-                            if (jpeg.isEmpty()) showFailure(IMAGE_ERROR) else ask(question, jpeg)
-                        }
+                stopSpeaking()
+                answerText.text = "در حال عکس گرفتن…"
+                val serial = ++turnSerial
+                captureStill { data ->
+                    if (data == null) {
+                        runOnUiThread { if (!isDestroyed && serial == turnSerial) showFailure(IMAGE_ERROR) }
+                        return@captureStill
                     }
-                } catch (e: RuntimeException) {
-                    showFailure(IMAGE_ERROR)
+                    try {
+                        worker.execute {
+                            val bmp = decodeCapture(data)
+                            val jpeg = if (bmp == null) ByteArray(0) else try { toJpeg(bmp) } catch (t: Throwable) { ByteArray(0) }
+                            runOnUiThread {
+                                if (isDestroyed || serial != turnSerial) return@runOnUiThread
+                                if (jpeg.isEmpty()) showFailure(IMAGE_ERROR) else ask(question, jpeg)
+                            }
+                        }
+                    } catch (e: RuntimeException) {
+                        runOnUiThread { if (!isDestroyed && serial == turnSerial) showFailure(IMAGE_ERROR) }
+                    }
                 }
             }
         }
@@ -567,7 +747,11 @@ class VisionActivity : Activity() {
         const val TAG = "VisionActivity"
         const val REQ_GALLERY = 4501
         const val REQ_CAMERA = 4502
-        const val MAX_SIDE = 1280
+        const val MAX_SIDE = 1600
+        const val STILL_IDLE = 0
+        const val STILL_WAIT = 1
+        const val STILL_SHOOT = 2
+        const val STILL_TIMEOUT_MS = 8_000L
         /** Keeps the base64 request well below Groq's 4 MB image limit (provider cap is 3.8M chars ≈ 2.8 MB). */
         const val MAX_JPEG_BYTES = 2_500_000
         const val TTS_WATCHDOG_MS = 30_000L
