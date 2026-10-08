@@ -176,12 +176,15 @@ class GeminiProvider(
             when (m.role) {
                 ChatRole.SYSTEM -> if (m.content.isNotBlank()) system.append('\n').append(m.content)
                 ChatRole.USER -> {
-                    if (m.content.isBlank()) continue
-                    val part = JSONObject().put("text", m.content)
+                    val img = m.imageBase64
+                    if (m.content.isBlank() && img == null) continue
+                    val userParts = ArrayList<JSONObject>()
+                    if (img != null) userParts += JSONObject().put("inlineData", JSONObject().put("mimeType", m.imageMime).put("data", img))
+                    if (m.content.isNotBlank()) userParts += JSONObject().put("text", m.content)
                     val last = contents.lastOrNull()
                     // Two user contents in a row (e.g. after an answer that was empty) are merged into one.
-                    if (last != null && last.role == "user") last.parts.put(part)
-                    else contents += Content("user", JSONArray().put(part), false)
+                    if (last != null && last.role == "user") userParts.forEach { last.parts.put(it) }
+                    else contents += Content("user", JSONArray().apply { userParts.forEach { put(it) } }, false)
                 }
                 ChatRole.ASSISTANT -> {
                     val parts = JSONArray()

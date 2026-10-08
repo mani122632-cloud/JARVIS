@@ -248,6 +248,9 @@ class MainActivity : Activity() {
             visibility = View.GONE
         }
         column.addView(ttsStatus, lp(10))
+        column.addView(outlineButton("👁️ Vision (عکس و دوربین)") {
+            startActivity(android.content.Intent(this, com.jarvis.assistant.vision.VisionActivity::class.java))
+        }, lp(20))
         if (isDebuggable()) {
             column.addView(outlineButton("[DEV] تست صدای فارسی") { onDevTtsClicked() }, lp(20))
         }
