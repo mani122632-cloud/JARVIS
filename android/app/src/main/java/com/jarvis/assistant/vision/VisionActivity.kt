@@ -173,7 +173,8 @@ class VisionActivity : Activity() {
         }
     }
 
-    private fun decodeUri(uri: Uri): Bitmap? = try {
+    private fun decodeUri(uri: Uri): Bitmap? {
+    return try {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
@@ -197,6 +198,7 @@ class VisionActivity : Activity() {
         null
     } catch (e: OutOfMemoryError) {
         null
+    }
     }
 
     private fun rotate(b: Bitmap, deg: Float): Bitmap =
