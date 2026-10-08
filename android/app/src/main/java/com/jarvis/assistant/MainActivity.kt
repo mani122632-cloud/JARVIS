@@ -1359,7 +1359,7 @@ class MainActivity : Activity() {
     private fun inputBackground(focused: Boolean) = GradientDrawable().apply {
         cornerRadius = dp(24).toFloat()
         setColor(SURFACE)
-        setStroke(dp(1), if (focused) ACCENT_FOCUS else ACCENT_DIM)
+        setStroke(dp(1), if (focused) ACCENT else ACCENT_DIM)
     }
 
     @Suppress("ClickableViewAccessibility")
