@@ -4,7 +4,7 @@ import com.jarvis.assistant.command.JarvisAction
 import com.jarvis.assistant.conversation.ConversationContext
 import com.jarvis.assistant.speech.JarvisPhrases
 
-enum class BrainKind { COMMAND, CONVERSATION, CLARIFY, END_CONVERSATION, UNKNOWN, ESCALATE }
+enum class BrainKind { MULTI, COMMAND, CONVERSATION, CLARIFY, END_CONVERSATION, UNKNOWN, ESCALATE }
 
 /**
  * What the Brain decided about one Persian utterance. [responseText] is always what JARVIS says (through
@@ -24,6 +24,21 @@ sealed class BrainResult {
         val confidence: Float
     ) : BrainResult() {
         override val kind: BrainKind get() = BrainKind.COMMAND
+    }
+
+    /**
+     * Several commands said in one sentence: run [commands] IN ORDER, stop at the first real failure.
+     * [responseText] ("حتماً.") is said once before the first one. [trailing] is an optional question for the
+     * last, incomplete part (e.g. "... و یه تایمر بذار"), asked after the others ran.
+     * [notice] is a true remark spoken after the commands ran (e.g. an old timer that cannot be cancelled).
+     */
+    data class Multi(
+        val commands: List<JarvisAction>,
+        override val responseText: String,
+        val trailing: Clarify? = null,
+        val notice: String? = null
+    ) : BrainResult() {
+        override val kind: BrainKind get() = BrainKind.MULTI
     }
 
     /** Small talk or a memory answer: say [responseText]; no Action. */

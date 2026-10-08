@@ -28,6 +28,14 @@ class ConversationContext(private val maxEntries: Int = MAX_ENTRIES) {
     /** Failed answers to the current media question. */
     var mediaAttempts: Int = 0
 
+    /** Last real alarm / timer command run in this session (for "نه، ۴۵ دقیقه" corrections). Same lifetime as [pending]. */
+    var lastAction: com.jarvis.assistant.command.JarvisAction? = null
+
+    /** The command whose tool asked a question (e.g. which contact); the next answer is attached to it. */
+    var openQuestionAction: com.jarvis.assistant.command.JarvisAction? = null
+    /** The utterance that produced [openQuestionAction]. */
+    var openQuestionText: String? = null
+
     /** Number of user utterances in this session. */
     var turnCount: Int = 0
         private set
@@ -50,6 +58,9 @@ class ConversationContext(private val maxEntries: Int = MAX_ENTRIES) {
         mediaStage = null
         mediaLanguage = null
         mediaAttempts = 0
+        lastAction = null
+        openQuestionAction = null
+        openQuestionText = null
         turnCount = 0
     }
 

@@ -309,6 +309,7 @@ class JarvisConversationController(
             }
             is BrainResult.Unknown -> handleUnusable()
             is BrainResult.Command -> runCommand(result)
+            is BrainResult.Multi -> runMulti(result)
             is BrainResult.Escalate -> startOnline(result)
         }
     }
@@ -420,6 +421,56 @@ class JarvisConversationController(
         }
     }
 
+    // ---- multi-command (Stage 5A) ----------------------------------------------------------------
+
+    /** Runs the commands one after another; the first real failure stops the rest (nothing is faked). */
+    private fun runMulti(result: BrainResult.Multi) {
+        val start = { runMultiStep(result, 0, ArrayList(), false) }
+        if (result.responseText.isBlank()) start() else speak(result.responseText) { start() }
+    }
+
+    private fun runMultiStep(result: BrainResult.Multi, index: Int, said: MutableList<String>, media: Boolean) {
+        if (state == State.IDLE) return
+        if (index >= result.commands.size) { finishMulti(result, said, media); return }
+        val action = result.commands[index]
+        val next = { outcome: JarvisActionExecutor.Outcome ->
+            outcome.message?.let { said.add(it) }
+            if (outcome.success) {
+                if (action is JarvisAction.CreateAlarm || action is JarvisAction.CreateTimer) conversationContext.lastAction = action
+                runMultiStep(result, index + 1, said, media || (outcome.success && isMediaAction(action)))
+            } else {
+                // Stop here: the remaining commands did not run, and JARVIS says so.
+                if (index + 1 < result.commands.size) said.add(MULTI_STOPPED)
+                finishMulti(result.copy(trailing = null, notice = null), said, media)
+            }
+        }
+        if (executor.runsAsync(action)) {
+            val gen = ++generation
+            try {
+                executor.executeAsync(action) { o -> if (gen == generation && state != State.IDLE) guarded { next(o) } }
+            } catch (e: RuntimeException) {
+                Log.e(TAG, "Executor threw", e)
+                next(JarvisActionExecutor.Outcome(false, null))
+            }
+        } else {
+            val o = try { executor.execute(action) } catch (e: RuntimeException) {
+                Log.e(TAG, "Executor threw", e)
+                JarvisActionExecutor.Outcome(false, null)
+            }
+            next(o)
+        }
+    }
+
+    private fun finishMulti(result: BrainResult.Multi, said: List<String>, media: Boolean) {
+        val parts = said.toMutableList()
+        result.notice?.let { parts.add(it) }
+        result.trailing?.let { parts.add(it.responseText) }
+        val text = parts.joinToString(" ")
+        if (text.isBlank()) { if (media) finish() else listen(AFTER_COMMAND_DELAY_MS, newTurn = true); return }
+        conversationContext.addResponse(text)
+        speak(text) { if (media && result.trailing == null) finish() else listen(LISTEN_DELAY_MS, newTurn = true) }
+    }
+
     private fun runCommand(result: BrainResult.Command) {
         val action = result.action
         if (action is JarvisAction.Unknown) { handleUnusable(); return }
@@ -457,6 +508,14 @@ class JarvisConversationController(
     /** Speaks the executor's result (or just listens again); shared by the sync and the async (call_contact) paths. */
     private fun handleOutcome(action: JarvisAction, outcome: JarvisActionExecutor.Outcome) {
         val message = outcome.message
+        if (outcome.success && (action is JarvisAction.CreateAlarm || action is JarvisAction.CreateTimer)) {
+            conversationContext.lastAction = action
+        }
+        // The tool asked a question (which contact? which alarm?): the next answer, without the wake word, continues it.
+        if (!outcome.success && message != null && message.trim().endsWith("؟")) {
+            conversationContext.openQuestionAction = action
+            conversationContext.openQuestionText = conversationContext.recentUserUtterances.lastOrNull()
+        }
         when {
             // Back's only real effect is closing the assistant, so the session ends with it.
             action == JarvisAction.GoBack -> finish()
@@ -575,6 +634,7 @@ class JarvisConversationController(
         const val SPEAK_PER_CHAR_MS = 90L
         const val SPEAK_MAX_MS = 40_000L
 
+        const val MULTI_STOPPED = "بقیه دستورها اجرا نشد."
         const val ONLINE_MAX_MS = 80_000L                // safety net above the OnlineBrain's own turn timeout
     }
 }
