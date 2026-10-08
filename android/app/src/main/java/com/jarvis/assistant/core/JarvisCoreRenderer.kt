@@ -75,8 +75,12 @@ class JarvisCoreRenderer {
 
     private fun al(v: Float): Int = (v * master * 255f).toInt().coerceIn(0, 255)
 
-    fun resize(w: Int, h: Int) {
-        R = min(w, h) / 2f * 0.93f
+    /** Vertical position of the core centre as a fraction of the view height (0.5 = middle). */
+    var anchorY = 0.5f
+
+    /** [maxRadius] caps the core size (px) so it stays at roughly Siri-orb presence in a large overlay. */
+    fun resize(w: Int, h: Int, maxRadius: Float = Float.MAX_VALUE) {
+        R = min(min(w, h) / 2f * 0.93f, maxRadius)
         radius = R
         if (R <= 0f) return
 
@@ -155,7 +159,7 @@ class JarvisCoreRenderer {
         if (R <= 0f) return
         master = s.masterBrightness
         c.save()
-        c.translate(w / 2f, h / 2f + s.verticalEntryOffset)
+        c.translate(w / 2f, h * anchorY + s.verticalEntryOffset)
         c.scale(s.entryScale, s.entryScale)
 
         // BACK PLANE

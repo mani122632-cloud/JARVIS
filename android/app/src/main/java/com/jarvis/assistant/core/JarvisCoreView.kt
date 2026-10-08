@@ -11,8 +11,11 @@ import kotlin.math.min
  * Public API:
  *  setState(JarvisState), showCinematic(), hideCinematic(),
  *  setVoiceAmplitude(0..1), setCoreVisible(visible, animated)
- * Default: HIDDEN (off-screen, no animation work). Call showCinematic() to enter.
- * Draws on a transparent background; the reactor enters/exits through the view's bottom edge.
+ * Default: HIDDEN (nothing drawn, no animation work). Call showCinematic() to enter.
+ * Draws on a transparent background. showCinematic(): the reactor blooms in place from a faint point,
+ * its light ignites, then a cyan/copper glow unfurls along the left and right edges of this view.
+ * hideCinematic(): glow and light fade, then the reactor folds into its own centre and vanishes.
+ * For the edge glow to reach the screen edges, the host should give this view the full screen width.
  */
 class JarvisCoreView @JvmOverloads constructor(
     context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
@@ -21,6 +24,20 @@ class JarvisCoreView @JvmOverloads constructor(
     private val anim = CoreAnimationState()
     private val controller = CoreAnimationController(anim)
     private val renderer = JarvisCoreRenderer()
+    private val edge = JarvisEdgeGlow()
+    private var wasVisible = false
+
+    /** Core size cap (radius, dp). ~68dp radius ≈ Siri-orb presence. */
+    var coreMaxRadiusDp = 68f
+        set(v) { field = v; if (width > 0) onSizeChanged(width, height, width, height) }
+
+    /** Vertical anchor of the core as a fraction of the view height (0.5 = centre). */
+    var coreAnchorY: Float
+        get() = renderer.anchorY
+        set(v) { renderer.anchorY = v.coerceIn(0f, 1f); invalidate() }
+
+    /** Called once when a hide has fully finished (nothing visible any more). Main thread. */
+    var onHidden: (() -> Unit)? = null
 
     private var running = false
     private var lastFrameNs = 0L
@@ -79,6 +96,8 @@ class JarvisCoreView @JvmOverloads constructor(
         val dt = if (lastFrameNs == 0L) 0.016f else ((nowNs - lastFrameNs) / 1e9f).coerceIn(0f, 0.05f)
         lastFrameNs = nowNs
         controller.update(dt)
+        edge.update(dt, controller.state, anim.smoothedVoiceAmplitude)
+        if (!controller.isHidden) wasVisible = true
         if (controller.isIdleLowRate) {
             accum += dt
             if (accum >= 0.033f) { accum = 0f; invalidate() }
@@ -89,6 +108,7 @@ class JarvisCoreView @JvmOverloads constructor(
         if (controller.isHidden) {            // fully off-screen: render once more (clear) and sleep
             invalidate()
             running = false
+            if (wasVisible) { wasVisible = false; onHidden?.invoke() }
             return
         }
         Choreographer.getInstance().postFrameCallback(frameCallback)
@@ -96,9 +116,9 @@ class JarvisCoreView @JvmOverloads constructor(
 
     override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) {
         super.onSizeChanged(w, h, ow, oh)
-        renderer.resize(w, h)
-        // center sits at h/2; glow halo reaches ~1.2R (x up to ~1.1 scale). Whole reactor ends below the bottom edge.
-        controller.hiddenOffsetPx = h / 2f + renderer.radius * 1.4f
+        val density = resources.displayMetrics.density
+        renderer.resize(w, h, coreMaxRadiusDp * density)
+        edge.resize(w, h, density)
         controller.update(0f)
     }
 
@@ -114,6 +134,7 @@ class JarvisCoreView @JvmOverloads constructor(
 
     override fun onDraw(canvas: Canvas) {
         if (controller.isHidden) return
+        edge.draw(canvas, controller.edgeProgress, controller.lightLevel, height * renderer.anchorY)
         renderer.draw(canvas, width, height, anim)
     }
 }
