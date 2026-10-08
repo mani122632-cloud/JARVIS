@@ -107,6 +107,7 @@ class OnlineBrain(
     // ---- turn ------------------------------------------------------------------------------------
 
     private inner class Turn(val listener: Listener, val userText: String, val imageBase64: String? = null) : Cancellable {
+        val userContent: String = if (imageBase64 != null) VisionAttachment.attach(userText, imageBase64) else userText
         @Volatile var cancelledFlag = false
         @Volatile var provHandle: Cancellable? = null
         @Volatile var toolHandle: Cancellable? = null
@@ -133,12 +134,13 @@ class OnlineBrain(
             cancelledFlag = true
             provHandle?.cancel(); toolHandle?.cancel()
             roundTimer?.cancel(false); turnTimer?.cancel(false)
+            VisionAttachment.release(userContent)
         }
     }
 
     private fun begin(turn: Turn) {
         if (turn.cancelledFlag) return
-        turn.messages += ChatMessage(ChatRole.USER, turn.userText, imageBase64 = turn.imageBase64)
+        turn.messages += ChatMessage(ChatRole.USER, turn.userContent)
         startRound(turn)
     }
 
@@ -290,6 +292,7 @@ class OnlineBrain(
     }
 
     private fun stopTimers(turn: Turn) {
+        VisionAttachment.release(turn.userContent)
         turn.roundTimer?.cancel(false); turn.turnTimer?.cancel(false)
         turn.chunker.reset()
     }
@@ -306,7 +309,7 @@ class OnlineBrain(
 
     private fun commit(turnMessages: List<ChatMessage>) {
         // Vision: the (large) image is only needed during its own turn; it is never kept in the session history.
-        history.addAll(turnMessages.map { if (it.imageBase64 != null) it.copy(imageBase64 = null) else it })
+        history.addAll(turnMessages)
         val trimmed = trimHistory(history)
         if (trimmed.size != history.size) {
             val copy = ArrayList(trimmed)

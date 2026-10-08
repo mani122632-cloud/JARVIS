@@ -176,11 +176,11 @@ class GeminiProvider(
             when (m.role) {
                 ChatRole.SYSTEM -> if (m.content.isNotBlank()) system.append('\n').append(m.content)
                 ChatRole.USER -> {
-                    val img = m.imageBase64
-                    if (m.content.isBlank() && img == null) continue
+                    val (cleanText, img) = VisionAttachment.extract(m.content)
+                    if (cleanText.isBlank() && img == null) continue
                     val userParts = ArrayList<JSONObject>()
-                    if (img != null) userParts += JSONObject().put("inlineData", JSONObject().put("mimeType", m.imageMime).put("data", img))
-                    if (m.content.isNotBlank()) userParts += JSONObject().put("text", m.content)
+                    if (img != null) userParts += JSONObject().put("inlineData", JSONObject().put("mimeType", "image/jpeg").put("data", img))
+                    if (cleanText.isNotBlank()) userParts += JSONObject().put("text", cleanText)
                     val last = contents.lastOrNull()
                     // Two user contents in a row (e.g. after an answer that was empty) are merged into one.
                     if (last != null && last.role == "user") userParts.forEach { last.parts.put(it) }
