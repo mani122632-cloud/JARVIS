@@ -3,6 +3,7 @@ package com.jarvis.assistant.nlu
 import com.jarvis.assistant.command.AppEntry
 import com.jarvis.assistant.command.AppRegistry
 import com.jarvis.assistant.command.JarvisAction
+import com.jarvis.assistant.command.RadioCommand
 import com.jarvis.assistant.command.TorchMode
 import com.jarvis.assistant.command.VolumeChange
 import java.time.LocalTime
@@ -269,6 +270,16 @@ class CommandIntentParser(
         val toggleVerb = t.any { it in ON_WORDS || it in OFF_WORDS }
         if (wifi && bluetooth) return null
         if (wifi || bluetooth) {
+            // "وای‌فای/بلوتوث رو روشن/خاموش کن" -> real toggle (executor), not just the settings page.
+            val on = t.any { it in ON_WORDS }
+            val off = t.any { it in OFF_WORDS }
+            if (on != off && !openVerb && !settingsWord) {
+                val q = RadioCommand.query(wifi, on)
+                return Candidate(
+                    JarvisAction.OpenAppByName(q), 0.97f, NluIntent.OPEN_APP,
+                    mapOf(NluSlot.APP_NAME to q)
+                )
+            }
             val action = if (wifi) JarvisAction.OpenWifiSettings else JarvisAction.OpenBluetoothSettings
             val intent = if (wifi) NluIntent.OPEN_WIFI_SETTINGS else NluIntent.OPEN_BLUETOOTH_SETTINGS
             val confidence = when {

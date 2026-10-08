@@ -3,6 +3,10 @@ package com.jarvis.assistant.command
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothManager
+import android.net.wifi.WifiManager
 import android.hardware.camera2.CameraAccessException
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
@@ -119,7 +123,9 @@ class JarvisActionExecutor(
 
     private fun dispatch(action: JarvisAction): Outcome = when (action) {
         is JarvisAction.OpenApp -> openApp(action)
-        is JarvisAction.OpenAppByName -> openAppByName(action)
+        is JarvisAction.OpenAppByName ->
+            RadioCommand.parse(action.query)?.let { (wifi, on) -> if (wifi) setWifi(on) else setBluetooth(on) }
+                ?: openAppByName(action)
         JarvisAction.OpenSettings -> startActivity(Intent(Settings.ACTION_SETTINGS), "نتوانستم تنظیمات را باز کنم.")
         JarvisAction.OpenWifiSettings -> startActivity(Intent(Settings.ACTION_WIFI_SETTINGS), "نتوانستم تنظیمات وای‌فای را باز کنم.")
         JarvisAction.OpenBluetoothSettings -> startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS), "نتوانستم تنظیمات بلوتوث را باز کنم.")
@@ -229,6 +235,48 @@ class JarvisActionExecutor(
         }
     }
 
+    // ---- wifi / bluetooth (real toggle; honest fallback when Android forbids it) ----------------
+
+    @Suppress("DEPRECATION")
+    private fun setWifi(enable: Boolean): Outcome {
+        val wm = app.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            ?: return Outcome(false, "این دستگاه وای‌فای ندارد.")
+        val word = if (enable) "روشن" else "خاموش"
+        if (wm.isWifiEnabled == enable) return Outcome(true, "وای‌فای از قبل $word است.")
+        // Android 10+ forbids apps from toggling Wi-Fi (setWifiEnabled always returns false).
+        val ok = Build.VERSION.SDK_INT < Build.VERSION_CODES.Q &&
+            try { wm.setWifiEnabled(enable) } catch (e: SecurityException) { Log.w(TAG, "setWifiEnabled denied", e); false }
+        if (ok) return Outcome(true, "وای‌فای $word شد.")
+        val intent = Intent(
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) Settings.Panel.ACTION_INTERNET_CONNECTIVITY
+            else Settings.ACTION_WIFI_SETTINGS
+        )
+        startActivity(intent, "نتوانستم تنظیمات وای‌فای را باز کنم.")
+        return Outcome(false, "اندروید اجازه تغییر مستقیم وای‌فای را نمی‌دهد. پنل را باز کردم، خودتان $word کنید.")
+    }
+
+    @Suppress("DEPRECATION", "MissingPermission")
+    private fun setBluetooth(enable: Boolean): Outcome {
+        val adapter = (app.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
+            ?: return Outcome(false, "این دستگاه بلوتوث ندارد.")
+        val word = if (enable) "روشن" else "خاموش"
+        if (adapter.isEnabled == enable) return Outcome(true, "بلوتوث از قبل $word است.")
+        val hasPerm = Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
+            app.checkSelfPermission(android.Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+        // enable()/disable() work only up to Android 12 (and need BLUETOOTH_CONNECT on 12); newer returns false.
+        val ok = hasPerm && try {
+            if (enable) adapter.enable() else adapter.disable()
+        } catch (e: SecurityException) { Log.w(TAG, "Bluetooth toggle denied", e); false }
+        if (ok) return Outcome(true, "بلوتوث $word شد.")
+        if (enable && hasPerm) {
+            // System confirmation dialog: a real, user-approved switch-on.
+            val r = startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE), "نتوانستم بلوتوث را روشن کنم.")
+            if (r.success) return Outcome(true, "برای روشن شدن بلوتوث، پنجرهٔ تأیید را بپذیرید.")
+        }
+        startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS), "نتوانستم تنظیمات بلوتوث را باز کنم.")
+        return Outcome(false, "اندروید اجازه تغییر مستقیم بلوتوث را نمی‌دهد. تنظیمات را باز کردم، خودتان $word کنید.")
+    }
+
     // ---- volume ---------------------------------------------------------------------------------
 
     private fun setVolume(change: VolumeChange): Outcome {
@@ -252,5 +300,19 @@ class JarvisActionExecutor(
         const val TAG = "JarvisActions"
         const val GENERIC_FAILURE = "نتوانستم این کار را انجام بدهم."
         const val VOLUME_STEP_FRACTION = 0.2f
+    }
+}
+
+/** Reserved [JarvisAction.OpenAppByName] queries that mean "switch Wi-Fi / Bluetooth on / off" (parser -> executor). */
+object RadioCommand {
+    private const val PREFIX = "__jarvis_radio_"
+    fun query(wifi: Boolean, on: Boolean) = PREFIX + (if (wifi) "wifi" else "bt") + (if (on) "_on__" else "_off__")
+    /** (isWifi, enable) or null when [q] is an ordinary app name. */
+    fun parse(q: String): Pair<Boolean, Boolean>? = when (q) {
+        query(true, true) -> true to true
+        query(true, false) -> true to false
+        query(false, true) -> false to true
+        query(false, false) -> false to false
+        else -> null
     }
 }
