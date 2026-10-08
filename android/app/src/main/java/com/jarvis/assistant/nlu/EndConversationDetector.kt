@@ -26,6 +26,37 @@ object EndConversationDetector {
     data class Result(val confidence: Float, val goodNight: Boolean)
 
     fun detect(raw: String): Result? {
+        val prep = prepare(raw) ?: return null
+        val rest = prep.rest
+        val goodNight = prep.goodNight
+
+        val confidence = when {
+            isFarewell(rest) -> 0.95f
+            isNothingMore(rest) -> 0.92f
+            isLeaving(rest) -> 0.92f
+            isDeferral(rest) -> 0.9f
+            isDone(rest) -> 0.88f
+            isRest(rest) -> 0.88f
+            else -> return null
+        }
+        return Result(confidence, goodNight)
+    }
+
+    /**
+     * True only for an unmistakable farewell (خداحافظ / خدانگهدار / مراقب خودت باش / به امید دیدار).
+     * Used by the conversation controller for the IMMEDIATE hard stop, in any session state. Weak endings
+     * ("کافیه", "فعلاً", "تموم شد") are NOT decided here: they still go through the Brain, which asks the
+     * device-command parser first ("تایمر تموم شد" is not a goodbye).
+     */
+    fun isStrongFarewell(raw: String): Boolean {
+        val rest = prepare(raw)?.rest ?: return false
+        return isStrongFarewellTokens(rest)
+    }
+
+    private class Prepared(val rest: List<String>, val goodNight: Boolean)
+
+    /** Shared normalisation: tokens without politeness / wish words, or null when the text can never be an ending. */
+    private fun prepare(raw: String): Prepared? {
         val tokens = glueVerbPrefix(PersianNormalizer.tokens(raw))
         if (tokens.isEmpty() || tokens.size > MAX_TOKENS) return null
         if (tokens.any { tok -> tok.any { it.isDigit() } }) return null
@@ -46,22 +77,19 @@ object EndConversationDetector {
             rest += tok
         }
         if (rest.isEmpty()) return null                      // a wish on its own is small talk, not an ending
-
-        val confidence = when {
-            isFarewell(rest) -> 0.95f
-            isNothingMore(rest) -> 0.92f
-            isLeaving(rest) -> 0.92f
-            isDeferral(rest) -> 0.9f
-            isDone(rest) -> 0.88f
-            isRest(rest) -> 0.88f
-            else -> return null
-        }
-        return Result(confidence, goodNight)
+        return Prepared(rest, goodNight)
     }
 
     // ---- roles ----------------------------------------------------------------------------------
 
     private fun isFarewell(t: List<String>): Boolean {
+        if (isStrongFarewellTokens(t)) return true
+        // Weak farewell words only count when almost nothing else is said ("فعلا" / "فعلا بای").
+        val weak = t.count { it in WEAK_FAREWELLS }
+        return weak > 0 && t.size - weak <= 1
+    }
+
+    private fun isStrongFarewellTokens(t: List<String>): Boolean {
         // خداحافظ / خدافظ / خداحافظی / خدانگهدار(ت) / bye
         if (t.any { tok -> STRONG_FAREWELL_STEMS.any { tok.startsWith(it) } }) return true
         // "خدا نگهدار(ت)" / "خدا حافظ" written as two words
@@ -74,9 +102,7 @@ object EndConversationDetector {
         for (i in 0 until t.size - 2) {
             if (t[i] == "به" && t[i + 1] == "امید" && t[i + 2].startsWith("دیدار")) return true
         }
-        // Weak farewell words only count when almost nothing else is said ("فعلا" / "فعلا بای").
-        val weak = t.count { it in WEAK_FAREWELLS }
-        return weak > 0 && t.size - weak <= 1
+        return false
     }
 
     /** [دیگه] + need-noun + negated have/need: the user has nothing more to ask. */

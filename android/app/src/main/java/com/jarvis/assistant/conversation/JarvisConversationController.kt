@@ -10,6 +10,7 @@ import com.jarvis.assistant.command.JarvisAction
 import com.jarvis.assistant.command.JarvisActionExecutor
 import com.jarvis.assistant.core.JarvisCoreView
 import com.jarvis.assistant.core.JarvisState
+import com.jarvis.assistant.nlu.EndConversationDetector
 import com.jarvis.assistant.online.Cancellable
 import com.jarvis.assistant.online.Failure
 import com.jarvis.assistant.online.OnlineBrain
@@ -70,6 +71,12 @@ class JarvisConversationController(
 
     private val main = Handler(Looper.getMainLooper())
     private var generation = 0
+
+    /**
+     * Goodbye fix: true from the first valid goodbye until the next begin(). While set, nothing (late STT result,
+     * barge-in, TTS/online/executor callback, timeout) may process input or re-open the session.
+     */
+    private var ending = false
 
     /**
      * Identity of the current online turn, independent of [generation]. Bumped (= every callback of the previous
@@ -152,6 +159,9 @@ class JarvisConversationController(
             override fun onListeningStarted() { core()?.setState(JarvisState.LISTENING) }
             override fun onFinalAlternatives(texts: List<String>) { alternatives = texts }
             override fun onFinalResult(text: String) = guarded {
+                if (ending || state == State.IDLE) { alternatives = emptyList(); return@guarded }   // closed session: nothing may come back to life
+                // Goodbye wins in EVERY state (listening, processing, speaking/barge-in): one valid "خداحافظ" ends it all.
+                if (isGoodbye(text)) { endNow("final result"); return@guarded }
                 if (state == State.RESPONDING) { alternatives = emptyList(); onBargeSessionEnded() }   // no barge-in was triggered: not a command
                 else onUtterance(text)
             }
@@ -173,6 +183,7 @@ class JarvisConversationController(
             Log.w(TAG, "begin() while $state: resetting the previous session")
             cancel()
         }
+        ending = false
         conversationContext.clear()
         invalidateOnline(resetHistory = true)
         emptyStreak = 0
@@ -193,7 +204,11 @@ class JarvisConversationController(
     /** Aborts everything silently (no finished callback). */
     fun cancel() {
         generation++
+        requestId++
         gate.cancel()
+        bargeArmed = false
+        bargeHits = 0
+        alternatives = emptyList()
         invalidateOnline(resetHistory = true)
         main.removeCallbacksAndMessages(null)
         try { commandSpeech.stopListening() } catch (t: Throwable) { Log.w(TAG, "stopListening failed", t) }
@@ -310,7 +325,9 @@ class JarvisConversationController(
     // ---- one utterance --------------------------------------------------------------------------
 
     private fun onUtterance(text: String) {
-        if (state != State.COMMAND_LISTENING) return       // late duplicate
+        if (ending || state != State.COMMAND_LISTENING) return       // late duplicate / session already ending
+        // Defensive: a goodbye must never reach the duplicate filter, the Brain or the command pipeline.
+        if (isGoodbye(text)) { endNow("utterance"); return }
         val now = SystemClock.uptimeMillis()
         val norm = text.trim()
         if (norm.isNotEmpty() && norm == lastUtterance && now - lastUtteranceAt < DUPLICATE_WINDOW_MS) {
@@ -372,8 +389,7 @@ class JarvisConversationController(
             }
             is BrainResult.EndConversation -> {
                 Log.i(TAG, "END_CONVERSATION intent")
-                conversationContext.sessionState = SessionState.ENDING
-                speak(result.responseText) { finish() }
+                endNow("brain intent")                      // no lingering reply: the session closes right now
             }
             is BrainResult.Unknown -> handleUnusable()
             is BrainResult.Command -> runCommand(result)
@@ -659,14 +675,14 @@ class JarvisConversationController(
 
     /** Opens the recognizer shortly after the reply's audio started, to hear the user talk over JARVIS. */
     private fun armBargeIn(gen: Int) {
-        if (!isBargeInAllowed()) return
+        if (ending || !isBargeInAllowed()) return
         bargeGen = gen
         main.removeCallbacks(bargeArmRunnable)
         main.postDelayed(bargeArmRunnable, BARGE_ARM_DELAY_MS)
     }
 
     private fun armBargeNow() {
-        if (state != State.RESPONDING || bargeGen != generation || !isBargeInAllowed()) return
+        if (ending || state != State.RESPONDING || bargeGen != generation || !isBargeInAllowed()) return
         bargeHits = 0
         if (commandSpeech.isListening) { bargeArmed = true; return }
         if (commandSpeech.isPreparing) return
@@ -703,7 +719,7 @@ class JarvisConversationController(
      * (already open) recognizer session as a normal command. Wake-word security: only inside an authorized session.
      */
     private fun bargeIn() {
-        if (state != State.RESPONDING || !bargeArmed || !isBargeInAllowed()) return
+        if (ending || state != State.RESPONDING || !bargeArmed || !isBargeInAllowed()) return
         Log.i(TAG, "Barge-in: user interrupted JARVIS")
         bargeArmed = false                                  // keep the recognizer open: it is now the command listener
         bargeHits = 0
@@ -723,18 +739,40 @@ class JarvisConversationController(
         setState(State.COMMAND_LISTENING)                   // LISTENING; the final text goes through onUtterance()
     }
 
+    /** True when [text] (or any recognizer alternative of the same result) is an unmistakable farewell. */
+    private fun isGoodbye(text: String): Boolean {
+        if (EndConversationDetector.isStrongFarewell(text)) return true
+        return alternatives.any { EndConversationDetector.isStrongFarewell(it) }
+    }
+
+    /** First valid goodbye: hard-stop listening, TTS, request, gate, online turn and the session, right now. */
+    private fun endNow(reason: String) {
+        if (ending || state == State.IDLE) return
+        Log.i(TAG, "Goodbye: ending the session immediately ($reason)")
+        finish()
+    }
+
     private fun finish() {
         if (state == State.IDLE) return                   // already finished: never report twice
-        generation++
-        gate.cancel()
+        ending = true                                     // from here no late callback can process input or reopen the session
+        generation++                                      // stale speak / listen / executor callbacks
+        requestId++                                       // Stage 5B: stale results
+        gate.cancel()                                     // Stage 5C: RequestGate
         invalidateOnline(resetHistory = true)
-        main.removeCallbacksAndMessages(null)
+        main.removeCallbacksAndMessages(null)             // timeouts, watchdogs, barge-in arming
+        bargeArmed = false
+        bargeHits = 0
+        alternatives = emptyList()
+        lastUtterance = ""
+        lastUtteranceAt = 0L
         try { commandSpeech.stopListening() } catch (t: Throwable) { Log.w(TAG, "stopListening failed", t) }
+        try { tts.interrupt() } catch (t: Throwable) { Log.w(TAG, "tts.interrupt failed", t) }
         try { tts.stop() } catch (t: Throwable) { Log.w(TAG, "tts.stop failed", t) }
         core()?.setVoiceAmplitude(0f)
         conversationContext.sessionState = SessionState.ENDING
         conversationContext.clear()
         setState(State.IDLE)
+        core()?.setState(JarvisState.READY)               // back to READY; the next interaction needs the wake word
         callback.onConversationFinished()
     }
 

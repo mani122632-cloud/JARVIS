@@ -136,7 +136,9 @@ class JarvisOverlayService : Service(), JarvisActivationController.OverlayPresen
             override fun onReadyForCommand() {
                 // "بله ارباب." is done. Vosk is suspended (runActivation), so the command recognizer
                 // is the only microphone user from here until the overlay hides.
-                if (!activation.commandAuthorized) {
+                // Goodbye fix: also refuse when the interaction was already ended (a stale activation callback must
+                // never open a conversation after endInteraction()).
+                if (!interactionActive || !activation.commandAuthorized) {
                     Log.w(TAG, "Command stage refused: no valid wake-word session")
                     endInteraction()
                     return
