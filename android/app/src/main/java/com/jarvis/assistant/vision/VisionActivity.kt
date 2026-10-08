@@ -19,6 +19,7 @@ import android.media.ExifInterface
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
+import android.os.Looper
 import android.os.HandlerThread
 import android.text.InputType
 import android.util.Base64
@@ -82,6 +83,12 @@ class VisionActivity : Activity() {
     private val speakQueue = ArrayDeque<String>()
     private var speaking = false
     private var turnSerial = 0
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val ttsWatchdog = Runnable {
+        // speak() never reported back: unstick the queue instead of freezing the conversation
+        speaking = false
+        playNext()
+    }
 
     // Camera2
     private var cameraThread: HandlerThread? = null
@@ -116,6 +123,7 @@ class VisionActivity : Activity() {
 
     override fun onDestroy() {
         handle?.cancel()
+        mainHandler.removeCallbacks(ttsWatchdog)
         brain?.release(); brain = null
         stopSpeaking()
         tts?.release(); tts = null
@@ -143,26 +151,32 @@ class VisionActivity : Activity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode != REQ_GALLERY || resultCode != RESULT_OK) return
         val uri = data?.data ?: return
-        worker.execute {
-            val bmp = decodeUri(uri)
-            runOnUiThread {
-                if (isDestroyed) return@runOnUiThread
-                if (bmp == null) {
-                    Toast.makeText(this, "خواندن عکس ممکن نشد", Toast.LENGTH_SHORT).show()
-                } else {
-                    stopCamera()
-                    galleryJpeg = toJpeg(bmp)
-                    imageView.setImageBitmap(bmp)
-                    setMode(Mode.GALLERY)
-                    answerText.text = "عکس انتخاب شد. سؤالت را بنویس و ارسال کن."
+        try {
+            worker.execute {
+                val bmp = decodeUri(uri)
+                val jpeg = if (bmp == null) null else try { toJpeg(bmp) } catch (t: Throwable) { null }
+                runOnUiThread {
+                    if (isDestroyed) return@runOnUiThread
+                    if (bmp == null || jpeg == null || jpeg.isEmpty()) {
+                        Toast.makeText(this, "عکس نامعتبر است یا خوانده نشد", Toast.LENGTH_SHORT).show()
+                    } else {
+                        stopCamera()
+                        galleryJpeg = jpeg
+                        imageView.setImageBitmap(bmp)
+                        setMode(Mode.GALLERY)
+                        answerText.text = "عکس انتخاب شد. سؤالت را بنویس و ارسال کن."
+                    }
                 }
             }
+        } catch (e: RuntimeException) {
+            Toast.makeText(this, "خواندن عکس ممکن نشد", Toast.LENGTH_SHORT).show()
         }
     }
 
     private fun decodeUri(uri: Uri): Bitmap? = try {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
         var sample = 1
         while (maxOf(bounds.outWidth, bounds.outHeight) / (sample * 2) >= MAX_SIDE) sample *= 2
         val opts = BitmapFactory.Options().apply { inSampleSize = sample }
@@ -196,9 +210,15 @@ class VisionActivity : Activity() {
     }
 
     private fun toJpeg(b: Bitmap): ByteArray {
-        val out = ByteArrayOutputStream()
-        scaleDown(b).compress(Bitmap.CompressFormat.JPEG, 85, out)
-        return out.toByteArray()
+        val scaled = scaleDown(b)
+        var bytes = ByteArray(0)
+        for (q in intArrayOf(85, 65, 45)) {
+            val out = ByteArrayOutputStream()
+            if (!scaled.compress(Bitmap.CompressFormat.JPEG, q, out)) return ByteArray(0)
+            bytes = out.toByteArray()
+            if (bytes.size <= MAX_JPEG_BYTES) break
+        }
+        return bytes
     }
 
     // ---- live camera (Camera2) -------------------------------------------------------------------
@@ -343,55 +363,84 @@ class VisionActivity : Activity() {
             Mode.NONE -> { Toast.makeText(this, "اول یک عکس انتخاب کن یا دوربین را روشن کن", Toast.LENGTH_SHORT).show(); return }
             Mode.GALLERY -> { val j = galleryJpeg ?: return; ask(question, j) }
             Mode.CAMERA -> {
-                val frame = textureView.bitmap
+                val frame = try { textureView.bitmap } catch (e: RuntimeException) { null }
                 if (frame == null) { Toast.makeText(this, "تصویر دوربین هنوز آماده نیست", Toast.LENGTH_SHORT).show(); return }
                 setBusy(true)
-                worker.execute {
-                    val jpeg = toJpeg(frame)
-                    runOnUiThread { if (!isDestroyed) ask(question, jpeg) }
+                try {
+                    worker.execute {
+                        val jpeg = try { toJpeg(frame) } catch (t: Throwable) { ByteArray(0) }
+                        runOnUiThread {
+                            if (isDestroyed) return@runOnUiThread
+                            if (jpeg.isEmpty()) showFailure(IMAGE_ERROR) else ask(question, jpeg)
+                        }
+                    }
+                } catch (e: RuntimeException) {
+                    showFailure(IMAGE_ERROR)
                 }
             }
         }
     }
 
     private fun ask(question: String, jpeg: ByteArray) {
-        val b = brain ?: return
+        val b = brain ?: run { setBusy(false); return }
+        if (jpeg.isEmpty()) { showFailure(IMAGE_ERROR); return }
         setBusy(true)
         stopSpeaking()
         val serial = ++turnSerial
         val shown = StringBuilder()
         answerText.text = "در حال تحلیل…"
-        val b64 = Base64.encodeToString(jpeg, Base64.NO_WRAP)
-        handle = b.ask(question, object : OnlineBrain.Listener {
-            override fun onSentence(text: String) {
-                if (serial != turnSerial) return
-                if (shown.isNotEmpty()) shown.append(' ')
-                shown.append(text)
-                answerText.text = shown.toString()
-                answerScroll.post { answerScroll.fullScroll(View.FOCUS_DOWN) }
-                speakQueue.addLast(text)
-                playNext()
-            }
-            override fun onFinished(fullText: String) {
-                if (serial != turnSerial) return
-                answerText.text = fullText
-                setBusy(false)
-            }
-            override fun onFailed(failure: Failure) {
-                if (serial != turnSerial) return
-                setBusy(false)
-                if (shown.isEmpty()) {
-                    val msg = when (failure.kind) {
-                        FailureKind.UNAVAILABLE -> "هوش مصنوعی آنلاین در دسترس نیست. اینترنت و کلید Groq را بررسی کن."
-                        FailureKind.TIMEOUT -> "پاسخ دیر رسید. دوباره امتحان کن."
-                        FailureKind.NETWORK -> "اتصال اینترنت مشکل دارد."
-                        FailureKind.LIMIT -> "محدودیت درخواست. کمی بعد دوباره امتحان کن."
-                        else -> "تحلیل تصویر انجام نشد. دوباره امتحان کن."
+        val b64 = try { Base64.encodeToString(jpeg, Base64.NO_WRAP) } catch (t: Throwable) { showFailure(IMAGE_ERROR); return }
+        handle = try {
+            b.ask(question, object : OnlineBrain.Listener {
+                override fun onSentence(text: String) {
+                    runOnUiThread {
+                        if (isDestroyed || serial != turnSerial) return@runOnUiThread
+                        if (shown.isNotEmpty()) shown.append(' ')
+                        shown.append(text)
+                        answerText.text = shown.toString()
+                        answerScroll.post { answerScroll.fullScroll(View.FOCUS_DOWN) }
+                        speakQueue.addLast(text)
+                        playNext()
                     }
-                    answerText.text = msg
                 }
-            }
-        }, b64)
+                override fun onFinished(fullText: String) {
+                    runOnUiThread {
+                        if (isDestroyed || serial != turnSerial) return@runOnUiThread
+                        if (fullText.isNotBlank()) answerText.text = fullText
+                        setBusy(false)
+                    }
+                }
+                override fun onFailed(failure: Failure) {
+                    runOnUiThread {
+                        if (isDestroyed || serial != turnSerial) return@runOnUiThread
+                        setBusy(false)
+                        if (shown.isEmpty()) {
+                            val msg = when (failure.kind) {
+                                FailureKind.UNAVAILABLE -> "هوش مصنوعی آنلاین در دسترس نیست. اینترنت و کلید Groq را بررسی کن."
+                                FailureKind.TIMEOUT -> "پاسخ دیر رسید. دوباره امتحان کن."
+                                FailureKind.NETWORK -> "اتصال اینترنت مشکل دارد."
+                                FailureKind.LIMIT -> "محدودیت درخواست. کمی بعد دوباره امتحان کن."
+                                else -> "تحلیل تصویر انجام نشد. دوباره امتحان کن."
+                            }
+                            answerText.text = msg
+                            speakQueue.addLast(msg)
+                            playNext()
+                        }
+                    }
+                }
+            }, b64)
+        } catch (t: Throwable) {
+            Log.w(TAG, "ask failed")
+            showFailure(GENERIC_ERROR)
+            null
+        }
+    }
+
+    /** Terminal error before/outside the brain: show a short Persian message and release the busy state. */
+    private fun showFailure(msg: String) {
+        turnSerial++
+        setBusy(false)
+        answerText.text = msg
     }
 
     private fun cancelTurn() {
@@ -410,17 +459,20 @@ class VisionActivity : Activity() {
     // ---- TTS ---------------------------------------------------------------------------------------
 
     private fun playNext() {
-        if (speaking) return
+        if (speaking || isDestroyed) return
         val next = speakQueue.removeFirstOrNull() ?: return
-        val engine = tts ?: OfflinePersianTts(this).also { tts = it; it.initialize() }
         speaking = true
         val serial = turnSerial
         try {
+            val engine = tts ?: OfflinePersianTts(this).also { tts = it; it.initialize() }
+            mainHandler.removeCallbacks(ttsWatchdog)
+            mainHandler.postDelayed(ttsWatchdog, TTS_WATCHDOG_MS)
             engine.speak(next, object : JarvisSpeechController.Callback {
                 override fun onStart() = Unit
                 override fun onDone(success: Boolean) {
                     runOnUiThread {
-                        if (serial != turnSerial) return@runOnUiThread
+                        if (isDestroyed || serial != turnSerial) return@runOnUiThread
+                        mainHandler.removeCallbacks(ttsWatchdog)
                         speaking = false
                         playNext()
                     }
@@ -428,12 +480,14 @@ class VisionActivity : Activity() {
             })
         } catch (t: Throwable) {
             Log.w(TAG, "tts failed")
+            mainHandler.removeCallbacks(ttsWatchdog)
             speaking = false
             speakQueue.clear()
         }
     }
 
     private fun stopSpeaking() {
+        mainHandler.removeCallbacks(ttsWatchdog)
         speakQueue.clear()
         speaking = false
         try { tts?.stop() } catch (t: Throwable) { /* ignore */ }
@@ -512,6 +566,11 @@ class VisionActivity : Activity() {
         const val REQ_GALLERY = 4501
         const val REQ_CAMERA = 4502
         const val MAX_SIDE = 1280
+        /** Keeps the base64 request well below Groq's 4 MB image limit (provider cap is 3.8M chars ≈ 2.8 MB). */
+        const val MAX_JPEG_BYTES = 2_500_000
+        const val TTS_WATCHDOG_MS = 30_000L
+        const val IMAGE_ERROR = "تصویر نامعتبر یا خیلی بزرگ است. تصویر دیگری امتحان کن."
+        const val GENERIC_ERROR = "تحلیل تصویر انجام نشد. دوباره امتحان کن."
         const val DEFAULT_QUESTION = "این تصویر را توضیح بده."
         val BG = Color.parseColor("#05080C")
         val TEXT_PRIMARY = Color.parseColor("#E6F6FF")

@@ -26,12 +26,17 @@ class GroqVisionProvider(
     override fun isAvailable(): Boolean = config.hasApiKey()
 
     override fun stream(request: ChatRequest, listener: StreamListener): Cancellable {
-        val key = config.getApiKey() ?: return failLater(listener, ErrorKind.UNAVAILABLE, "no_key")
+        val key = try { config.getApiKey() } catch (e: RuntimeException) { null }
+        if (key.isNullOrBlank() || !GroqConfigStore.isPlausibleKey(key)) return failLater(listener, ErrorKind.UNAVAILABLE, "no_key")
         val body = try {
             buildBody(request).toString()
         } catch (e: JSONException) {
             return failLater(listener, ErrorKind.PROTOCOL, "bad_request")
         } catch (e: IllegalArgumentException) {
+            return failLater(listener, ErrorKind.PROTOCOL, "bad_image")
+        } catch (e: RuntimeException) {
+            return failLater(listener, ErrorKind.PROTOCOL, "bad_request")
+        } catch (e: OutOfMemoryError) {
             return failLater(listener, ErrorKind.PROTOCOL, "bad_image")
         }
         val round = Round(listener)
@@ -66,6 +71,14 @@ class GroqVisionProvider(
 
         override fun onEvent(event: String?, data: String) {
             if (done.get()) return
+            try {
+                handleEvent(data)
+            } catch (e: RuntimeException) {
+                fail(ErrorKind.PROTOCOL, "bad_event")
+            }
+        }
+
+        private fun handleEvent(data: String) {
             val text = data.trim()
             if (text.isEmpty() || text == "[DONE]") return
             val json = try { JSONObject(text) } catch (e: JSONException) { fail(ErrorKind.PROTOCOL, "bad_json"); return }
@@ -74,17 +87,17 @@ class GroqVisionProvider(
             val piece = choice.optJSONObject("delta")?.let { if (it.isNull("content")) null else it.optString("content") }
             if (!piece.isNullOrEmpty()) {
                 hadOutput = true
-                listener.onEvent(StreamEvent.TextDelta(piece))
+                emit(StreamEvent.TextDelta(piece))
             }
             if (!choice.isNull("finish_reason")) finishReason = choice.optString("finish_reason").takeIf { it.isNotEmpty() }
         }
 
         override fun onComplete() {
             if (!done.compareAndSet(false, true)) return
-            if (hadOutput) listener.onEvent(StreamEvent.Finished(finishReason))
+            if (hadOutput) emit(StreamEvent.Finished(finishReason))
             else {
                 Log.w(TAG, "Groq vision round ended without output")
-                listener.onEvent(StreamEvent.Error(ErrorKind.PROTOCOL, "empty"))
+                emit(StreamEvent.Error(ErrorKind.PROTOCOL, "empty"))
             }
         }
 
@@ -92,14 +105,24 @@ class GroqVisionProvider(
             if (!done.compareAndSet(false, true)) return
             val d = if (kind == ErrorKind.HTTP) "http_${httpCode ?: 0}" else detail
             Log.w(TAG, "Groq vision round failed: $kind ${d ?: ""}")
-            listener.onEvent(StreamEvent.Error(kind, d))
+            // 401/403 = invalid/revoked key -> same "check the key" path as a missing key; 413 = image too large.
+            val k = when {
+                kind == ErrorKind.HTTP && (httpCode == 401 || httpCode == 403) -> ErrorKind.UNAVAILABLE
+                kind == ErrorKind.HTTP && httpCode == 413 -> ErrorKind.PROTOCOL
+                else -> kind
+            }
+            emit(StreamEvent.Error(k, d))
+        }
+
+        private fun emit(e: StreamEvent) {
+            try { listener.onEvent(e) } catch (t: RuntimeException) { Log.w(TAG, "listener threw") }
         }
 
         private fun fail(kind: ErrorKind, detail: String) {
             if (!done.compareAndSet(false, true)) return
             Log.w(TAG, "Groq vision round failed: $kind $detail")
-            handle?.cancel()
-            listener.onEvent(StreamEvent.Error(kind, detail))
+            try { handle?.cancel() } catch (e: RuntimeException) { /* ignore */ }
+            emit(StreamEvent.Error(kind, detail))
         }
     }
 
@@ -114,6 +137,7 @@ class GroqVisionProvider(
                     val (text, img) = VisionAttachment.extract(m.content)
                     if (text.isBlank() && img == null) continue
                     if (img == null) { msgs.put(JSONObject().put("role", "user").put("content", text)); continue }
+                    if (img.isBlank() || !img.startsWith(JPEG_B64_PREFIX)) throw IllegalArgumentException("invalid image")
                     if (img.length > MAX_IMAGE_B64) throw IllegalArgumentException("image too large")
                     val parts = JSONArray()
                         .put(JSONObject().put("type", "text").put("text", text.ifBlank { "این تصویر را توضیح بده." }))
@@ -161,5 +185,7 @@ class GroqVisionProvider(
         private const val MAX_OUTPUT_TOKENS = 400
         /** Groq limit for a base64 image request is 4 MB. */
         private const val MAX_IMAGE_B64 = 3_800_000
+        /** Every JPEG starts with FF D8 FF, which is "/9j/" in base64. */
+        private const val JPEG_B64_PREFIX = "/9j/"
     }
 }
