@@ -9,13 +9,20 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
+import android.os.Build
 import android.os.Bundle
+import android.text.InputType
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowInsets
+import android.view.WindowManager
+import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import com.jarvis.assistant.overlay.JarvisOverlayService
@@ -27,11 +34,11 @@ import com.jarvis.assistant.wakeword.WakeStatus
 import com.jarvis.assistant.wakeword.WakeWordState
 
 /**
- * Minimal JARVIS setup screen. It is NOT the assistant interface: the assistant lives in
- * JarvisOverlayService / JarvisOverlayWindow / JarvisActivationController.
+ * JARVIS main screen: a simple RTL chat base (header, message list, text input, send, "+" placeholder).
+ * The assistant itself still lives in JarvisOverlayService / JarvisOverlayWindow / JarvisActivationController.
  *
- * This screen only shows the "display over other apps" status and offers a user action to grant it.
- * It never activates JARVIS, owns no TTS, and does not host the Arc Reactor.
+ * The existing setup controls (overlay permission, wake word, Vision, DEV TTS) are kept unchanged,
+ * only moved into a compact strip under the header.
  * Built in code (no layout XML, no extra dependencies) so it cannot clash with existing resources.
  */
 class MainActivity : Activity() {
@@ -42,6 +49,9 @@ class MainActivity : Activity() {
     private lateinit var voiceButton: TextView
     private lateinit var voiceStatus: TextView
     private lateinit var ttsStatus: TextView
+    private lateinit var chatScroll: ScrollView
+    private lateinit var messages: LinearLayout
+    private lateinit var input: EditText
 
     /** DEBUG builds only: a separate engine instance used by the [DEV] voice test button. */
     private var devTts: OfflinePersianTts? = null
@@ -54,6 +64,7 @@ class MainActivity : Activity() {
             window.statusBarColor = BG
             window.navigationBarColor = BG
         }
+        window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
         setContentView(buildUi())
         // Load the Vosk model now (background, no microphone, no service) so the first wake-word start is instant.
         if (!WakeWordState.isActive()) VoskWakeWordEngine.warmUp(this)
@@ -169,94 +180,193 @@ class MainActivity : Activity() {
 
     // ---- UI (code-built) ------------------------------------------------------------------------
 
+    @Suppress("DEPRECATION")
     private fun buildUi(): View {
-        val root = FrameLayout(this).apply {
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
             setBackgroundColor(BG)
             layoutDirection = View.LAYOUT_DIRECTION_RTL
         }
-
-        val column = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            setPadding(dp(32), dp(32), dp(32), dp(32))
+        // Keep content clear of system bars / keyboard (works edge-to-edge or not).
+        root.setOnApplyWindowInsetsListener { v, insets ->
+            if (Build.VERSION.SDK_INT >= 30) {
+                val i = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.ime())
+                v.setPadding(i.left, i.top, i.right, i.bottom)
+            } else {
+                v.setPadding(insets.systemWindowInsetLeft, insets.systemWindowInsetTop,
+                    insets.systemWindowInsetRight, insets.systemWindowInsetBottom)
+            }
+            insets
         }
 
-        val title = TextView(this).apply {
+        val match = ViewGroup.LayoutParams.MATCH_PARENT
+        val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
+
+        // Header
+        val header = FrameLayout(this)
+        header.addView(TextView(this).apply {
             text = "JARVIS"
             setTextColor(TEXT_PRIMARY)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 34f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
             typeface = Typeface.create("sans-serif-light", Typeface.NORMAL)
-            letterSpacing = 0.32f
+            letterSpacing = 0.3f
             gravity = Gravity.CENTER
             layoutDirection = View.LAYOUT_DIRECTION_LTR
             textDirection = View.TEXT_DIRECTION_LTR
-        }
+        }, FrameLayout.LayoutParams(wrap, wrap, Gravity.CENTER))
+        root.addView(header, LinearLayout.LayoutParams(match, dp(56)))
+        root.addView(View(this).apply { setBackgroundColor(ACCENT_DIM) }, LinearLayout.LayoutParams(match, dp(1)))
 
-        val rule = View(this).apply {
-            setBackgroundColor(ACCENT_DIM)
+        // Existing setup controls (unchanged behavior), compact strip
+        grantButton = chip("فعال‌سازی نمایش روی برنامه‌ها") { onGrantClicked() }
+        voiceButton = chip("فعال‌سازی فرمان صوتی") { onVoiceClicked() }
+        val chips = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(12), dp(8), dp(12), dp(4))
         }
-
-        val subtitle = TextView(this).apply {
-            text = "دستیار شخصی شما"
-            setTextColor(TEXT_SECONDARY)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
-            gravity = Gravity.CENTER
-        }
-
-        grantButton = outlineButton("فعال‌سازی نمایش روی برنامه‌ها") { onGrantClicked() }
+        fun chipLp() = LinearLayout.LayoutParams(wrap, wrap).apply { marginEnd = dp(8) }
+        chips.addView(grantButton, chipLp())
+        chips.addView(voiceButton, chipLp())
+        chips.addView(chip("Vision") {
+            startActivity(android.content.Intent(this, com.jarvis.assistant.vision.VisionActivity::class.java))
+        }, chipLp())
+        if (isDebuggable()) chips.addView(chip("[DEV] TTS") { onDevTtsClicked() }, chipLp())
+        root.addView(HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            addView(chips)
+        }, LinearLayout.LayoutParams(match, wrap))
 
         val dot = View(this).apply {
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(ACCENT)
-            }
+            background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(ACCENT) }
         }
         statusText = TextView(this).apply {
             setTextColor(TEXT_SECONDARY)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-            gravity = Gravity.CENTER
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
         }
         statusRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-            addView(dot, LinearLayout.LayoutParams(dp(6), dp(6)).apply { marginEnd = dp(10) })
-            addView(statusText, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), 0, dp(16), dp(2))
+            addView(dot, LinearLayout.LayoutParams(dp(6), dp(6)).apply { marginEnd = dp(8) })
+            addView(statusText, LinearLayout.LayoutParams(wrap, wrap))
         }
-
-        fun lp(topDp: Int, w: Int = ViewGroup.LayoutParams.WRAP_CONTENT, h: Int = ViewGroup.LayoutParams.WRAP_CONTENT) =
-            LinearLayout.LayoutParams(w, h).apply { topMargin = dp(topDp); gravity = Gravity.CENTER_HORIZONTAL }
-
-        column.addView(title, lp(0))
-        column.addView(rule, lp(18, dp(36), dp(1)))
-        column.addView(subtitle, lp(18))
-        column.addView(grantButton, lp(56))
-        column.addView(statusRow, lp(56))
-
-        voiceButton = outlineButton("فعال‌سازی فرمان صوتی") { onVoiceClicked() }
         voiceStatus = TextView(this).apply {
             setTextColor(TEXT_SECONDARY)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-            gravity = Gravity.CENTER
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setPadding(dp(16), 0, dp(16), dp(2))
             visibility = View.GONE
         }
-        column.addView(voiceButton, lp(20))
-        column.addView(voiceStatus, lp(14))
         ttsStatus = TextView(this).apply {
             setTextColor(TEXT_SECONDARY)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            gravity = Gravity.CENTER
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setPadding(dp(16), 0, dp(16), dp(2))
             visibility = View.GONE
         }
-        column.addView(ttsStatus, lp(10))
-        column.addView(outlineButton("👁️ Vision (عکس و دوربین)") {
-            startActivity(android.content.Intent(this, com.jarvis.assistant.vision.VisionActivity::class.java))
-        }, lp(20))
-        if (isDebuggable()) {
-            column.addView(outlineButton("[DEV] تست صدای فارسی") { onDevTtsClicked() }, lp(20))
-        }
+        root.addView(statusRow, LinearLayout.LayoutParams(match, wrap))
+        root.addView(voiceStatus, LinearLayout.LayoutParams(match, wrap))
+        root.addView(ttsStatus, LinearLayout.LayoutParams(match, wrap))
 
-        root.addView(column, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        // Messages
+        messages = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+        }
+        chatScroll = ScrollView(this).apply {
+            isVerticalScrollBarEnabled = false
+            addView(messages, FrameLayout.LayoutParams(match, wrap))
+        }
+        root.addView(chatScroll, LinearLayout.LayoutParams(match, 0, 1f))
+        addMessage("سلام، من جارویس هستم. چطور می‌توانم کمکتان کنم؟", fromUser = false)
+
+        // Input bar: "+" (no action yet) | text field | send
+        val plus = TextView(this).apply {
+            text = "+"
+            setTextColor(ACCENT)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 24f)
+            gravity = Gravity.CENTER
+            background = circle(Color.TRANSPARENT, ACCENT_DIM)
+            isClickable = true   // placeholder only: intentionally no click action in this step
+        }
+        input = EditText(this).apply {
+            hint = "پیام خود را بنویسید…"
+            setHintTextColor(TEXT_SECONDARY)
+            setTextColor(TEXT_PRIMARY)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            maxLines = 4
+            gravity = Gravity.CENTER_VERTICAL or Gravity.START
+            textDirection = View.TEXT_DIRECTION_FIRST_STRONG_RTL
+            setPadding(dp(18), dp(10), dp(18), dp(10))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(24).toFloat()
+                setColor(SURFACE)
+                setStroke(dp(1), ACCENT_DIM)
+            }
+        }
+        val send = TextView(this).apply {
+            text = "➤"
+            setTextColor(BG)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+            gravity = Gravity.CENTER
+            scaleX = -1f   // arrow points left (RTL "forward")
+            background = circle(ACCENT, Color.TRANSPARENT)
+            isClickable = true
+            isFocusable = true
+            setOnClickListener { onSendClicked() }
+        }
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.BOTTOM
+            setPadding(dp(10), dp(8), dp(10), dp(10))
+        }
+        bar.addView(plus, LinearLayout.LayoutParams(dp(44), dp(44)).apply { marginEnd = dp(8) })
+        bar.addView(input, LinearLayout.LayoutParams(0, wrap, 1f).apply { marginEnd = dp(8) })
+        bar.addView(send, LinearLayout.LayoutParams(dp(44), dp(44)))
+        root.addView(bar, LinearLayout.LayoutParams(match, wrap))
         return root
+    }
+
+    private fun onSendClicked() {
+        val text = input.text.toString().trim()
+        if (text.isEmpty()) return
+        addMessage(text, fromUser = true)
+        input.text.clear()
+    }
+
+    private fun addMessage(text: String, fromUser: Boolean) {
+        val bubble = TextView(this).apply {
+            this.text = text
+            setTextColor(TEXT_PRIMARY)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            setLineSpacing(0f, 1.15f)
+            textDirection = View.TEXT_DIRECTION_FIRST_STRONG_RTL
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+            maxWidth = (resources.displayMetrics.widthPixels * 0.8f).toInt()
+            setTextIsSelectable(true)
+            background = GradientDrawable().apply {
+                cornerRadius = dp(18).toFloat()
+                if (fromUser) { setColor(USER_BUBBLE); setStroke(dp(1), ACCENT_DIM) }
+                else { setColor(SURFACE) }
+            }
+        }
+        // RTL: START = right (user), END = left (JARVIS)
+        val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            gravity = if (fromUser) Gravity.START else Gravity.END
+            topMargin = dp(8)
+        }
+        messages.addView(bubble, lp)
+        chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
+    }
+
+    private fun circle(fill: Int, stroke: Int): GradientDrawable = GradientDrawable().apply {
+        shape = GradientDrawable.OVAL
+        setColor(fill)
+        if (stroke != Color.TRANSPARENT) setStroke(dp(1), stroke)
+    }
+
+    private fun chip(label: String, onClick: () -> Unit): TextView = outlineButton(label, onClick).apply {
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+        setPadding(dp(14), dp(7), dp(14), dp(7))
     }
 
     private fun outlineButton(label: String, onClick: () -> Unit): TextView = TextView(this).apply {
@@ -286,5 +396,7 @@ class MainActivity : Activity() {
         val ACCENT = Color.parseColor("#5FD8FF")
         val ACCENT_DIM = Color.parseColor("#335FD8FF")
         val RIPPLE = Color.parseColor("#225FD8FF")
+        val SURFACE = Color.parseColor("#0E151C")
+        val USER_BUBBLE = Color.parseColor("#14305A6B")
     }
 }
